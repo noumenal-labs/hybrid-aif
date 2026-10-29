@@ -1,0 +1,102 @@
+{
+  "hybrid_aif_description": "0.3",
+  "variables": {
+    "location": {"domain": "categorical", "levels": 4},
+    "context": {"domain": "categorical", "levels": 2},
+    "u_location": {"domain": "categorical", "levels": 4},
+    "a_location": {"domain": "categorical", "levels": 4},
+    "cue": {"domain": "categorical", "levels": 3},
+    "D_location": {"domain": "logits", "shape": [4]},
+    "B_location": {"domain": "logits", "shape": [4, 4, 4]},
+    "D_context": {"domain": "logits", "shape": [2]},
+    "B_context": {"domain": "log_simplex", "shape": [2, 2]},
+    "A_cue": {"domain": "log_simplex", "shape": [3, 4, 2]},
+    "A_cue_concentration": {"domain": "positive", "shape": [3, 4, 2]},
+    "H_location": {"domain": "logits", "shape": [4, 2]}
+  },
+  "factors": {
+    "location": {
+      "initial": {
+        "family": "Categorical",
+        "parameters": {"logits": "D_location"}
+      },
+      "transition": {
+        "family": "ConditionalCategorical",
+        "parents": ["location", "u_location"],
+        "parameters": {"log_table": "B_location"}
+      },
+      "terminal": {
+        "family": "ConditionalCategorical",
+        "parents": ["context"],
+        "parameters": {"log_table": "H_location"}
+      }
+    },
+    "context": {
+      "initial": {
+        "family": "Categorical",
+        "parameters": {"logits": "D_context"}
+      },
+      "transition": {
+        "family": "ConditionalCategorical",
+        "parents": ["context"],
+        "parameters": {"log_table": "B_context"}
+      }
+    },
+    "a_location": {
+    },
+    "cue": {
+      "likelihood": {
+        "family": "ConditionalCategorical",
+        "parents": ["location", "context"],
+        "parameters": {"log_table": "A_cue"}
+      }
+    },
+    "A_cue": {
+      "prior": {
+        "family": "Dirichlet",
+        "parameters": {"concentration": "A_cue_concentration"}
+      }
+    }
+  },
+  "relations": {
+    "controls": {"u_location": "a_location"},
+    "observed": ["cue"]
+  },
+  "clamps": {
+    "D_location": [0.0, -10.0, -10.0, -10.0],
+    "D_context": -0.693,
+    "B_location": [
+      [
+        [0.0, -100.0, -100.0, -100.0],
+        [-100.0, 0.0, -100.0, -100.0],
+        [-100.0, -100.0, 0.0, -100.0],
+        [-100.0, -100.0, -100.0, 0.0]
+      ],
+      [
+        [-100.0, 0.0, -100.0, -100.0],
+        [-100.0, 0.0, -100.0, -100.0],
+        [-100.0, 0.0, -100.0, -100.0],
+        [-100.0, 0.0, -100.0, -100.0]
+      ],
+      [
+        [-100.0, -100.0, 0.0, -100.0],
+        [-100.0, -100.0, 0.0, -100.0],
+        [-100.0, -100.0, 0.0, -100.0],
+        [-100.0, -100.0, 0.0, -100.0]
+      ],
+      [
+        [-100.0, -100.0, -100.0, 0.0],
+        [-100.0, -100.0, -100.0, 0.0],
+        [-100.0, -100.0, -100.0, 0.0],
+        [-100.0, -100.0, -100.0, 0.0]
+      ]
+    ],
+    "B_context": [[0.0, -100.0], [-100.0, 0.0]],
+    "A_cue_concentration": 1.0,
+    "H_location": [[0.0, 0.0], [3.0, 0.0], [0.0, 3.0], [0.0, 0.0]]
+  },
+  "objective": {"decomposition": "utility_infogain"},
+  "configuration": {
+    "planning": {"planner": "enumeration", "horizon": 3, "gamma": 16.0}
+  }
+}

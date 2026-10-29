@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hybrid-aif"
+version = "0.18.0"
+description = "Hybrid continuous-discrete active inference & RL in JAX"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Noumenal" }]
+dependencies = [
+    "jax>=0.11,<0.12",
+    "equinox>=0.13.8",
+    "optax>=0.2",
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+data = ["h5py>=3"]
+demo = ["matplotlib>=3.8", "notebook>=7", "ipykernel", "nbconvert"]
+dev = [
+    "pytest>=8",
+    "pytest-xdist>=3",
+    "ruff>=0.6",
+    "pre-commit>=3",
+    # Parity oracle: discrete-node tests compare against pymdp's JAX Agent directly.
+    "inferactively-pymdp>=1.0",
+    "h5py>=3",
+    # R-AIF parity: parses the vendored resolved oracle config
+    # (`reference/raif/fixtures/oracle_state_mc.config.yaml`) so that
+    # `tests/test_oracle_parity.py` checks its literals against the dump itself
+    # rather than against a hand transcription. Not a runtime dependency — the two
+    # tests that need it `importorskip`.
+    "pyyaml>=6",
+    # The description format's JSON Schema is checked against documents in the tests.
+    "jsonschema>=4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hybrid_aif"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The notebook-execution gate is slow (a full nbconvert run) and opt-in: it is
+# deselected by default so the normal suite stays fast; run it with `-m notebook`.
+addopts = "-m 'not notebook and not slow'"
+markers = [
+    "notebook: end-to-end notebook execution gate (opt-in; run with `-m notebook`)",
+    "slow: full-size/parity-rate runs (opt-in; run with `-m slow`)",
+]

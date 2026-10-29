@@ -1,0 +1,125 @@
+{
+  "hybrid_aif_description": "0.3",
+  "variables": {
+    "location": {"domain": "categorical", "levels": 4},
+    "context": {"domain": "categorical", "levels": 2},
+    "u_location": {"domain": "categorical", "levels": 4},
+    "a_location": {"domain": "categorical", "levels": 4},
+    "position": {"domain": "categorical", "levels": 4},
+    "cue": {"domain": "categorical", "levels": 3},
+    "outcome": {"domain": "categorical", "levels": 3},
+    "D_location": {"domain": "logits", "shape": [4]},
+    "B_location": {"domain": "logits", "shape": [4, 4, 4]},
+    "D_context": {"domain": "logits", "shape": [2]},
+    "B_context": {"domain": "log_simplex", "shape": [2, 2]},
+    "A_position": {"domain": "log_simplex", "shape": [4, 4]},
+    "A_cue": {"domain": "log_simplex", "shape": [3, 4, 4]},
+    "A_outcome": {"domain": "log_simplex", "shape": [3, 4, 2]},
+    "K_a_location": {"domain": "log_simplex", "shape": [4, 4]},
+    "C_outcome": {"domain": "logits", "shape": [3]}
+  },
+  "factors": {
+    "location": {
+      "start": {
+        "family": "Categorical",
+        "parents": [],
+        "parameters": {"logits": "D_location"},
+        "steps": "0"
+      },
+      "move": {
+        "family": "ConditionalCategorical",
+        "parents": ["location[t-1]", "u_location[t-1]"],
+        "parameters": {"log_table": "B_location"},
+        "steps": "1+"
+      }
+    },
+    "context": {
+      "pick": {
+        "family": "Categorical",
+        "parents": [],
+        "parameters": {"logits": "D_context"},
+        "steps": "0"
+      },
+      "persist": {
+        "family": "ConditionalCategorical",
+        "parents": ["context[t-1]"],
+        "parameters": {"log_table": "B_context"},
+        "steps": "1+"
+      }
+    },
+    "position": {
+      "see": {
+        "family": "ConditionalCategorical",
+        "parents": ["location[t]"],
+        "parameters": {"log_table": "A_position"},
+        "steps": "all"
+      }
+    },
+    "cue": {
+      "perceive": {
+        "family": "ConditionalCategorical",
+        "parents": ["location[t]", "context[t]"],
+        "parameters": {"log_table": "A_cue"},
+        "steps": "all"
+      }
+    },
+    "outcome": {
+      "experience": {
+        "family": "ConditionalCategorical",
+        "parents": ["location[t]", "context[t]"],
+        "parameters": {"log_table": "A_outcome"},
+        "steps": "all"
+      },
+      "target": {
+        "family": "Categorical",
+        "parameters": {"logits": "C_outcome"}
+      }
+    },
+    "a_location": {
+      "realize": {
+        "family": "ConditionalCategorical",
+        "parents": ["u_location[t]"],
+        "parameters": {"log_table": "K_a_location"},
+        "steps": "all"
+      }
+    }
+  },
+  "relations": {
+    "controls": {"u_location": "a_location"},
+    "observed": ["position", "cue", "outcome"]
+  },
+  "clamps": {
+    "D_location": [5.0, -5.0, -5.0, -5.0],
+    "B_location": [
+      [[-0.1, -4.0, -4.0, -4.0], [-4.0, -4.0, -4.0, -4.0], [-4.0, -4.0, -4.0, -4.0], [-0.1, -4.0, -4.0, -4.0]],
+      [[-4.0, -0.1, -4.0, -4.0], [-4.0, -0.1, -4.0, -4.0], [-4.0, -0.1, -4.0, -4.0], [-4.0, -0.1, -4.0, -4.0]],
+      [[-4.0, -4.0, -0.1, -4.0], [-4.0, -4.0, -0.1, -4.0], [-4.0, -4.0, -0.1, -4.0], [-4.0, -4.0, -0.1, -4.0]],
+      [[-0.1, -4.0, -4.0, -4.0], [-4.0, -0.1, -4.0, -4.0], [-4.0, -4.0, -0.1, -4.0], [-4.0, -4.0, -4.0, -0.1]]
+    ],
+    "D_context": 0.0,
+    "B_context": [[-0.01, -4.6], [-4.6, -0.01]],
+    "A_position": [[0, -1000, -1000, -1000], [-1000, 0, -1000, -1000], [-1000, -1000, 0, -1000], [-1000, -1000, -1000, 0]],
+    "A_cue": [
+      [[-4.6, -4.6, -4.6, -0.01], [-4.6, -4.6, -4.6, -0.01], [-4.6, -4.6, -4.6, -0.01], [-0.01, -4.6, -4.6, -4.6]],
+      [[-4.6, -4.6, -4.6, -4.6], [-4.6, -4.6, -4.6, -4.6], [-4.6, -4.6, -4.6, -4.6], [-4.6, -0.01, -4.6, -4.6]],
+      [[-0.01, -0.01, -0.01, -4.6], [-0.01, -0.01, -0.01, -4.6], [-0.01, -0.01, -0.01, -4.6], [-4.6, -4.6, -4.6, -0.01]]
+    ],
+    "A_outcome": [
+      [[-4.6, -4.6, -4.6, -1000.0], [-0.02, -4.0, -4.6, -1000.0], [-4.0, -0.02, -4.6, -1000.0], [-1000.0, -1000.0, -1000.0, -1000.0]],
+      [[-4.6, -4.6, -4.6, -1000.0], [-4.0, -0.02, -4.6, -1000.0], [-0.02, -4.0, -4.6, -1000.0], [-1000.0, -1000.0, -1000.0, -1000.0]],
+      [[-0.01, -0.01, -0.01, 0.0], [0.0, 0.0, -0.01, 0.0], [0.0, 0.0, -0.01, 0.0], [0.0, 0.0, 0.0, 0.0]]
+    ],
+    "K_a_location": [[-0.01, -4.6, -4.6, -4.6], [-4.6, -0.01, -4.6, -4.6], [-4.6, -4.6, -0.01, -4.6], [-4.6, -4.6, -4.6, -0.01]],
+    "C_outcome": [3.0, -3.0, 0.0]
+  },
+  "objective": {
+    "decomposition": "utility_infogain"
+  },
+  "configuration": {
+    "planning": {
+      "horizon": 2,
+      "planner": "enumeration",
+      "gamma": 16.0
+    }
+  }
+}

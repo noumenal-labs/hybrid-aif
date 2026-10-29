@@ -1,0 +1,80 @@
+{
+  "hybrid_aif_description": "0.3",
+  "variables": {
+    "regime": {"domain": "categorical", "levels": 2},
+    "x": {"domain": "real", "dim": 2},
+    "y_pos": {"domain": "real", "dim": 1},
+    "y_regime": {"domain": "categorical", "levels": 2},
+    "D_regime": {"domain": "logits", "shape": [2]},
+    "B_regime": {"domain": "log_simplex", "shape": [2, 2]},
+    "x_initial_loc": {"domain": "real", "shape": [2]},
+    "x_initial_chol": {"domain": "cholesky", "shape": [2, 2]},
+    "x_transition_F": {"domain": "real", "shape": [2, 2]},
+    "x_transition_innovations_loc": {"domain": "real", "shape": [2, 2]},
+    "x_transition_innovations_chol": {"domain": "cholesky", "shape": [2, 2, 2]},
+    "y_pos_likelihood_head": {"domain": "real", "shape": [1, 3]},
+    "y_pos_likelihood_noise": {"domain": "cholesky", "shape": [1, 1]},
+    "A_y_regime": {"domain": "log_simplex", "shape": [2, 2]}
+  },
+  "factors": {
+    "regime": {
+      "initial": {"family": "Categorical", "parameters": {"logits": "D_regime"}},
+      "transition": {
+        "family": "ConditionalCategorical",
+        "parents": ["regime"],
+        "parameters": {"log_table": "B_regime"}
+      }
+    },
+    "x": {
+      "initial": {
+        "family": "Gaussian",
+        "parameters": {"loc": "x_initial_loc", "chol": "x_initial_chol"}
+      },
+      "transition": {
+        "family": "LinearGaussianTransition",
+        "parents": ["x", "regime[t]"],
+        "parameters": {
+          "F": "x_transition_F",
+          "innovations": {
+            "loc": "x_transition_innovations_loc",
+            "chol": "x_transition_innovations_chol"
+          }
+        }
+      }
+    },
+    "y_pos": {
+      "likelihood": {
+        "family": "LinearGaussianObservation",
+        "parents": ["x"],
+        "parameters": {"head": "y_pos_likelihood_head", "noise": "y_pos_likelihood_noise"}
+      }
+    },
+    "y_regime": {
+      "likelihood": {
+        "family": "ConditionalCategorical",
+        "parents": ["regime"],
+        "parameters": {"log_table": "A_y_regime"}
+      }
+    }
+  },
+  "relations": {
+    "observed": ["y_pos", "y_regime"]
+  },
+  "clamps": {
+    "D_regime": 0.0,
+    "B_regime": [[-0.10536051565782628, -2.3025850929940455], [-2.3025850929940455, -0.10536051565782628]],
+    "x_initial_loc": [0.0, 0.0],
+    "x_initial_chol": [[1.0, 0.0], [0.0, 1.0]],
+    "x_transition_F": [[1.0, 1.0], [0.0, 1.0]],
+    "x_transition_innovations_loc": [[0.0, 0.0], [0.0, 0.5]],
+    "x_transition_innovations_chol": [
+      [[0.1, 0.0], [0.0, 0.1]],
+      [[0.3, 0.0], [0.0, 0.3]]
+    ],
+    "y_pos_likelihood_head": [[1.0, 0.0, 0.0]],
+    "y_pos_likelihood_noise": [[0.2]],
+    "A_y_regime": [[-0.2231435513142097, -1.6094379124341003], [-1.6094379124341003, -0.2231435513142097]]
+  },
+  "objective": {"decomposition": "utility_infogain"},
+  "configuration": {"planning": {"planner": "enumeration", "horizon": 1, "gamma": 16.0}}
+}

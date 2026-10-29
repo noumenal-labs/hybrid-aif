@@ -1,0 +1,413 @@
+{
+ "hybrid_aif_description": "0.2",
+ "library_version": "0.11.0",
+ "structure": {
+  "states": [
+   {
+    "name": "location",
+    "transition_parents": [
+     "location"
+    ],
+    "controlled": true,
+    "num_controls": 4,
+    "initial_parents": null,
+    "terminal_parents": [
+     "context"
+    ],
+    "continuous_control": null
+   },
+   {
+    "name": "context",
+    "transition_parents": [
+     "context"
+    ],
+    "controlled": false,
+    "num_controls": 1,
+    "initial_parents": null,
+    "terminal_parents": [],
+    "continuous_control": null
+   }
+  ],
+  "observations": [
+   {
+    "name": "position",
+    "observes": [
+     "location"
+    ],
+    "source": "external"
+   },
+   {
+    "name": "cue",
+    "observes": [
+     "location",
+     "context"
+    ],
+    "source": "external"
+   }
+  ],
+  "generated_names": {
+   "states": false,
+   "observations": false
+  },
+  "policy_len": 3,
+  "planner": "enumeration",
+  "gamma": 16.0,
+  "num_iters": 16,
+  "decomposition": "utility_infogain",
+  "epistemic": true,
+  "mixture_k": null,
+  "mixture_schedule": "runnalls",
+  "recognition": null,
+  "terms": [],
+  "scoring": {},
+  "external_inputs": [],
+  "subsystems": null
+ },
+ "declarations": {
+  "transition:location": {
+   "family": "ConditionalCategorical",
+   "static": {
+    "parent_ndims": 2
+   },
+   "arrays": {
+    "log_table": {
+     "shape": [
+      4,
+      4,
+      4
+     ],
+     "dtype": "float32",
+     "domain": "log_probability",
+     "values": [
+      [
+       [
+        -0.10536054521799088,
+        -3.4011974334716797,
+        -3.4011974334716797,
+        -3.4011974334716797
+       ],
+       [
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625
+       ],
+       [
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625
+       ],
+       [
+        -0.10536054521799088,
+        -3.4011974334716797,
+        -3.4011974334716797,
+        -3.4011974334716797
+       ]
+      ],
+      [
+       [
+        -3.4011974334716797,
+        -0.10536054521799088,
+        -3.4011974334716797,
+        -3.4011974334716797
+       ],
+       [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+       ],
+       [
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625
+       ],
+       [
+        -3.4011974334716797,
+        -0.10536054521799088,
+        -3.4011974334716797,
+        -3.4011974334716797
+       ]
+      ],
+      [
+       [
+        -3.4011974334716797,
+        -3.4011974334716797,
+        -0.10536054521799088,
+        -3.4011974334716797
+       ],
+       [
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625
+       ],
+       [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+       ],
+       [
+        -3.4011974334716797,
+        -3.4011974334716797,
+        -0.10536054521799088,
+        -3.4011974334716797
+       ]
+      ],
+      [
+       [
+        -3.4011974334716797,
+        -3.4011974334716797,
+        -3.4011974334716797,
+        -0.10536054521799088
+       ],
+       [
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625
+       ],
+       [
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625,
+        -20.7232666015625
+       ],
+       [
+        -3.4011974334716797,
+        -3.4011974334716797,
+        -3.4011974334716797,
+        -0.10536054521799088
+       ]
+      ]
+     ]
+    }
+   }
+  },
+  "initial_state_prior:location": {
+   "family": "Categorical",
+   "arrays": {
+    "logits": {
+     "shape": [
+      4
+     ],
+     "dtype": "float32",
+     "domain": "logits",
+     "values": [
+      0.0,
+      -20.7232666015625,
+      -20.7232666015625,
+      -20.7232666015625
+     ]
+    }
+   }
+  },
+  "transition:context": {
+   "family": "ConditionalCategorical",
+   "static": {
+    "parent_ndims": 2
+   },
+   "arrays": {
+    "log_table": {
+     "shape": [
+      2,
+      2,
+      1
+     ],
+     "dtype": "float32",
+     "domain": "log_probability",
+     "values": [
+      [
+       [
+        0.0
+       ],
+       [
+        -Infinity
+       ]
+      ],
+      [
+       [
+        -Infinity
+       ],
+       [
+        0.0
+       ]
+      ]
+     ]
+    }
+   }
+  },
+  "initial_state_prior:context": {
+   "family": "Categorical",
+   "arrays": {
+    "logits": {
+     "shape": [
+      2
+     ],
+     "dtype": "float32",
+     "domain": "logits",
+     "values": [
+      0.0,
+      0.0
+     ]
+    }
+   }
+  },
+  "likelihood:position": {
+   "family": "ConditionalCategorical",
+   "static": {
+    "parent_ndims": 1
+   },
+   "arrays": {
+    "log_table": {
+     "shape": [
+      4,
+      4
+     ],
+     "dtype": "float32",
+     "domain": "log_probability",
+     "values": [
+      [
+       0.0,
+       -20.7232666015625,
+       -20.7232666015625,
+       -20.7232666015625
+      ],
+      [
+       -20.7232666015625,
+       0.0,
+       -20.7232666015625,
+       -20.7232666015625
+      ],
+      [
+       -20.7232666015625,
+       -20.7232666015625,
+       0.0,
+       -20.7232666015625
+      ],
+      [
+       -20.7232666015625,
+       -20.7232666015625,
+       -20.7232666015625,
+       0.0
+      ]
+     ]
+    }
+   }
+  },
+  "likelihood:cue": {
+   "family": "ConditionalDirichlet",
+   "static": {
+    "parent_ndims": 2
+   },
+   "arrays": {
+    "concentration": {
+     "shape": [
+      3,
+      4,
+      2
+     ],
+     "dtype": "float32",
+     "domain": "positive",
+     "values": [
+      [
+       [
+        1.0,
+        1.0
+       ],
+       [
+        1.0,
+        1.0
+       ],
+       [
+        1.0,
+        1.0
+       ],
+       [
+        1.0,
+        1.0
+       ]
+      ],
+      [
+       [
+        1.0,
+        1.0
+       ],
+       [
+        1.0,
+        1.0
+       ],
+       [
+        1.0,
+        1.0
+       ],
+       [
+        1.0,
+        1.0
+       ]
+      ],
+      [
+       [
+        1.0,
+        1.0
+       ],
+       [
+        1.0,
+        1.0
+       ],
+       [
+        1.0,
+        1.0
+       ],
+       [
+        1.0,
+        1.0
+       ]
+      ]
+     ]
+    }
+   },
+   "fields": {
+    "alpha0": null
+   }
+  },
+  "terminal_targets:location": {
+   "family": "ConditionalCategorical",
+   "static": {
+    "parent_ndims": 1
+   },
+   "arrays": {
+    "log_table": {
+     "shape": [
+      4,
+      2
+     ],
+     "dtype": "float32",
+     "domain": "log_probability",
+     "values": [
+      [
+       -3.1392061710357666,
+       -3.1392061710357666
+      ],
+      [
+       -0.13920626044273376,
+       -3.1392061710357666
+      ],
+      [
+       -3.1392061710357666,
+       -0.13920626044273376
+      ],
+      [
+       -3.1392061710357666,
+       -3.1392061710357666
+      ]
+     ]
+    }
+   }
+  }
+ },
+ "sidecar": false
+}

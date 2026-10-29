@@ -1,0 +1,1007 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://noumenal.ai/schemas/hybrid-aif/description-0.3.json",
+  "title": "hybrid-aif model description",
+  "description": "A hybrid-aif System and its parameters as a document: variables with their domains, factors keyed by child and label, the relations no factor owns, clamps on parameter variables, the objective's terms and the configuration. A consumer's own data rides under 'extensions', keyed by consumer; no other unknown key is allowed. The format: docs/description-format.md.",
+  "type": "object",
+  "required": [
+    "hybrid_aif_description",
+    "variables",
+    "configuration"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "hybrid_aif_description": {
+      "const": "0.3"
+    },
+    "library_version": {
+      "type": "string"
+    },
+    "arrays_file": {
+      "type": "string"
+    },
+    "variables": {
+      "$ref": "#/$defs/body/properties/variables"
+    },
+    "factors": {
+      "$ref": "#/$defs/body/properties/factors"
+    },
+    "relations": {
+      "$ref": "#/$defs/body/properties/relations"
+    },
+    "clamps": {
+      "$ref": "#/$defs/body/properties/clamps"
+    },
+    "objective": {
+      "$ref": "#/$defs/body/properties/objective"
+    },
+    "configuration": {
+      "$ref": "#/$defs/body/properties/configuration"
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Consumer data, keyed by consumer name; opaque to the library.",
+      "additionalProperties": {
+        "type": "object"
+      }
+    }
+  },
+  "$defs": {
+    "parent": {
+      "type": "string",
+      "pattern": "^[^\\[\\]]+(\\[t(-1)?\\])?$"
+    },
+    "names": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "leaf": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "dependentSchemas": {
+        "levels": {
+          "required": [
+            "domain"
+          ],
+          "properties": {
+            "domain": {
+              "const": "categorical"
+            }
+          }
+        },
+        "dim": {
+          "required": [
+            "domain"
+          ],
+          "properties": {
+            "domain": {
+              "const": "real"
+            }
+          },
+          "not": {
+            "required": [
+              "shape"
+            ]
+          }
+        },
+        "dims": {
+          "required": [
+            "dim"
+          ]
+        },
+        "low": {
+          "required": [
+            "dim"
+          ]
+        },
+        "high": {
+          "required": [
+            "dim"
+          ]
+        },
+        "duration": {
+          "required": [
+            "levels"
+          ]
+        }
+      },
+      "properties": {
+        "domain": {
+          "enum": [
+            "categorical",
+            "cholesky",
+            "integer_levels",
+            "log_simplex",
+            "logits",
+            "nonnegative",
+            "positive",
+            "real",
+            "simplex",
+            "spd",
+            "unit_interval"
+          ]
+        },
+        "levels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "dim": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "dims": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[^:.*\\[\\]]+$"
+          }
+        },
+        "low": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            }
+          ]
+        },
+        "high": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            }
+          ]
+        },
+        "duration": {
+          "anyOf": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            }
+          ]
+        },
+        "shape": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "variable": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/leaf"
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/variable"
+          }
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/variable"
+          }
+        }
+      ]
+    },
+    "clamp": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/clamp"
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "ref"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "ref": {
+              "type": "string",
+              "pattern": "^[^#]+#.+$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "init"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "init": {
+              "type": "object"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "ref"
+                ]
+              },
+              {
+                "required": [
+                  "init"
+                ]
+              }
+            ]
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/clamp"
+          }
+        }
+      ]
+    },
+    "block": {
+      "type": "object",
+      "properties": {
+        "initial": {
+          "type": "object",
+          "required": [
+            "family"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "family": {
+              "enum": [
+                "Categorical",
+                "ConditionalCategorical",
+                "ConditionalGaussian",
+                "DerivedInitial",
+                "Deterministic",
+                "Dirichlet",
+                "Gaussian",
+                "InverseGamma",
+                "InverseWishart",
+                "JointCategorical",
+                "LearnedVector",
+                "LinearGaussianObservation",
+                "LinearGaussianTransition",
+                "MLPCategorical",
+                "MLPConditional",
+                "MLPPredictor",
+                "MatrixNormal",
+                "MixtureGaussian",
+                "NonlinearGaussianTransition",
+                "PredictorHead"
+              ]
+            },
+            "parents": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/parent"
+              }
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/names"
+              }
+            },
+            "options": {
+              "type": "object"
+            },
+            "steps": {
+              "const": "0"
+            }
+          }
+        },
+        "transition": {
+          "type": "object",
+          "required": [
+            "family"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "family": {
+              "enum": [
+                "Categorical",
+                "ConditionalCategorical",
+                "ConditionalGaussian",
+                "DerivedInitial",
+                "Deterministic",
+                "Dirichlet",
+                "Gaussian",
+                "InverseGamma",
+                "InverseWishart",
+                "JointCategorical",
+                "LearnedVector",
+                "LinearGaussianObservation",
+                "LinearGaussianTransition",
+                "MLPCategorical",
+                "MLPConditional",
+                "MLPPredictor",
+                "MatrixNormal",
+                "MixtureGaussian",
+                "NonlinearGaussianTransition",
+                "PredictorHead"
+              ]
+            },
+            "parents": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/parent"
+              }
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/names"
+              }
+            },
+            "options": {
+              "type": "object"
+            },
+            "steps": {
+              "const": "1+"
+            }
+          }
+        },
+        "likelihood": {
+          "type": "object",
+          "required": [
+            "family"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "family": {
+              "enum": [
+                "Categorical",
+                "ConditionalCategorical",
+                "ConditionalGaussian",
+                "DerivedInitial",
+                "Deterministic",
+                "Dirichlet",
+                "Gaussian",
+                "InverseGamma",
+                "InverseWishart",
+                "JointCategorical",
+                "LearnedVector",
+                "LinearGaussianObservation",
+                "LinearGaussianTransition",
+                "MLPCategorical",
+                "MLPConditional",
+                "MLPPredictor",
+                "MatrixNormal",
+                "MixtureGaussian",
+                "NonlinearGaussianTransition",
+                "PredictorHead"
+              ]
+            },
+            "parents": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/parent"
+              }
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/names"
+              }
+            },
+            "options": {
+              "type": "object"
+            },
+            "steps": {
+              "const": "all"
+            }
+          }
+        },
+        "actuator": {
+          "type": "object",
+          "required": [
+            "family"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "family": {
+              "enum": [
+                "Categorical",
+                "ConditionalCategorical",
+                "ConditionalGaussian",
+                "DerivedInitial",
+                "Deterministic",
+                "Dirichlet",
+                "Gaussian",
+                "InverseGamma",
+                "InverseWishart",
+                "JointCategorical",
+                "LearnedVector",
+                "LinearGaussianObservation",
+                "LinearGaussianTransition",
+                "MLPCategorical",
+                "MLPConditional",
+                "MLPPredictor",
+                "MatrixNormal",
+                "MixtureGaussian",
+                "NonlinearGaussianTransition",
+                "PredictorHead"
+              ]
+            },
+            "parents": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/parent"
+              }
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/names"
+              }
+            },
+            "options": {
+              "type": "object"
+            },
+            "steps": {
+              "const": "all"
+            }
+          }
+        },
+        "recognition": {
+          "type": "object",
+          "required": [
+            "family"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "family": {
+              "enum": [
+                "Categorical",
+                "ConditionalCategorical",
+                "ConditionalGaussian",
+                "DerivedInitial",
+                "Deterministic",
+                "Dirichlet",
+                "Gaussian",
+                "InverseGamma",
+                "InverseWishart",
+                "JointCategorical",
+                "LearnedVector",
+                "LinearGaussianObservation",
+                "LinearGaussianTransition",
+                "MLPCategorical",
+                "MLPConditional",
+                "MLPPredictor",
+                "MatrixNormal",
+                "MixtureGaussian",
+                "NonlinearGaussianTransition",
+                "PredictorHead"
+              ]
+            },
+            "parents": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/parent"
+              }
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/names"
+              }
+            },
+            "options": {
+              "type": "object"
+            },
+            "steps": {
+              "const": "all"
+            }
+          }
+        },
+        "target": {
+          "type": "object",
+          "required": [
+            "family"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "family": {
+              "enum": [
+                "Categorical",
+                "ConditionalCategorical",
+                "ConditionalGaussian",
+                "DerivedInitial",
+                "Deterministic",
+                "Dirichlet",
+                "Gaussian",
+                "InverseGamma",
+                "InverseWishart",
+                "JointCategorical",
+                "LearnedVector",
+                "LinearGaussianObservation",
+                "LinearGaussianTransition",
+                "MLPCategorical",
+                "MLPConditional",
+                "MLPPredictor",
+                "MatrixNormal",
+                "MixtureGaussian",
+                "NonlinearGaussianTransition",
+                "PredictorHead"
+              ]
+            },
+            "parents": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/parent"
+              }
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/names"
+              }
+            },
+            "options": {
+              "type": "object"
+            }
+          }
+        },
+        "terminal": {
+          "type": "object",
+          "required": [
+            "family"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "family": {
+              "enum": [
+                "Categorical",
+                "ConditionalCategorical",
+                "ConditionalGaussian",
+                "DerivedInitial",
+                "Deterministic",
+                "Dirichlet",
+                "Gaussian",
+                "InverseGamma",
+                "InverseWishart",
+                "JointCategorical",
+                "LearnedVector",
+                "LinearGaussianObservation",
+                "LinearGaussianTransition",
+                "MLPCategorical",
+                "MLPConditional",
+                "MLPPredictor",
+                "MatrixNormal",
+                "MixtureGaussian",
+                "NonlinearGaussianTransition",
+                "PredictorHead"
+              ]
+            },
+            "parents": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/parent"
+              }
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/names"
+              }
+            },
+            "options": {
+              "type": "object"
+            }
+          }
+        },
+        "policy_prior": {
+          "type": "object",
+          "required": [
+            "family"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "family": {
+              "enum": [
+                "Categorical",
+                "ConditionalCategorical",
+                "ConditionalGaussian",
+                "DerivedInitial",
+                "Deterministic",
+                "Dirichlet",
+                "Gaussian",
+                "InverseGamma",
+                "InverseWishart",
+                "JointCategorical",
+                "LearnedVector",
+                "LinearGaussianObservation",
+                "LinearGaussianTransition",
+                "MLPCategorical",
+                "MLPConditional",
+                "MLPPredictor",
+                "MatrixNormal",
+                "MixtureGaussian",
+                "NonlinearGaussianTransition",
+                "PredictorHead"
+              ]
+            },
+            "parents": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/parent"
+              }
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/names"
+              }
+            },
+            "options": {
+              "type": "object"
+            }
+          }
+        },
+        "prior": {
+          "type": "object",
+          "required": [
+            "family"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "family": {
+              "enum": [
+                "Categorical",
+                "ConditionalCategorical",
+                "ConditionalGaussian",
+                "DerivedInitial",
+                "Deterministic",
+                "Dirichlet",
+                "Gaussian",
+                "InverseGamma",
+                "InverseWishart",
+                "JointCategorical",
+                "LearnedVector",
+                "LinearGaussianObservation",
+                "LinearGaussianTransition",
+                "MLPCategorical",
+                "MLPConditional",
+                "MLPPredictor",
+                "MatrixNormal",
+                "MixtureGaussian",
+                "NonlinearGaussianTransition",
+                "PredictorHead"
+              ]
+            },
+            "parents": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/parent"
+              }
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/names"
+              }
+            },
+            "options": {
+              "type": "object"
+            }
+          }
+        }
+      },
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "family"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "family": {
+            "enum": [
+              "Categorical",
+              "ConditionalCategorical",
+              "ConditionalGaussian",
+              "DerivedInitial",
+              "Deterministic",
+              "Dirichlet",
+              "Gaussian",
+              "InverseGamma",
+              "InverseWishart",
+              "JointCategorical",
+              "LearnedVector",
+              "LinearGaussianObservation",
+              "LinearGaussianTransition",
+              "MLPCategorical",
+              "MLPConditional",
+              "MLPPredictor",
+              "MatrixNormal",
+              "MixtureGaussian",
+              "NonlinearGaussianTransition",
+              "PredictorHead"
+            ]
+          },
+          "parents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/parent"
+            }
+          },
+          "parameters": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/$defs/names"
+            }
+          },
+          "options": {
+            "type": "object"
+          },
+          "steps": {
+            "enum": [
+              "0",
+              "1+",
+              "all"
+            ]
+          }
+        }
+      }
+    },
+    "term": {
+      "type": "object",
+      "required": [
+        "term"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "term": {
+          "type": "string",
+          "minLength": 1
+        },
+        "on": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/names"
+          }
+        },
+        "options": {
+          "type": "object"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/body"
+            },
+            {
+              "type": "object",
+              "required": [
+                "ref"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "ref": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "body": {
+      "type": "object",
+      "required": [
+        "variables",
+        "configuration"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "variables": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[^\\[\\]]+$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/variable"
+          }
+        },
+        "factors": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/block"
+          }
+        },
+        "relations": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "controls": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "observed": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "external": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "clamps": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/clamp"
+          }
+        },
+        "objective": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "decomposition": {
+              "enum": [
+                "utility_infogain",
+                "risk_ambiguity"
+              ]
+            },
+            "terms": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/term"
+              }
+            }
+          }
+        },
+        "configuration": {
+          "type": "object",
+          "required": [
+            "planning"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "planning": {
+              "type": "object",
+              "required": [
+                "horizon"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "planner": {
+                  "type": "string"
+                },
+                "horizon": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "gamma": {
+                  "type": "number"
+                },
+                "precision": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "branch_on": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "belief": {
+                  "enum": [
+                    "prior",
+                    "posterior"
+                  ]
+                },
+                "feedback": {
+                  "enum": [
+                    "linear_quadratic"
+                  ]
+                }
+              }
+            },
+            "inference": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "iterations": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "mixture_k": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "mixture_schedule": {
+                  "enum": [
+                    "runnalls",
+                    "mode_aligned"
+                  ]
+                }
+              }
+            },
+            "learning": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "frozen": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,158 @@
+[
+ {
+  "arm": "02",
+  "agent": "sonnet",
+  "run": 1,
+  "answers": {
+   "q1_chooses": "The state factor \"location\" is the controlled one (\"controlled\": true, \"num_controls\": 4), so the rat chooses its location (one of 4 moves). \"context\" is \"controlled\": false.",
+   "q2_cue_depends_on": "The observation \"cue\" has \"observes\": [\"location\", \"context\"]. In \"likelihood:cue\" the concentration array has shape [3, 4, 2] with \"parent_ndims\": 2, which matches 2 cue outcomes over 4 locations and 3 context-side values.",
+   "q3_learned_and_prior": "The learned parameters are in \"likelihood:cue\". Its family is \"ConditionalDirichlet\", with a \"concentration\" array of shape [3, 4, 2] whose values are all 1.0 (a uniform Dirichlet prior). Its \"fields\" entry \"alpha0\" is null. The other declarations are fixed Categorical or ConditionalCategorical tables.",
+   "q4_where_slip_written": "The slip is in the \"log_table\" of \"transition:location\". For the move rows, the intended next location has log-probability -0.105 (about 0.90) and each other location has -3.401 (about 0.033). Rows for the other state values are near-deterministic (0.0 against -20.72). No separate slip field exists. \"transition_parents\" of location is [\"location\"].",
+   "q5_terminal_depends_on": "The \"terminal_targets:location\" declaration is a ConditionalCategorical with \"parent_ndims\": 1 and a [4, 2] log_table. In the structure, location's \"terminal_parents\" is [\"context\"]. So the end-of-horizon preference over location depends on context. The table's rows are indexed by 4 values and its columns by 2, and the document does not say which axis is context.",
+   "q6_steps_ahead": "3 steps ahead: \"policy_len\": 3, with \"planner\": \"enumeration\"."
+  }
+ },
+ {
+  "arm": "02",
+  "agent": "sonnet",
+  "run": 2,
+  "answers": {
+   "q1_chooses": "The state factor \"location\" (structure.states[0]) with \"controlled\": true and \"num_controls\": 4. The rat picks among 4 control values. \"context\" is \"controlled\": false.",
+   "q2_cue_depends_on": "The observation \"cue\" has \"observes\": [\"location\", \"context\"]. Its declaration \"likelihood:cue\" has \"parent_ndims\": 2 and a concentration array of shape [3, 4, 2]. The 4 matches location and the 2 matches context.",
+   "q3_learned_and_prior": "\"likelihood:cue\" is the only learned parameter. Its family is \"ConditionalDirichlet\", and its prior is \"concentration\" of shape [3, 4, 2], all 1.0 (a uniform Dirichlet), with \"alpha0\": null. The other declarations (transition:location, initial_state_prior:location, transition:context, initial_state_prior:context, likelihood:position, terminal_targets:location) use fixed Categorical or ConditionalCategorical families. The document does not state a learning rule beyond the Dirichlet family.",
+   "q4_where_slip_written": "In the \"transition:location\" declaration, in arrays.log_table, which has shape [4, 4, 4]. The intended-move entries are -0.105 (about 0.9), and the other three destinations get -3.40 (about 0.033 each). The document has no separate slip field or parameter. The slip appears only as these table values.",
+   "q5_terminal_depends_on": "The declaration \"terminal_targets:location\" is a ConditionalCategorical with log_table shape [4, 2] and \"parent_ndims\": 1. It is conditioned on \"context\", the state's terminal_parents entry (\"terminal_parents\": [\"context\"]). Its log-probabilities are high at location 1 for context 0 and at location 2 for context 1 (-0.139 versus -3.139). The preference is therefore over location, given context.",
+   "q6_steps_ahead": "3 steps. structure has \"policy_len\": 3 with \"planner\": \"enumeration\"."
+  }
+ },
+ {
+  "arm": "02",
+  "agent": "haiku",
+  "run": 1,
+  "answers": {
+   "q1_chooses": "location",
+   "q2_cue_depends_on": "location and context",
+   "q3_learned_and_prior": "likelihood:cue (ConditionalDirichlet) with uniform Dirichlet prior (concentration: 1.0)",
+   "q4_where_slip_written": "transition:location, log_table array (off-diagonal low-probability entries)",
+   "q5_terminal_depends_on": "location (parent_ndims: 1)",
+   "q6_steps_ahead": "3 (policy_len: 3)"
+  }
+ },
+ {
+  "arm": "02",
+  "agent": "haiku",
+  "run": 2,
+  "answers": {
+   "q1_chooses": "location",
+   "q2_cue_depends_on": "location and context",
+   "q3_learned_and_prior": "likelihood:cue with Dirichlet prior (concentration 1.0)",
+   "q4_where_slip_written": "transition:location \u2192 arrays \u2192 log_table",
+   "q5_terminal_depends_on": "location",
+   "q6_steps_ahead": "3"
+  }
+ },
+ {
+  "arm": "03role",
+  "agent": "sonnet",
+  "run": 1,
+  "answers": {
+   "q1_chooses": "The rat chooses the control variable \"u_location\" (4 levels), declared in \"variables\" and listed in relations.controls as \"u_location\": \"a_location\". It drives the \"location\" transition (parents [\"location\",\"u_location\"]). The document gives no prior or policy over u_location beyond that.",
+   "q2_cue_depends_on": "factors.cue.likelihood is a ConditionalCategorical with parents [\"location\",\"context\"] and log_table \"A_cue\" (shape [3,4,2]). So the cue depends on the rat's location and on the hidden context. It is listed in relations.observed.",
+   "q3_learned_and_prior": "Only \"A_cue\" is learned. It has factors.A_cue.prior = Dirichlet with concentration \"A_cue_concentration\", which is clamped to 1.0 (a flat prior) and has shape [3,4,2]. Every other parameter (D_location, B_location, D_context, B_context, A_position, K_a_location, H_location) has an entry in \"clamps\", so it is fixed.",
+   "q4_where_slip_written": "The slip is in the \"K_a_location\" table, which is the log_table of factors.a_location.actuator (parent u_location). It maps the chosen u_location to the executed a_location. The diagonal is -0.105 (about 0.9 probability) and the off-diagonal entries are -3.40 (about 0.033 each), as set in clamps.K_a_location. B_location, by contrast, is deterministic: its entries are 0 or -20.7.",
+   "q5_terminal_depends_on": "factors.location.terminal is a ConditionalCategorical with parents [\"context\"] and log_table \"H_location\" (shape [4,2]). So the end-of-horizon preference is over location and depends on context. The values are clamped in clamps.H_location.",
+   "q6_steps_ahead": "It plans 3 steps ahead: configuration.planning.horizon = 3, with planner \"enumeration\" and gamma 16.0."
+  }
+ },
+ {
+  "arm": "03role",
+  "agent": "sonnet",
+  "run": 2,
+  "answers": {
+   "q1_chooses": "The rat chooses the control variable u_location (relations.controls maps u_location -> a_location). u_location is a 4-level categorical that drives the location transition, and the executed action a_location is derived from it.",
+   "q2_cue_depends_on": "The cue observation (3 levels) depends on location and context: factors.cue.likelihood is a ConditionalCategorical with parents [\"location\",\"context\"] and log_table A_cue (shape [3,4,2]).",
+   "q3_learned_and_prior": "Only A_cue is learned: factors.A_cue.prior is a Dirichlet with concentration A_cue_concentration, which clamps to 1.0 (a flat prior) over shape [3,4,2]. Everything else (D_*, B_*, A_position, K_a_location, H_location) is fixed via \"clamps\".",
+   "q4_where_slip_written": "In the actuator factor: factors.a_location.actuator (ConditionalCategorical, parent u_location, log_table K_a_location), clamped to log(0.9) = -0.105 on the diagonal and log(0.0333) = -3.401 off it. So the executed a_location matches the chosen u_location with probability 0.9 and slips to each other location with about 0.033.",
+   "q5_terminal_depends_on": "The end-of-horizon preference is factors.location.terminal, a ConditionalCategorical with parent [\"context\"] and log_table H_location (shape [4,2]). It is a preference over location that depends on context.",
+   "q6_steps_ahead": "3 steps: configuration.planning.horizon = 3 (planner \"enumeration\", gamma 16.0)."
+  }
+ },
+ {
+  "arm": "03role",
+  "agent": "haiku",
+  "run": 1,
+  "answers": {
+   "q1_chooses": "u_location",
+   "q2_cue_depends_on": "location and context (the parents field in the cue likelihood factor lists both)",
+   "q3_learned_and_prior": "A_cue is learned from a Dirichlet prior (specified in the factors.A_cue.prior section with Dirichlet family and concentration A_cue_concentration)",
+   "q4_where_slip_written": "In the clamps.B_location log-table, where the diagonal entries are 0.0 (intended transitions) and off-diagonal entries are -20.7232666015625 (slip/unreliability to unintended locations)",
+   "q5_terminal_depends_on": "context (the parents field in the location terminal factor lists only context)",
+   "q6_steps_ahead": "3 (specified as horizon in configuration.planning)"
+  }
+ },
+ {
+  "arm": "03role",
+  "agent": "haiku",
+  "run": 2,
+  "answers": {
+   "q1_chooses": "u_location",
+   "q2_cue_depends_on": "location and context",
+   "q3_learned_and_prior": "A_cue from Dirichlet prior with concentration A_cue_concentration",
+   "q4_where_slip_written": "K_a_location (actuator factor parameters in clamps)",
+   "q5_terminal_depends_on": "context",
+   "q6_steps_ahead": "3"
+  }
+ },
+ {
+  "arm": "03generic",
+  "agent": "sonnet",
+  "run": 1,
+  "answers": {
+   "q1_chooses": "The rat chooses u_location (categorical, 4 levels). relations.controls maps u_location to a_location, the emitted action.",
+   "q2_cue_depends_on": "The cue observation depends on location[t] and context[t]. This is the factor cue.sees, a ConditionalCategorical with log_table A_cue, which has shape [3,4,2].",
+   "q3_learned_and_prior": "A_cue is the only learned parameter. It has factors.A_cue.prior, a Dirichlet with concentration A_cue_concentration, which is clamped to 1.0 with shape [3,4,2]. D_location, B_location, D_context, B_context, A_position, K_a_location and H_location are all fixed by clamps. A_cue_concentration is clamped too, as the prior's hyperparameter.",
+   "q4_where_slip_written": "The slip is the factor a_location.slips. It is a ConditionalCategorical with parent u_location[t], log_table K_a_location, and steps \"all\". In clamps, K_a_location has -0.105 on the diagonal (about 0.9 probability of the intended move) and -3.40 off the diagonal (about 0.033 each).",
+   "q5_terminal_depends_on": "The end-of-horizon preference is the factor location.terminal. It is a ConditionalCategorical with parent context and log_table H_location, which has shape [4,2]. It therefore depends on context and is a preference over location given context.",
+   "q6_steps_ahead": "The rat plans 3 steps ahead: configuration.planning.horizon is 3. The planner is \"enumeration\" and gamma is 16.0."
+  }
+ },
+ {
+  "arm": "03generic",
+  "agent": "sonnet",
+  "run": 2,
+  "answers": {
+   "q1_chooses": "The rat chooses u_location (categorical, 4 levels). It is declared as a variable and named in relations.controls as the control that drives a_location. It has no factor of its own.",
+   "q2_cue_depends_on": "The cue is read by factors.cue.sees (ConditionalCategorical, parents location[t] and context[t], log_table A_cue, steps \"all\"). So it depends on the rat's location and the context at the same time step. cue is listed in relations.observed.",
+   "q3_learned_and_prior": "Only A_cue is learned. factors.A_cue.prior is family Dirichlet with concentration A_cue_concentration, and clamps sets A_cue_concentration to 1.0, so the prior is Dirichlet(1.0) over each column of the 3x4x2 table. Every other parameter has a value in clamps and is fixed. A_cue is not in clamps.",
+   "q4_where_slip_written": "In factors.a_location.slips. It is a ConditionalCategorical with parent u_location[t], log_table K_a_location, and steps \"all\". The values are in clamps.K_a_location: -0.105 (probability about 0.9) on the diagonal and -3.401 (about 0.033) off it.",
+   "q5_terminal_depends_on": "factors.location.terminal is a ConditionalCategorical with parent context and log_table H_location (shape 4x2). So the end-of-horizon preference depends on context, as a log-table over location given context. The document calls it a \"terminal\" factor and does not label it a preference explicitly.",
+   "q6_steps_ahead": "3. configuration.planning.horizon is 3, with planner \"enumeration\" and gamma 16.0."
+  }
+ },
+ {
+  "arm": "03generic",
+  "agent": "haiku",
+  "run": 1,
+  "answers": {
+   "q1_chooses": "u_location",
+   "q2_cue_depends_on": "location[t] and context[t]",
+   "q3_learned_and_prior": "A_cue is learned with Dirichlet prior parameterized by A_cue_concentration",
+   "q4_where_slip_written": "a_location.slips factor, parameterized by K_a_location",
+   "q5_terminal_depends_on": "context",
+   "q6_steps_ahead": "3"
+  }
+ },
+ {
+  "arm": "03generic",
+  "agent": "haiku",
+  "run": 2,
+  "answers": {
+   "q1_chooses": "u_location",
+   "q2_cue_depends_on": "location[t] and context[t]",
+   "q3_learned_and_prior": "A_cue is learned, with Dirichlet prior parameterized by A_cue_concentration",
+   "q4_where_slip_written": "a_location factor, \"slips\" subfactor, parameters K_a_location",
+   "q5_terminal_depends_on": "context",
+   "q6_steps_ahead": "3"
+  }
+ }
+]

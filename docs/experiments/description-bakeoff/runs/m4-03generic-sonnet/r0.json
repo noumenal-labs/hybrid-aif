@@ -1,0 +1,148 @@
+{
+  "hybrid_aif_description": "0.3",
+  "variables": {
+    "rat.location": {"domain": "categorical", "levels": 4},
+    "rat.context": {"domain": "categorical", "levels": 2},
+    "maze.location": {"domain": "categorical", "levels": 4},
+    "maze.context": {"domain": "categorical", "levels": 2},
+    "rat.u_location": {"domain": "categorical", "levels": 4},
+    "rat.a_location": {"domain": "categorical", "levels": 4},
+    "rat.position": {"domain": "categorical", "levels": 4},
+    "rat.cue": {"domain": "categorical", "levels": 3},
+    "rat.outcome": {"domain": "categorical", "levels": 3},
+    "rat.D_location": {"domain": "logits", "shape": [4]},
+    "rat.B_location": {"domain": "log_simplex", "shape": [4, 4, 4]},
+    "rat.D_context": {"domain": "logits", "shape": [2]},
+    "rat.B_context": {"domain": "log_simplex", "shape": [2, 2]},
+    "maze.D_location": {"domain": "logits", "shape": [4]},
+    "maze.B_location": {"domain": "log_simplex", "shape": [4, 4, 4]},
+    "maze.D_context": {"domain": "logits", "shape": [2]},
+    "maze.B_context": {"domain": "log_simplex", "shape": [2, 2]},
+    "rat.A_position": {"domain": "log_simplex", "shape": [4, 4]},
+    "rat.A_cue": {"domain": "log_simplex", "shape": [3, 4, 2]},
+    "rat.A_outcome": {"domain": "log_simplex", "shape": [3, 4, 2]},
+    "rat.C_outcome": {"domain": "logits", "shape": [3]}
+  },
+  "factors": {
+    "rat.location": {
+      "start": {
+        "family": "Categorical",
+        "parameters": {"logits": "rat.D_location"},
+        "steps": "0"
+      },
+      "move": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.location[t-1]", "rat.u_location[t-1]"],
+        "parameters": {"log_table": "rat.B_location"},
+        "steps": "1+"
+      }
+    },
+    "rat.context": {
+      "start": {
+        "family": "Categorical",
+        "parameters": {"logits": "rat.D_context"},
+        "steps": "0"
+      },
+      "persist": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.context[t-1]"],
+        "parameters": {"log_table": "rat.B_context"},
+        "steps": "1+"
+      }
+    },
+    "maze.location": {
+      "start": {
+        "family": "Categorical",
+        "parameters": {"logits": "maze.D_location"},
+        "steps": "0"
+      },
+      "move": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.location[t-1]", "rat.u_location[t-1]"],
+        "parameters": {"log_table": "maze.B_location"},
+        "steps": "1+"
+      }
+    },
+    "maze.context": {
+      "start": {
+        "family": "Categorical",
+        "parameters": {"logits": "maze.D_context"},
+        "steps": "0"
+      },
+      "persist": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.context[t-1]"],
+        "parameters": {"log_table": "maze.B_context"},
+        "steps": "1+"
+      }
+    },
+    "rat.position": {
+      "sees_position": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.location[t]"],
+        "parameters": {"log_table": "rat.A_position"},
+        "steps": "all"
+      }
+    },
+    "rat.cue": {
+      "sees_cue": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.location[t]", "rat.context[t]"],
+        "parameters": {"log_table": "rat.A_cue"},
+        "steps": "all"
+      }
+    },
+    "rat.outcome": {
+      "gets_outcome": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.location[t]", "rat.context[t]"],
+        "parameters": {"log_table": "rat.A_outcome"},
+        "steps": "all"
+      },
+      "target": {"family": "Categorical", "parameters": {"logits": "rat.C_outcome"}}
+    }
+  },
+  "relations": {
+    "controls": {"rat.u_location": "rat.a_location"},
+    "observed": ["rat.position", "rat.cue", "rat.outcome"]
+  },
+  "clamps": {
+    "rat.D_location": [0.0, -Infinity, -Infinity, -Infinity],
+    "rat.B_location": [
+      [[0.0, -Infinity, -Infinity, -Infinity], [-Infinity, -Infinity, -Infinity, -Infinity], [-Infinity, -Infinity, -Infinity, -Infinity], [0.0, -Infinity, -Infinity, -Infinity]],
+      [[-Infinity, 0.0, -Infinity, -Infinity], [0.0, 0.0, 0.0, 0.0], [-Infinity, -Infinity, -Infinity, -Infinity], [-Infinity, 0.0, -Infinity, -Infinity]],
+      [[-Infinity, -Infinity, 0.0, -Infinity], [-Infinity, -Infinity, -Infinity, -Infinity], [0.0, 0.0, 0.0, 0.0], [-Infinity, -Infinity, 0.0, -Infinity]],
+      [[-Infinity, -Infinity, -Infinity, 0.0], [-Infinity, -Infinity, -Infinity, -Infinity], [-Infinity, -Infinity, -Infinity, -Infinity], [-Infinity, -Infinity, -Infinity, 0.0]]
+    ],
+    "rat.D_context": [0.0, 0.0],
+    "rat.B_context": [[0.0, -Infinity], [-Infinity, 0.0]],
+    "maze.D_location": [0.0, -Infinity, -Infinity, -Infinity],
+    "maze.B_location": [
+      [[0.0, -0.6931471805599453, -0.6931471805599453, -0.6931471805599453], [-Infinity, -Infinity, -Infinity, -Infinity], [-Infinity, -Infinity, -Infinity, -Infinity], [0.0, -Infinity, -Infinity, -Infinity]],
+      [[-Infinity, -0.6931471805599453, -Infinity, -Infinity], [0.0, 0.0, 0.0, 0.0], [-Infinity, -Infinity, -Infinity, -Infinity], [-Infinity, 0.0, -Infinity, -Infinity]],
+      [[-Infinity, -Infinity, -0.6931471805599453, -Infinity], [-Infinity, -Infinity, -Infinity, -Infinity], [0.0, 0.0, 0.0, 0.0], [-Infinity, -Infinity, 0.0, -Infinity]],
+      [[-Infinity, -Infinity, -Infinity, -0.6931471805599453], [-Infinity, -Infinity, -Infinity, -Infinity], [-Infinity, -Infinity, -Infinity, -Infinity], [-Infinity, -Infinity, -Infinity, 0.0]]
+    ],
+    "maze.D_context": [0.0, 0.0],
+    "maze.B_context": [[0.0, -Infinity], [-Infinity, 0.0]],
+    "rat.A_position": [
+      [0.0, -Infinity, -Infinity, -Infinity],
+      [-Infinity, 0.0, -Infinity, -Infinity],
+      [-Infinity, -Infinity, 0.0, -Infinity],
+      [-Infinity, -Infinity, -Infinity, 0.0]
+    ],
+    "rat.A_cue": [
+      [[-Infinity, -Infinity], [-Infinity, -Infinity], [-Infinity, -Infinity], [0.0, -Infinity]],
+      [[-Infinity, -Infinity], [-Infinity, -Infinity], [-Infinity, -Infinity], [-Infinity, 0.0]],
+      [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [-Infinity, -Infinity]]
+    ],
+    "rat.A_outcome": [
+      [[-Infinity, -Infinity], [-0.020202707317519466, -3.912023005428146], [-3.912023005428146, -0.020202707317519466], [-Infinity, -Infinity]],
+      [[-Infinity, -Infinity], [-3.912023005428146, -0.020202707317519466], [-0.020202707317519466, -3.912023005428146], [-Infinity, -Infinity]],
+      [[0.0, 0.0], [-Infinity, -Infinity], [-Infinity, -Infinity], [0.0, 0.0]]
+    ],
+    "rat.C_outcome": [3.0, -3.0, 0.0]
+  },
+  "objective": {"decomposition": "utility_infogain"},
+  "configuration": {"planning": {"planner": "enumeration", "horizon": 2}}
+}

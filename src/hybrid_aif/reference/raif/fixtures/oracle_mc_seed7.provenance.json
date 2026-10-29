@@ -1,0 +1,10 @@
+{
+  "collected_at": "2026-10-04T13:06:18.749947",
+  "command": "python scripts/collect_prior.py --configs collect gym_mtc --run.steps 2000 --expname oracle_state_mc_seed7 --seed 7",
+  "commit_sha": "9b1864e8fab9d1becd6dd248f2c590d06ff22848",
+  "n_episodes": 48,
+  "n_steps": 1903,
+  "note": "complete collect stream from replay/ (per-env-worker chains; partial episodes at chain boundaries dropped); M+ is reproduced by the recipe routing successes",
+  "repo": "NACLab/robust-active-inference (local checkout: raif-paper)",
+  "seed": 7
+}

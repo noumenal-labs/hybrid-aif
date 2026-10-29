@@ -1,0 +1,249 @@
+{
+  "hybrid_aif_description": "0.3",
+  "variables": {
+    "rat.location": {"domain": "categorical", "levels": 4},
+    "rat.context": {"domain": "categorical", "levels": 2},
+    "rat.u_location": {"domain": "categorical", "levels": 4},
+    "rat.a_location": {"domain": "categorical", "levels": 4},
+    "rat.position": {"domain": "categorical", "levels": 4},
+    "rat.cue": {"domain": "categorical", "levels": 3},
+    "rat.outcome": {"domain": "categorical", "levels": 3},
+    "maze.location": {"domain": "categorical", "levels": 4},
+    "maze.context": {"domain": "categorical", "levels": 2},
+    "maze.door": {"domain": "categorical", "levels": 2},
+    "maze.position": {"domain": "categorical", "levels": 4},
+    "rat.D_location": {"domain": "logits", "shape": [4]},
+    "rat.B_location": {"domain": "log_simplex", "shape": [4, 4, 4]},
+    "rat.D_context": {"domain": "logits", "shape": [2]},
+    "rat.B_context": {"domain": "log_simplex", "shape": [2, 2]},
+    "rat.A_position": {"domain": "log_simplex", "shape": [4, 4]},
+    "rat.A_cue": {"domain": "log_simplex", "shape": [3, 4, 2]},
+    "rat.A_outcome": {"domain": "log_simplex", "shape": [3, 4, 2]},
+    "rat.C_outcome": {"domain": "logits", "shape": [3]},
+    "rat.K_a_location": {"domain": "log_simplex", "shape": [4, 4]},
+    "maze.D_location": {"domain": "logits", "shape": [4]},
+    "maze.B_location": {"domain": "log_simplex", "shape": [4, 4, 2, 4]},
+    "maze.D_context": {"domain": "logits", "shape": [2]},
+    "maze.B_context": {"domain": "log_simplex", "shape": [2, 2]},
+    "maze.D_door": {"domain": "logits", "shape": [2]},
+    "maze.B_door": {"domain": "log_simplex", "shape": [2, 2]},
+    "maze.A_position": {"domain": "log_simplex", "shape": [4, 4]}
+  },
+  "factors": {
+    "rat.location": {
+      "genesis": {
+        "family": "Categorical",
+        "steps": "0",
+        "parameters": {"logits": "rat.D_location"}
+      },
+      "advance": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.location[t-1]", "rat.u_location[t]"],
+        "steps": "1+",
+        "parameters": {"log_table": "rat.B_location"}
+      }
+    },
+    "rat.context": {
+      "genesis": {
+        "family": "Categorical",
+        "steps": "0",
+        "parameters": {"logits": "rat.D_context"}
+      },
+      "persist": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.context[t-1]"],
+        "steps": "1+",
+        "parameters": {"log_table": "rat.B_context"}
+      }
+    },
+    "rat.a_location": {
+      "apply": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.u_location[t]"],
+        "steps": "all",
+        "parameters": {"log_table": "rat.K_a_location"}
+      }
+    },
+    "rat.position": {
+      "see": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.location[t]"],
+        "steps": "all",
+        "parameters": {"log_table": "rat.A_position"}
+      }
+    },
+    "rat.cue": {
+      "perceive": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.location[t]", "rat.context[t]"],
+        "steps": "all",
+        "parameters": {"log_table": "rat.A_cue"}
+      }
+    },
+    "rat.outcome": {
+      "sense": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.location[t]", "rat.context[t]"],
+        "steps": "all",
+        "parameters": {"log_table": "rat.A_outcome"}
+      },
+      "target": {
+        "family": "Categorical",
+        "parameters": {"logits": "rat.C_outcome"}
+      }
+    },
+    "maze.location": {
+      "genesis": {
+        "family": "Categorical",
+        "steps": "0",
+        "parameters": {"logits": "maze.D_location"}
+      },
+      "advance": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.location[t-1]", "maze.door[t-1]", "rat.u_location[t]"],
+        "steps": "1+",
+        "parameters": {"log_table": "maze.B_location"}
+      }
+    },
+    "maze.context": {
+      "genesis": {
+        "family": "Categorical",
+        "steps": "0",
+        "parameters": {"logits": "maze.D_context"}
+      },
+      "persist": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.context[t-1]"],
+        "steps": "1+",
+        "parameters": {"log_table": "maze.B_context"}
+      }
+    },
+    "maze.door": {
+      "genesis": {
+        "family": "Categorical",
+        "steps": "0",
+        "parameters": {"logits": "maze.D_door"}
+      },
+      "maintain": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.door[t-1]"],
+        "steps": "1+",
+        "parameters": {"log_table": "maze.B_door"}
+      }
+    },
+    "maze.position": {
+      "observe": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.location[t]"],
+        "steps": "all",
+        "parameters": {"log_table": "maze.A_position"}
+      }
+    }
+  },
+  "relations": {
+    "controls": {"rat.u_location": "rat.a_location"},
+    "observed": ["rat.position", "rat.cue", "rat.outcome", "maze.position"]
+  },
+  "clamps": {
+    "rat.D_location": [-20, -20, -20, 0],
+    "rat.B_location": [
+      [
+        [0, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20]
+      ],
+      [
+        [-20, 0, -20, -20],
+        [0, 0, 0, 0],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20]
+      ],
+      [
+        [-20, -20, 0, -20],
+        [-20, -20, -20, -20],
+        [0, 0, 0, 0],
+        [-20, -20, -20, -20]
+      ],
+      [
+        [-20, -20, -20, 0],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [0, 0, 0, 0]
+      ]
+    ],
+    "rat.D_context": [0, 0],
+    "rat.B_context": [[0, -20], [-20, 0]],
+    "rat.A_position": [[0, -20, -20, -20], [-20, 0, -20, -20], [-20, -20, 0, -20], [-20, -20, -20, 0]],
+    "rat.A_cue": [
+      [[-20, -20], [-20, -20], [-20, -20], [0, -20]],
+      [[-20, -20], [-20, -20], [-20, -20], [-20, 0]],
+      [[0, 0], [0, 0], [0, 0], [-20, -20]]
+    ],
+    "rat.A_outcome": [
+      [[-20, -20], [-0.02025, -3.912], [-3.912, -0.02025], [-20, -20]],
+      [[-20, -20], [-3.912, -0.02025], [-0.02025, -3.912], [-20, -20]],
+      [[0, 0], [-20, -20], [-20, -20], [0, 0]]
+    ],
+    "rat.C_outcome": [3, -3, 0],
+    "rat.K_a_location": [[0, -20, -20, -20], [-20, 0, -20, -20], [-20, -20, 0, -20], [-20, -20, -20, 0]],
+    "maze.D_location": [-20, -20, -20, 0],
+    "maze.B_location": [
+      [
+        [0, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [0, 0, 0, 0],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20]
+      ],
+      [
+        [-20, 0, -20, -20],
+        [0, 0, 0, 0],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [0, 0, 0, 0],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20]
+      ],
+      [
+        [-20, -20, 0, -20],
+        [-20, -20, -20, -20],
+        [0, 0, 0, 0],
+        [-20, -20, -20, -20],
+        [0, 0, 0, 0],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20]
+      ],
+      [
+        [-20, -20, -20, 0],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20],
+        [-20, -20, -20, -20]
+      ]
+    ],
+    "maze.D_context": [0, 0],
+    "maze.B_context": [[0, -20], [-20, 0]],
+    "maze.D_door": [0, 0],
+    "maze.B_door": [[0, -20], [-20, 0]],
+    "maze.A_position": [[0, -20, -20, -20], [-20, 0, -20, -20], [-20, -20, 0, -20], [-20, -20, -20, 0]]
+  },
+  "objective": {
+    "decomposition": "utility_infogain"
+  },
+  "configuration": {
+    "planning": {
+      "horizon": 2,
+      "planner": "enumeration",
+      "gamma": 16.0
+    }
+  }
+}

@@ -1,0 +1,131 @@
+{
+  "hybrid_aif_description": "0.3",
+  "library_version": "0.11.0",
+  "variables": {
+    "location": {"domain": "categorical", "levels": 4},
+    "context": {"domain": "categorical", "levels": 2},
+    "u_location": {"domain": "categorical", "levels": 4},
+    "a_location": {"domain": "categorical", "levels": 4},
+    "position": {"domain": "categorical", "levels": 4},
+    "cue": {"domain": "categorical", "levels": 3},
+    "D_location": {"domain": "logits", "shape": [4]},
+    "B_location": {"domain": "log_simplex", "shape": [4, 4, 4]},
+    "D_context": {"domain": "logits", "shape": [2]},
+    "B_context": {"domain": "log_simplex", "shape": [2, 2]},
+    "A_position": {"domain": "log_simplex", "shape": [4, 4]},
+    "A_cue": {"domain": "log_simplex", "shape": [3, 2]},
+    "A_cue_concentration": {"domain": "positive", "shape": [3, 2]},
+    "K_a_location": {"domain": "log_simplex", "shape": [4, 4]},
+    "H_location": {"domain": "log_simplex", "shape": [4, 2]}
+  },
+  "factors": {
+    "location": {
+      "initial": {"family": "Categorical", "parameters": {"logits": "D_location"}},
+      "transition": {
+        "family": "ConditionalCategorical",
+        "parents": ["location", "a_location"],
+        "parameters": {"log_table": "B_location"}
+      },
+      "terminal": {
+        "family": "ConditionalCategorical",
+        "parents": ["context"],
+        "parameters": {"log_table": "H_location"}
+      }
+    },
+    "context": {
+      "initial": {"family": "Categorical", "parameters": {"logits": "D_context"}},
+      "transition": {
+        "family": "ConditionalCategorical",
+        "parents": ["context"],
+        "parameters": {"log_table": "B_context"}
+      }
+    },
+    "a_location": {
+      "actuator": {
+        "family": "ConditionalCategorical",
+        "parents": ["u_location"],
+        "parameters": {"log_table": "K_a_location"}
+      }
+    },
+    "position": {
+      "likelihood": {
+        "family": "ConditionalCategorical",
+        "parents": ["location"],
+        "parameters": {"log_table": "A_position"}
+      }
+    },
+    "cue": {
+      "likelihood": {
+        "family": "ConditionalCategorical",
+        "parents": ["context"],
+        "parameters": {"log_table": "A_cue"}
+      }
+    },
+    "A_cue": {
+      "prior": {"family": "Dirichlet", "parameters": {"concentration": "A_cue_concentration"}}
+    }
+  },
+  "relations": {
+    "controls": {"u_location": "a_location"},
+    "observed": ["position", "cue"]
+  },
+  "clamps": {
+    "D_location": [-0.02, -4.605, -4.605, -4.605],
+    "B_location": [
+      [
+        [-0.02, -4.605, -4.605, -4.605],
+        [-4.605, -4.605, -4.605, -4.605],
+        [-4.605, -4.605, -4.605, -4.605],
+        [-0.02, -4.605, -4.605, -4.605]
+      ],
+      [
+        [-4.605, -0.02, -4.605, -4.605],
+        [-0.02, -0.02, -0.02, -0.02],
+        [-4.605, -4.605, -4.605, -4.605],
+        [-4.605, -0.02, -4.605, -4.605]
+      ],
+      [
+        [-4.605, -4.605, -0.02, -4.605],
+        [-4.605, -4.605, -4.605, -4.605],
+        [-0.02, -0.02, -0.02, -0.02],
+        [-4.605, -4.605, -0.02, -4.605]
+      ],
+      [
+        [-4.605, -4.605, -4.605, -0.02],
+        [-4.605, -4.605, -4.605, -4.605],
+        [-4.605, -4.605, -4.605, -4.605],
+        [-4.605, -4.605, -4.605, -0.02]
+      ]
+    ],
+    "D_context": 0.0,
+    "B_context": [[-0.01, -4.605], [-4.605, -0.01]],
+    "A_position": [
+      [-0.02, -4.605, -4.605, -4.605],
+      [-4.605, -0.02, -4.605, -4.605],
+      [-4.605, -4.605, -0.02, -4.605],
+      [-4.605, -4.605, -4.605, -0.02]
+    ],
+    "A_cue": -1.0986122886681098,
+    "A_cue_concentration": 1.0,
+    "K_a_location": [
+      [-0.10536051565782628, -3.401197381623481, -3.401197381623481, -3.401197381623481],
+      [-3.401197381623481, -0.10536051565782628, -3.401197381623481, -3.401197381623481],
+      [-3.401197381623481, -3.401197381623481, -0.10536051565782628, -3.401197381623481],
+      [-3.401197381623481, -3.401197381623481, -3.401197381623481, -0.10536051565782628]
+    ],
+    "H_location": [
+      [-3.1399055841160303, -3.1399055841160303],
+      [-0.1399055841160303, -3.1399055841160303],
+      [-3.1399055841160303, -0.1399055841160303],
+      [-3.1399055841160303, -3.1399055841160303]
+    ]
+  },
+  "objective": {"decomposition": "utility_infogain"},
+  "configuration": {
+    "planning": {
+      "planner": "enumeration",
+      "horizon": 3,
+      "gamma": 16.0
+    }
+  }
+}

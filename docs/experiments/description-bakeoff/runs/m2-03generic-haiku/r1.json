@@ -1,0 +1,89 @@
+{
+  "hybrid_aif_description": "0.3",
+  "variables": {
+    "regime": {"domain": "categorical", "levels": 2},
+    "state": {"domain": "real", "dim": 2},
+    "position_obs": {"domain": "real", "dim": 1},
+    "regime_obs": {"domain": "categorical", "levels": 2},
+    "D_regime": {"domain": "logits", "shape": [2]},
+    "B_regime": {"domain": "log_simplex", "shape": [2, 2]},
+    "state_initial_loc": {"domain": "real", "shape": [2]},
+    "state_initial_chol": {"domain": "cholesky", "shape": [2, 2]},
+    "state_transition_F": {"domain": "real", "shape": [2, 2, 2]},
+    "state_transition_innovations_loc": {"domain": "real", "shape": [2, 2]},
+    "state_transition_innovations_chol": {"domain": "cholesky", "shape": [2, 2, 2]},
+    "position_obs_head": {"domain": "real", "shape": [1, 3]},
+    "position_obs_noise": {"domain": "cholesky", "shape": [1, 1]},
+    "regime_obs_table": {"domain": "log_simplex", "shape": [2, 2]}
+  },
+  "factors": {
+    "regime": {
+      "initial": {
+        "family": "Categorical",
+        "parameters": {"logits": "D_regime"}
+      },
+      "stochastic": {
+        "family": "ConditionalCategorical",
+        "parents": ["regime[t-1]"],
+        "steps": "1+",
+        "parameters": {"log_table": "B_regime"}
+      }
+    },
+    "state": {
+      "initial": {
+        "family": "Gaussian",
+        "parameters": {"loc": "state_initial_loc", "chol": "state_initial_chol"}
+      },
+      "stochastic": {
+        "family": "LinearGaussianTransition",
+        "parents": ["state[t-1]", "regime[t]"],
+        "steps": "1+",
+        "parameters": {
+          "F": "state_transition_F",
+          "innovations": {
+            "loc": "state_transition_innovations_loc",
+            "chol": "state_transition_innovations_chol"
+          }
+        }
+      }
+    },
+    "position_obs": {
+      "sensor": {
+        "family": "LinearGaussianObservation",
+        "parents": ["state[t]"],
+        "steps": "all",
+        "parameters": {
+          "head": "position_obs_head",
+          "noise": "position_obs_noise"
+        }
+      }
+    },
+    "regime_obs": {
+      "sensor": {
+        "family": "ConditionalCategorical",
+        "parents": ["regime[t]"],
+        "steps": "all",
+        "parameters": {"log_table": "regime_obs_table"}
+      }
+    }
+  },
+  "relations": {
+    "observed": ["position_obs", "regime_obs"]
+  },
+  "clamps": {
+    "D_regime": 0.0,
+    "B_regime": [[-0.10536051565782628, -2.3025850929940455], [-2.3025850929940455, -0.10536051565782628]],
+    "state_initial_loc": [0.0, 0.0],
+    "state_initial_chol": [[1.0, 0.0], [0.0, 1.0]],
+    "state_transition_F": [[[1.0, 1.0], [0.0, 1.0]], [[1.0, 1.0], [0.0, 1.0]]],
+    "state_transition_innovations_loc": [[0.0, 0.0], [0.0, 0.5]],
+    "state_transition_innovations_chol": [[[0.1, 0.0], [0.0, 0.1]], [[0.3, 0.0], [0.0, 0.3]]],
+    "position_obs_head": [[1.0, 0.0, 0.0]],
+    "position_obs_noise": [[0.2]],
+    "regime_obs_table": [[-0.2231435513142097, -1.6094379124341003], [-1.6094379124341003, -0.2231435513142097]]
+  },
+  "configuration": {
+    "planning": {"horizon": 1, "planner": "enumeration", "gamma": 16.0},
+    "inference": {"mixture_k": 2}
+  }
+}

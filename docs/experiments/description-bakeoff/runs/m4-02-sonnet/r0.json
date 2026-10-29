@@ -1,0 +1,120 @@
+{
+  "hybrid_aif_description": "0.2",
+  "sidecar": false,
+  "arrays_file": null,
+  "structure": {
+    "states": [
+      {"name": "rat.location", "transition_parents": ["rat.location"], "controlled": true, "num_controls": 4, "control_parents": ["rat.u_location"]},
+      {"name": "rat.context", "transition_parents": ["rat.context"], "controlled": false, "num_controls": 1},
+      {"name": "maze.location", "transition_parents": ["maze.location"], "controlled": true, "num_controls": 4, "control_parents": ["rat.u_location"]},
+      {"name": "maze.context", "transition_parents": ["maze.context"], "controlled": false, "num_controls": 1}
+    ],
+    "observations": [
+      {"name": "rat.position", "observes": ["maze.location"], "source": "maze.location"},
+      {"name": "rat.cue", "observes": ["rat.location", "rat.context"], "source": "external"},
+      {"name": "rat.outcome", "observes": ["rat.location", "rat.context"], "source": "external"},
+      {"name": "maze.position", "observes": ["maze.location"], "source": "external"},
+      {"name": "maze.outcome", "observes": ["maze.location", "maze.context"], "source": "external"}
+    ],
+    "policy_len": 2
+  },
+  "declarations": {
+    "transition:rat.location": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {"log_table": {"shape": [4, 4, 4], "dtype": "float32", "domain": "log_probability", "values": [
+        [[0, -20.7233, -20.7233, -20.7233], [-20.7233, -20.7233, -20.7233, -20.7233], [-20.7233, -20.7233, -20.7233, -20.7233], [0, -20.7233, -20.7233, -20.7233]],
+        [[-20.7233, 0, -20.7233, -20.7233], [0, 0, 0, 0], [-20.7233, -20.7233, -20.7233, -20.7233], [-20.7233, 0, -20.7233, -20.7233]],
+        [[-20.7233, -20.7233, 0, -20.7233], [-20.7233, -20.7233, -20.7233, -20.7233], [0, 0, 0, 0], [-20.7233, -20.7233, 0, -20.7233]],
+        [[-20.7233, -20.7233, -20.7233, 0], [-20.7233, -20.7233, -20.7233, -20.7233], [-20.7233, -20.7233, -20.7233, -20.7233], [-20.7233, -20.7233, -20.7233, 0]]
+      ]}}
+    },
+    "transition:rat.context": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {"log_table": {"shape": [2, 2, 1], "dtype": "float32", "domain": "log_probability", "values": [[[0], [-20.7233]], [[-20.7233], [0]]]}}
+    },
+    "transition:maze.location": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {"log_table": {"shape": [4, 4, 4], "dtype": "float32", "domain": "log_probability", "values": [
+        [[0, -0.6931, -0.6931, -0.6931], [-20.7233, -20.7233, -20.7233, -20.7233], [-20.7233, -20.7233, -20.7233, -20.7233], [0, -20.7233, -20.7233, -20.7233]],
+        [[-20.7233, -0.6931, -20.7233, -20.7233], [0, 0, 0, 0], [-20.7233, -20.7233, -20.7233, -20.7233], [-20.7233, 0, -20.7233, -20.7233]],
+        [[-20.7233, -20.7233, -0.6931, -20.7233], [-20.7233, -20.7233, -20.7233, -20.7233], [0, 0, 0, 0], [-20.7233, -20.7233, 0, -20.7233]],
+        [[-20.7233, -20.7233, -20.7233, -0.6931], [-20.7233, -20.7233, -20.7233, -20.7233], [-20.7233, -20.7233, -20.7233, -20.7233], [-20.7233, -20.7233, -20.7233, 0]]
+      ]}}
+    },
+    "transition:maze.context": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {"log_table": {"shape": [2, 2, 1], "dtype": "float32", "domain": "log_probability", "values": [[[0], [-20.7233]], [[-20.7233], [0]]]}}
+    },
+    "initial_state_prior:rat.location": {
+      "family": "Categorical",
+      "arrays": {"logits": {"shape": [4], "dtype": "float32", "domain": "logits", "values": [0, -20.7233, -20.7233, -20.7233]}}
+    },
+    "initial_state_prior:rat.context": {
+      "family": "Categorical",
+      "arrays": {"logits": {"shape": [2], "dtype": "float32", "domain": "logits", "values": [-0.6931, -0.6931]}}
+    },
+    "initial_state_prior:maze.location": {
+      "family": "Categorical",
+      "arrays": {"logits": {"shape": [4], "dtype": "float32", "domain": "logits", "values": [0, -20.7233, -20.7233, -20.7233]}}
+    },
+    "initial_state_prior:maze.context": {
+      "family": "Categorical",
+      "arrays": {"logits": {"shape": [2], "dtype": "float32", "domain": "logits", "values": [-0.6931, -0.6931]}}
+    },
+    "likelihood:rat.position": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 1},
+      "arrays": {"log_table": {"shape": [4, 4], "dtype": "float32", "domain": "log_probability", "values": [
+        [0, -20.7233, -20.7233, -20.7233],
+        [-20.7233, 0, -20.7233, -20.7233],
+        [-20.7233, -20.7233, 0, -20.7233],
+        [-20.7233, -20.7233, -20.7233, 0]
+      ]}}
+    },
+    "likelihood:rat.cue": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {"log_table": {"shape": [3, 4, 2], "dtype": "float32", "domain": "log_probability", "values": [
+        [[-20.7233, -20.7233], [-20.7233, -20.7233], [-20.7233, -20.7233], [0, -20.7233]],
+        [[-20.7233, -20.7233], [-20.7233, -20.7233], [-20.7233, -20.7233], [-20.7233, 0]],
+        [[0, 0], [0, 0], [0, 0], [-20.7233, -20.7233]]
+      ]}}
+    },
+    "likelihood:rat.outcome": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {"log_table": {"shape": [3, 4, 2], "dtype": "float32", "domain": "log_probability", "values": [
+        [[-20.7233, -20.7233], [-0.0202, -3.912], [-3.912, -0.0202], [-20.7233, -20.7233]],
+        [[-20.7233, -20.7233], [-3.912, -0.0202], [-0.0202, -3.912], [-20.7233, -20.7233]],
+        [[0, 0], [-20.7233, -20.7233], [-20.7233, -20.7233], [0, 0]]
+      ]}}
+    },
+    "likelihood:maze.position": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 1},
+      "arrays": {"log_table": {"shape": [4, 4], "dtype": "float32", "domain": "log_probability", "values": [
+        [0, -20.7233, -20.7233, -20.7233],
+        [-20.7233, 0, -20.7233, -20.7233],
+        [-20.7233, -20.7233, 0, -20.7233],
+        [-20.7233, -20.7233, -20.7233, 0]
+      ]}}
+    },
+    "likelihood:maze.outcome": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {"log_table": {"shape": [3, 4, 2], "dtype": "float32", "domain": "log_probability", "values": [
+        [[-20.7233, -20.7233], [-0.0202, -3.912], [-3.912, -0.0202], [-20.7233, -20.7233]],
+        [[-20.7233, -20.7233], [-3.912, -0.0202], [-0.0202, -3.912], [-20.7233, -20.7233]],
+        [[0, 0], [-20.7233, -20.7233], [-20.7233, -20.7233], [0, 0]]
+      ]}}
+    },
+    "obs_targets:rat.outcome": {
+      "family": "Categorical",
+      "arrays": {"logits": {"shape": [3], "dtype": "float32", "domain": "logits", "values": [3, -3, 0]}}
+    }
+  }
+}

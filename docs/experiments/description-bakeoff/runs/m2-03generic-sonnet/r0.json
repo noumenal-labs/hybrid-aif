@@ -1,0 +1,86 @@
+{
+  "hybrid_aif_description": "0.3",
+  "variables": {
+    "mode": {"domain": "categorical", "levels": 2},
+    "x": {"domain": "real", "dim": 2},
+    "y": {"domain": "real", "dim": 1},
+    "r": {"domain": "categorical", "levels": 2},
+    "D_mode": {"domain": "logits", "shape": [2]},
+    "B_mode": {"domain": "log_simplex", "shape": [2, 2]},
+    "x_start_loc": {"domain": "real", "shape": [2]},
+    "x_start_chol": {"domain": "cholesky", "shape": [2, 2]},
+    "x_dyn_F": {"domain": "real", "shape": [2, 2, 2]},
+    "x_dyn_innovations_loc": {"domain": "real", "shape": [2, 2]},
+    "x_dyn_innovations_chol": {"domain": "cholesky", "shape": [2, 2, 2]},
+    "y_sensor_head": {"domain": "real", "shape": [1, 3]},
+    "y_sensor_noise": {"domain": "cholesky", "shape": [1, 1]},
+    "r_sensor_table": {"domain": "log_simplex", "shape": [2, 2]}
+  },
+  "factors": {
+    "mode": {
+      "mode_start": {
+        "family": "Categorical",
+        "steps": "0",
+        "parameters": {"logits": "D_mode"}
+      },
+      "mode_sticky": {
+        "family": "ConditionalCategorical",
+        "parents": ["mode[t-1]"],
+        "steps": "1+",
+        "parameters": {"log_table": "B_mode"}
+      }
+    },
+    "x": {
+      "x_start": {
+        "family": "Gaussian",
+        "steps": "0",
+        "parameters": {"loc": "x_start_loc", "chol": "x_start_chol"}
+      },
+      "x_dyn": {
+        "family": "LinearGaussianTransition",
+        "parents": ["x[t-1]", "mode[t]"],
+        "steps": "1+",
+        "parameters": {
+          "F": "x_dyn_F",
+          "innovations": {
+            "loc": "x_dyn_innovations_loc",
+            "chol": "x_dyn_innovations_chol"
+          }
+        }
+      }
+    },
+    "y": {
+      "y_sensor": {
+        "family": "LinearGaussianObservation",
+        "parents": ["x[t]"],
+        "steps": "all",
+        "parameters": {"head": "y_sensor_head", "noise": "y_sensor_noise"}
+      }
+    },
+    "r": {
+      "r_sensor": {
+        "family": "ConditionalCategorical",
+        "parents": ["mode[t]"],
+        "steps": "all",
+        "parameters": {"log_table": "r_sensor_table"}
+      }
+    }
+  },
+  "relations": {
+    "observed": ["y", "r"]
+  },
+  "clamps": {
+    "D_mode": 0.0,
+    "B_mode": [[-0.10536051565782628, -2.302585092994046], [-2.302585092994046, -0.10536051565782628]],
+    "x_start_loc": [0.0, 0.0],
+    "x_start_chol": [[1.0, 0.0], [0.0, 1.0]],
+    "x_dyn_F": [[[1.0, 1.0], [0.0, 1.0]], [[1.0, 1.0], [0.0, 1.0]]],
+    "x_dyn_innovations_loc": [[0.0, 0.0], [0.0, 0.5]],
+    "x_dyn_innovations_chol": [[[0.1, 0.0], [0.0, 0.1]], [[0.3, 0.0], [0.0, 0.3]]],
+    "y_sensor_head": [[1.0, 0.0, 0.0]],
+    "y_sensor_noise": [[0.2]],
+    "r_sensor_table": [[-0.2231435513142097, -1.6094379124341003], [-1.6094379124341003, -0.2231435513142097]]
+  },
+  "objective": {"decomposition": "utility_infogain"},
+  "configuration": {"planning": {"planner": "enumeration", "horizon": 1}}
+}

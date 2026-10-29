@@ -1,0 +1,140 @@
+{
+  "hybrid_aif_description": "0.2",
+  "structure": {
+    "states": [
+      {
+        "name": "state",
+        "transition_parents": ["state", "regime"],
+        "controlled": false,
+        "num_controls": 1
+      },
+      {
+        "name": "regime",
+        "transition_parents": ["regime"],
+        "controlled": false,
+        "num_controls": 1
+      }
+    ],
+    "observations": [
+      {
+        "name": "obs_position",
+        "observes": ["state"]
+      },
+      {
+        "name": "obs_regime",
+        "observes": ["regime"]
+      }
+    ],
+    "policy_len": 1
+  },
+  "declarations": {
+    "transition:state": {
+      "family": "ConditionalGaussian",
+      "static": {
+        "parent_ndims": 2
+      },
+      "arrays": {
+        "loc": {
+          "shape": [2, 2, 2],
+          "dtype": "float32",
+          "domain": "real",
+          "values": [
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[1.0, 0.0], [0.5, 1.0]]
+          ]
+        },
+        "chol": {
+          "shape": [2, 2, 2],
+          "dtype": "float32",
+          "domain": "cholesky",
+          "values": [
+            [[0.1, 0.0], [0.0, 0.1]],
+            [[0.3, 0.0], [0.0, 0.3]]
+          ]
+        }
+      }
+    },
+    "transition:regime": {
+      "family": "ConditionalCategorical",
+      "static": {
+        "parent_ndims": 1
+      },
+      "arrays": {
+        "log_table": {
+          "shape": [2, 2, 1],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [[-0.10536051565782628], [-2.302585125923157]],
+            [[-2.302585125923157], [-0.10536051565782628]]
+          ]
+        }
+      }
+    },
+    "initial_state_prior:state": {
+      "family": "Gaussian",
+      "static": {},
+      "arrays": {
+        "loc": {
+          "shape": [2],
+          "dtype": "float32",
+          "domain": "real",
+          "values": [0.0, 0.0]
+        },
+        "chol": {
+          "shape": [2, 2],
+          "dtype": "float32",
+          "domain": "cholesky",
+          "values": [[1.0, 0.0], [0.0, 1.0]]
+        }
+      }
+    },
+    "initial_state_prior:regime": {
+      "family": "Categorical",
+      "static": {},
+      "arrays": {
+        "logits": {
+          "shape": [2],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [0.0, 0.0]
+        }
+      }
+    },
+    "likelihood:obs_position": {
+      "family": "LinearGaussianObservation",
+      "static": {},
+      "arrays": {
+        "head": {
+          "shape": [1, 2],
+          "dtype": "float32",
+          "domain": "real",
+          "values": [[1.0, 0.0]]
+        },
+        "noise": {
+          "shape": [1, 1],
+          "dtype": "float32",
+          "domain": "cholesky",
+          "values": [[0.2]]
+        }
+      }
+    },
+    "likelihood:obs_regime": {
+      "family": "ConditionalCategorical",
+      "static": {
+        "parent_ndims": 1
+      },
+      "arrays": {
+        "log_table": {
+          "shape": [2, 2, 1],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [[-0.2231435513142097], [-1.6094379424235657]],
+            [[-1.6094379424235657], [-0.2231435513142097]]
+          ]
+        }
+      }
+    }
+  }
+}

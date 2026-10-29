@@ -1,0 +1,373 @@
+[
+ [
+  "m1-02-haiku",
+  0,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m1-02-sonnet",
+  0,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m1-03generic-haiku",
+  0,
+  "REFUSED",
+  "clamps['B_location'] must be normalised log-probabilities (domain 'log_simplex': each distribution's entries are <= 0 and their exponentials sum to one); normalise it, or give the variable the domain 'logits' where its family takes logits",
+  "sentence"
+ ],
+ [
+  "m1-03generic-haiku",
+  1,
+  "REFUSED",
+  "clamps['A_position'] must be normalised log-probabilities (domain 'log_simplex': each distribution's entries are <= 0 and their exponentials sum to one); normalise it, or give the variable the domain 'logits' where its family takes logits",
+  "sentence"
+ ],
+ [
+  "m1-03generic-haiku",
+  2,
+  "REFUSED",
+  "clamps['A_cue']: the clamp has shape [3, 4, 4] and the variable declares [3, 4, 2]",
+  "sentence"
+ ],
+ [
+  "m1-03generic-haiku",
+  3,
+  "REFUSED",
+  "clamps['A_cue'] must be normalised log-probabilities (domain 'log_simplex': each distribution's entries are <= 0 and their exponentials sum to one); normalise it, or give the variable the domain 'logits' where its family takes logits",
+  "sentence"
+ ],
+ [
+  "m1-03generic-sonnet",
+  0,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m1-03role-haiku",
+  0,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m1-03role-sonnet",
+  0,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m2-02-haiku",
+  0,
+  "REFUSED",
+  "transition:regime: parent_ndims is 1 but the state has 1 transition parent(s); every transition table carries a trailing control axis (size 1 when uncontrolled), so parent_ndims must be 2",
+  "sentence"
+ ],
+ [
+  "m2-02-haiku",
+  1,
+  "REFUSED",
+  "likelihood:obs_regime: the table has 3 axes but parent_ndims=1 needs 2 (observation levels first, then the parents)",
+  "sentence"
+ ],
+ [
+  "m2-02-haiku",
+  2,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor 'state': unknown transition declaration type ConditionalGaussian",
+  "sentence"
+ ],
+ [
+  "m2-02-haiku",
+  3,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor 'state': a continuous factor's B_deps may only name categorical (discrete) factors, got ['state'] (self-dependence is excluded for continuous factors)",
+  "sentence"
+ ],
+ [
+  "m2-02-sonnet",
+  0,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor 'x': a continuous factor's B_deps may only name categorical (discrete) factors, got ['x'] (self-dependence is excluded for continuous factors)",
+  "sentence"
+ ],
+ [
+  "m2-02-sonnet",
+  1,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: 'jaxlib._jax.ArrayImpl' object has no attribute 'parent_shape'",
+  "sentence"
+ ],
+ [
+  "m2-02-sonnet",
+  2,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: 'jaxlib._jax.ArrayImpl' object has no attribute 'parent_shape'",
+  "sentence"
+ ],
+ [
+  "m2-02-sonnet",
+  3,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: 'jaxlib._jax.ArrayImpl' object has no attribute 'parent_shape'",
+  "sentence"
+ ],
+ [
+  "m2-03generic-haiku",
+  0,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor(s) ['state'] carry mixture beliefs, so System.mixture_k (the shared Runnalls budget) must be set",
+  "sentence"
+ ],
+ [
+  "m2-03generic-haiku",
+  1,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m2-03generic-sonnet",
+  0,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor(s) ['x'] carry mixture beliefs, so System.mixture_k (the shared Runnalls budget) must be set",
+  "sentence"
+ ],
+ [
+  "m2-03generic-sonnet",
+  1,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m2-03role-haiku",
+  0,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor(s) ['x'] carry mixture beliefs, so System.mixture_k (the shared Runnalls budget) must be set",
+  "sentence"
+ ],
+ [
+  "m2-03role-haiku",
+  1,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m2-03role-sonnet",
+  0,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor(s) ['x'] carry mixture beliefs, so System.mixture_k (the shared Runnalls budget) must be set",
+  "sentence"
+ ],
+ [
+  "m2-03role-sonnet",
+  1,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m3-02-haiku",
+  0,
+  "REFUSED",
+  "transition:location: parent_ndims is 1 but the state has 1 transition parent(s) and 0 control parent(s) (one trailing axis each, or one size-1 axis for none), so parent_ndims must be 2",
+  "sentence"
+ ],
+ [
+  "m3-02-haiku",
+  1,
+  "REFUSED",
+  "transition:location: the trailing control axes have sizes (4,) but the control parents [] declare num_controls (1,)",
+  "sentence"
+ ],
+ [
+  "m3-02-haiku",
+  2,
+  "REFUSED",
+  "transition:context: parent_ndims is 1 but the state has 1 transition parent(s) and 0 control parent(s) (one trailing axis each, or one size-1 axis for none), so parent_ndims must be 2",
+  "sentence"
+ ],
+ [
+  "m3-02-sonnet",
+  0,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m3-03generic-haiku",
+  0,
+  "REFUSED",
+  "the control node 'u_location' is read by no transition; a control node moves at least one latent, so list it among a transition's parents",
+  "sentence"
+ ],
+ [
+  "m3-03generic-haiku",
+  1,
+  "REFUSED",
+  "variable 'A_cue' has a clamp and a prior record; a parameter is either fixed (a clamp) or learned (a prior)",
+  "sentence"
+ ],
+ [
+  "m3-03generic-haiku",
+  2,
+  "REFUSED",
+  "clamps['B_location'] must be normalised log-probabilities (domain 'log_simplex': each distribution's entries are <= 0 and their exponentials sum to one); normalise it, or give the variable the domain 'logits' where its family takes logits",
+  "sentence"
+ ],
+ [
+  "m3-03generic-sonnet",
+  0,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m3-03role-haiku",
+  0,
+  "REFUSED",
+  "the control node 'u_location' is read by no transition; a control node moves at least one latent, so list it among a transition's parents",
+  "sentence"
+ ],
+ [
+  "m3-03role-haiku",
+  1,
+  "REFUSED",
+  "clamps['B_location'] must be normalised log-probabilities (domain 'log_simplex': each distribution's entries are <= 0 and their exponentials sum to one); normalise it, or give the variable the domain 'logits' where its family takes logits",
+  "sentence"
+ ],
+ [
+  "m3-03role-haiku",
+  2,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m3-03role-sonnet",
+  0,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m4-02-haiku",
+  0,
+  "REFUSED",
+  "transition:rat.location: the trailing control axes have sizes (4,) but the control parents [] declare num_controls (1,)",
+  "sentence"
+ ],
+ [
+  "m4-02-sonnet",
+  0,
+  "REFUSED",
+  "structure.states['rat.location'].control_parents names 'rat.u_location', but no state of that name is declared; the states are ['rat.location', 'rat.context', 'maze.location', 'maze.context']",
+  "sentence"
+ ],
+ [
+  "m4-02-sonnet",
+  1,
+  "REFUSED",
+  "structure does not declare a valid System: factor(s) ['maze.location'] are declared controlled but no factor reads their control (B_control_deps=((0,), (), (0,), ())): list each in the entry of a factor it moves, or declare it uncontrolled",
+  "sentence"
+ ],
+ [
+  "m4-02-sonnet",
+  2,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m4-03generic-haiku",
+  0,
+  "REFUSED",
+  "factors['rat.location']['advance']: a transition reads the control node 'rat.u_location' at the step it is chosen, the step before the child: write rat.u_location (or rat.u_location[t-1])",
+  "sentence"
+ ],
+ [
+  "m4-03generic-haiku",
+  1,
+  "REFUSED",
+  "clamps['maze.B_location']: the clamp has shape [4, 8, 4] and the variable declares [4, 4, 2, 4]",
+  "sentence"
+ ],
+ [
+  "m4-03generic-haiku",
+  2,
+  "REFUSED",
+  "clamps['maze.B_location'] must be normalised log-probabilities (domain 'log_simplex': each distribution's entries are <= 0 and their exponentials sum to one); normalise it, or give the variable the domain 'logits' where its family takes logits",
+  "sentence"
+ ],
+ [
+  "m4-03generic-haiku",
+  3,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor 'rat.context': transition has parent_ndims=1, but B_deps names 1 parent(s) and B_control_deps 0 control(s), so it needs 2 (the state parents, then one control axis per B_control_deps entry, or one size-1 axis when the entry is empty)",
+  "sentence"
+ ],
+ [
+  "m4-03generic-sonnet",
+  0,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor 'rat.context': transition has parent_ndims=1, but B_deps names 1 parent(s) and B_control_deps 0 control(s), so it needs 2 (the state parents, then one control axis per B_control_deps entry, or one size-1 axis when the entry is empty)",
+  "sentence"
+ ],
+ [
+  "m4-03generic-sonnet",
+  1,
+  "BUILT",
+  "",
+  ""
+ ],
+ [
+  "m4-03role-haiku",
+  0,
+  "REFUSED",
+  "clamps['rat.A_location']: no variable of that name",
+  "sentence"
+ ],
+ [
+  "m4-03role-haiku",
+  1,
+  "REFUSED",
+  "clamps['rat.B_location'] must be normalised log-probabilities (domain 'log_simplex': each distribution's entries are <= 0 and their exponentials sum to one); normalise it, or give the variable the domain 'logits' where its family takes logits",
+  "sentence"
+ ],
+ [
+  "m4-03role-haiku",
+  2,
+  "REFUSED",
+  "clamps['maze.B_location']: the clamp has shape [4, 4, 8] and the variable declares [4, 4, 4, 2]",
+  "sentence"
+ ],
+ [
+  "m4-03role-sonnet",
+  0,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor 'rat.context': transition has parent_ndims=1, but B_deps names 1 parent(s) and B_control_deps 0 control(s), so it needs 2 (the state parents, then one control axis per B_control_deps entry, or one size-1 axis when the entry is empty)",
+  "sentence"
+ ],
+ [
+  "m4-03role-sonnet",
+  1,
+  "REFUSED",
+  "the document builds, but the System it describes is invalid: factor 'maze.context': transition has parent_ndims=1, but B_deps names 1 parent(s) and B_control_deps 0 control(s), so it needs 2 (the state parents, then one control axis per B_control_deps entry, or one size-1 axis when the entry is empty)",
+  "sentence"
+ ],
+ [
+  "m4-03role-sonnet",
+  2,
+  "BUILT",
+  "",
+  ""
+ ]
+]

@@ -1,0 +1,128 @@
+{
+  "hybrid_aif_description": "0.2",
+  "structure": {
+    "states": [
+      {"name": "location", "transition_parents": ["location"], "controlled": true, "num_controls": 4},
+      {"name": "context", "transition_parents": ["context"], "controlled": false, "num_controls": 1}
+    ],
+    "observations": [
+      {"name": "position", "observes": ["location"], "source": "external"},
+      {"name": "cue", "observes": ["location", "context"], "source": "external"},
+      {"name": "outcome", "observes": ["location", "context"], "source": "external"}
+    ],
+    "policy_len": 2
+  },
+  "declarations": {
+    "transition:location": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {
+        "log_table": {
+          "shape": [4, 4, 4],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [[0.0, -20.7, -20.7, -20.7], [-20.7, -20.7, -20.7, -20.7], [-20.7, -20.7, -20.7, -20.7], [0.0, -20.7, -20.7, -20.7]],
+            [[-20.7, 0.0, -20.7, -20.7], [0.0, 0.0, 0.0, 0.0], [-20.7, -20.7, -20.7, -20.7], [-20.7, 0.0, -20.7, -20.7]],
+            [[-20.7, -20.7, 0.0, -20.7], [-20.7, -20.7, -20.7, -20.7], [0.0, 0.0, 0.0, 0.0], [-20.7, -20.7, 0.0, -20.7]],
+            [[-20.7, -20.7, -20.7, 0.0], [-20.7, -20.7, -20.7, -20.7], [-20.7, -20.7, -20.7, -20.7], [-20.7, -20.7, -20.7, 0.0]]
+          ]
+        }
+      }
+    },
+    "transition:context": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {
+        "log_table": {
+          "shape": [2, 2, 1],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [[[0.0], [-20.7]], [[-20.7], [0.0]]]
+        }
+      }
+    },
+    "initial_state_prior:location": {
+      "family": "Categorical",
+      "arrays": {
+        "logits": {
+          "shape": [4],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [0.0, -20.7, -20.7, -20.7]
+        }
+      }
+    },
+    "initial_state_prior:context": {
+      "family": "Categorical",
+      "arrays": {
+        "logits": {
+          "shape": [2],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [0.0, 0.0]
+        }
+      }
+    },
+    "likelihood:position": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 1},
+      "arrays": {
+        "log_table": {
+          "shape": [4, 4],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [0.0, -20.7, -20.7, -20.7],
+            [-20.7, 0.0, -20.7, -20.7],
+            [-20.7, -20.7, 0.0, -20.7],
+            [-20.7, -20.7, -20.7, 0.0]
+          ]
+        }
+      }
+    },
+    "likelihood:cue": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {
+        "log_table": {
+          "shape": [3, 4, 2],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [[-20.7, -20.7], [-20.7, -20.7], [-20.7, -20.7], [0.0, -20.7]],
+            [[-20.7, -20.7], [-20.7, -20.7], [-20.7, -20.7], [-20.7, 0.0]],
+            [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [-20.7, -20.7]]
+          ]
+        }
+      }
+    },
+    "likelihood:outcome": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {
+        "log_table": {
+          "shape": [3, 4, 2],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [[-20.7, -20.7], [-0.020203, -3.912023], [-3.912023, -0.020203], [-20.7, -20.7]],
+            [[-20.7, -20.7], [-3.912023, -0.020203], [-0.020203, -3.912023], [-20.7, -20.7]],
+            [[0.0, 0.0], [-20.7, -20.7], [-20.7, -20.7], [0.0, 0.0]]
+          ]
+        }
+      }
+    },
+    "obs_targets:outcome": {
+      "family": "Categorical",
+      "arrays": {
+        "logits": {
+          "shape": [3],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [3.0, -3.0, 0.0]
+        }
+      }
+    }
+  }
+}

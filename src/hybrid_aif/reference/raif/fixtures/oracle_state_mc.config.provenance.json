@@ -1,0 +1,11 @@
+{
+  "commit_sha": "9b1864e8fab9d1becd6dd248f2c590d06ff22848",
+  "copied_at": "2026-09-02",
+  "identical_across_seeds": true,
+  "n_lines": 197,
+  "note": "The RESOLVED configuration the oracle run actually executed - every default already substituted and dumped by their own driver, which is what makes it the ground truth rather than raif/configs.yaml (an inheritance chain a reader resolves by hand; three of chunk 2d's divergences were hand-resolutions that went wrong). Vendored so the parity audit is reproducible without the external checkout, and so a claim about 'their value' can be checked against a file in this repo. seed{1,2,3}'s dumps are byte-identical to this one apart from expname, logdir and seed - verified 2026-09-02, and asserted in tests/test_oracle_parity.py.",
+  "repo": "NACLab/robust-active-inference (local checkout: raif-paper)",
+  "seed": 0,
+  "source": "logs/oracle_state_mc_seed0/config.yaml",
+  "used_by": "docs/design/amortization.md, A12 implementation note chunk 2d, section (e) - the field-by-field disposition table"
+}

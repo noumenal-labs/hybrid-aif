@@ -1,0 +1,162 @@
+{
+  "hybrid_aif_description": "0.3",
+  "variables": {
+    "rat.location": {"domain": "categorical", "levels": 4},
+    "rat.context": {"domain": "categorical", "levels": 2},
+    "maze.location": {"domain": "categorical", "levels": 4},
+    "maze.context": {"domain": "categorical", "levels": 2},
+    "maze.door": {"domain": "categorical", "levels": 2},
+    "rat.u_location": {"domain": "categorical", "levels": 4},
+    "rat.a_location": {"domain": "categorical", "levels": 4},
+    "rat.position": {"domain": "categorical", "levels": 4},
+    "rat.cue": {"domain": "categorical", "levels": 3},
+    "rat.outcome": {"domain": "categorical", "levels": 3},
+    "rat.D_location": {"domain": "logits", "shape": [4]},
+    "rat.B_location": {"domain": "logits", "shape": [4, 4, 4]},
+    "rat.D_context": {"domain": "logits", "shape": [2]},
+    "rat.B_context": {"domain": "log_simplex", "shape": [2, 2]},
+    "maze.D_location": {"domain": "logits", "shape": [4]},
+    "maze.B_location": {"domain": "log_simplex", "shape": [4, 4, 4, 2]},
+    "maze.D_context": {"domain": "logits", "shape": [2]},
+    "maze.B_context": {"domain": "log_simplex", "shape": [2, 2]},
+    "maze.D_door": {"domain": "logits", "shape": [2]},
+    "maze.B_door": {"domain": "log_simplex", "shape": [2, 2]},
+    "rat.A_position": {"domain": "log_simplex", "shape": [4, 4]},
+    "rat.A_cue": {"domain": "log_simplex", "shape": [3, 4, 2]},
+    "rat.A_outcome": {"domain": "log_simplex", "shape": [3, 4, 2]},
+    "rat.C_outcome": {"domain": "logits", "shape": [3]},
+    "rat.K_a_location": {"domain": "log_simplex", "shape": [4, 4]}
+  },
+  "factors": {
+    "rat.location": {
+      "initial": {"family": "Categorical", "parameters": {"logits": "rat.D_location"}},
+      "transition": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.location", "rat.u_location"],
+        "parameters": {"log_table": "rat.B_location"}
+      }
+    },
+    "rat.context": {
+      "initial": {"family": "Categorical", "parameters": {"logits": "rat.D_context"}},
+      "transition": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.context"],
+        "parameters": {"log_table": "rat.B_context"}
+      }
+    },
+    "maze.location": {
+      "initial": {"family": "Categorical", "parameters": {"logits": "maze.D_location"}},
+      "transition": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.location", "rat.u_location", "maze.door"],
+        "parameters": {"log_table": "maze.B_location"}
+      }
+    },
+    "maze.context": {
+      "initial": {"family": "Categorical", "parameters": {"logits": "maze.D_context"}},
+      "transition": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.context"],
+        "parameters": {"log_table": "maze.B_context"}
+      }
+    },
+    "maze.door": {
+      "initial": {"family": "Categorical", "parameters": {"logits": "maze.D_door"}},
+      "transition": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.door"],
+        "parameters": {"log_table": "maze.B_door"}
+      }
+    },
+    "rat.a_location": {
+      "actuator": {
+        "family": "ConditionalCategorical",
+        "parents": ["rat.u_location"],
+        "parameters": {"log_table": "rat.K_a_location"}
+      }
+    },
+    "rat.position": {
+      "likelihood": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.location"],
+        "parameters": {"log_table": "rat.A_position"}
+      }
+    },
+    "rat.cue": {
+      "likelihood": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.location", "maze.context"],
+        "parameters": {"log_table": "rat.A_cue"}
+      }
+    },
+    "rat.outcome": {
+      "likelihood": {
+        "family": "ConditionalCategorical",
+        "parents": ["maze.location", "maze.context"],
+        "parameters": {"log_table": "rat.A_outcome"}
+      },
+      "target": {"family": "Categorical", "parameters": {"logits": "rat.C_outcome"}}
+    }
+  },
+  "relations": {
+    "controls": {"rat.u_location": "rat.a_location"},
+    "observed": ["rat.position", "rat.cue", "rat.outcome"]
+  },
+  "clamps": {
+    "rat.D_location": [0, -4.605, -4.605, -4.605],
+    "rat.B_location": [
+      [[-0.01, -4.605, -4.605, -4.605], [-4.605, -4.605, -4.605, -4.605], [-4.605, -4.605, -4.605, -4.605], [-0.01, -4.605, -4.605, -4.605]],
+      [[-4.605, -0.01, -4.605, -4.605], [-0.01, -0.01, -0.01, -0.01], [-4.605, -4.605, -4.605, -4.605], [-4.605, -0.01, -4.605, -4.605]],
+      [[-4.605, -4.605, -0.01, -4.605], [-4.605, -4.605, -4.605, -4.605], [-0.01, -0.01, -0.01, -0.01], [-4.605, -4.605, -0.01, -4.605]],
+      [[-4.605, -4.605, -4.605, -0.01], [-4.605, -4.605, -4.605, -4.605], [-4.605, -4.605, -4.605, -4.605], [-0.01, -4.605, -4.605, -0.01]]
+    ],
+    "rat.D_context": [0, 0],
+    "rat.B_context": [[-0.01, -4.605], [-4.605, -0.01]],
+    "maze.D_location": [0, -4.605, -4.605, -4.605],
+    "maze.B_location": [
+      [
+        [[-0.01, -4.605], [-4.605, -4.605], [-0.01, -0.01], [-0.01, -0.01]],
+        [[-4.605, -4.605], [-4.605, -4.605], [-0.01, -0.01], [-0.01, -0.01]],
+        [[-4.605, -4.605], [-4.605, -4.605], [-0.01, -0.01], [-0.01, -0.01]],
+        [[-0.01, -4.605], [-4.605, -4.605], [-0.01, -0.01], [-0.01, -0.01]]
+      ],
+      [
+        [[-4.605, -0.01], [-4.605, -4.605], [-4.605, -4.605], [-4.605, -4.605]],
+        [[-0.01, -0.01], [-0.01, -0.01], [-4.605, -4.605], [-4.605, -4.605]],
+        [[-4.605, -4.605], [-4.605, -4.605], [-4.605, -4.605], [-4.605, -4.605]],
+        [[-4.605, -0.01], [-4.605, -4.605], [-4.605, -4.605], [-4.605, -4.605]]
+      ],
+      [
+        [[-4.605, -4.605], [-0.01, -4.605], [-4.605, -4.605], [-4.605, -4.605]],
+        [[-4.605, -4.605], [-4.605, -4.605], [-4.605, -4.605], [-4.605, -4.605]],
+        [[-0.01, -0.01], [-0.01, -0.01], [-4.605, -4.605], [-4.605, -4.605]],
+        [[-4.605, -4.605], [-0.01, -4.605], [-4.605, -4.605], [-4.605, -4.605]]
+      ],
+      [
+        [[-4.605, -4.605], [-4.605, -0.01], [-0.01, -0.01], [-0.01, -0.01]],
+        [[-4.605, -4.605], [-4.605, -4.605], [-0.01, -0.01], [-0.01, -0.01]],
+        [[-4.605, -4.605], [-4.605, -4.605], [-0.01, -0.01], [-0.01, -0.01]],
+        [[-0.01, -4.605], [-4.605, -0.01], [-0.01, -0.01], [-0.01, -0.01]]
+      ]
+    ],
+    "maze.D_context": [0, 0],
+    "maze.B_context": [[-0.01, -4.605], [-4.605, -0.01]],
+    "maze.D_door": [0, 0],
+    "maze.B_door": [[0, 0], [0, 0]],
+    "rat.K_a_location": [[-0.01, -4.605, -4.605, -4.605], [-4.605, -0.01, -4.605, -4.605], [-4.605, -4.605, -0.01, -4.605], [-4.605, -4.605, -4.605, -0.01]],
+    "rat.A_position": [[-0.01, -4.605, -4.605, -4.605], [-4.605, -0.01, -4.605, -4.605], [-4.605, -4.605, -0.01, -4.605], [-4.605, -4.605, -4.605, -0.01]],
+    "rat.A_cue": [
+      [[-4.605, -4.605], [-4.605, -4.605], [-4.605, -4.605], [-0.02, -4.605]],
+      [[-4.605, -4.605], [-4.605, -4.605], [-4.605, -4.605], [-4.605, -0.02]],
+      [[0, 0], [0, 0], [0, 0], [-4.605, -4.605]]
+    ],
+    "rat.A_outcome": [
+      [[-4.605, -4.605], [-0.02, -3.912], [-3.912, -0.02], [-4.605, -4.605]],
+      [[-4.605, -4.605], [-3.912, -0.02], [-0.02, -3.912], [-4.605, -4.605]],
+      [[0, 0], [-4.605, -4.605], [-4.605, -4.605], [0, 0]]
+    ],
+    "rat.C_outcome": [3, -3, 0]
+  },
+  "objective": {"decomposition": "utility_infogain"},
+  "configuration": {"planning": {"planner": "enumeration", "horizon": 2, "gamma": 16.0}}
+}

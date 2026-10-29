@@ -1,0 +1,413 @@
+{
+ "hybrid_aif_description": "0.3",
+ "library_version": "0.11.0",
+ "variables": {
+  "location": {
+   "domain": "categorical",
+   "levels": 4
+  },
+  "context": {
+   "domain": "categorical",
+   "levels": 2
+  },
+  "u_location": {
+   "domain": "categorical",
+   "levels": 4
+  },
+  "a_location": {
+   "domain": "categorical",
+   "levels": 4
+  },
+  "position": {
+   "domain": "categorical",
+   "levels": 4
+  },
+  "cue": {
+   "domain": "categorical",
+   "levels": 3
+  },
+  "D_location": {
+   "domain": "logits",
+   "shape": [
+    4
+   ]
+  },
+  "B_location": {
+   "domain": "log_simplex",
+   "shape": [
+    4,
+    4,
+    4
+   ]
+  },
+  "D_context": {
+   "domain": "logits",
+   "shape": [
+    2
+   ]
+  },
+  "B_context": {
+   "domain": "log_simplex",
+   "shape": [
+    2,
+    2,
+    1
+   ]
+  },
+  "A_position": {
+   "domain": "log_simplex",
+   "shape": [
+    4,
+    4
+   ]
+  },
+  "A_cue": {
+   "domain": "log_simplex",
+   "shape": [
+    3,
+    4,
+    2
+   ]
+  },
+  "A_cue_concentration": {
+   "domain": "positive",
+   "shape": [
+    3,
+    4,
+    2
+   ]
+  },
+  "K_a_location": {
+   "domain": "log_simplex",
+   "shape": [
+    4,
+    4
+   ]
+  },
+  "H_location": {
+   "domain": "log_simplex",
+   "shape": [
+    4,
+    2
+   ]
+  }
+ },
+ "factors": {
+  "location": {
+   "terminal": {
+    "family": "ConditionalCategorical",
+    "parents": [
+     "context"
+    ],
+    "parameters": {
+     "log_table": "H_location"
+    }
+   },
+   "start": {
+    "family": "Categorical",
+    "parameters": {
+     "logits": "D_location"
+    },
+    "steps": "0"
+   },
+   "moves": {
+    "family": "ConditionalCategorical",
+    "parents": [
+     "location[t-1]",
+     "u_location[t-1]"
+    ],
+    "parameters": {
+     "log_table": "B_location"
+    },
+    "steps": "1+"
+   }
+  },
+  "context": {
+   "start": {
+    "family": "Categorical",
+    "parameters": {
+     "logits": "D_context"
+    },
+    "steps": "0"
+   },
+   "stays": {
+    "family": "ConditionalCategorical",
+    "parents": [
+     "context[t-1]"
+    ],
+    "parameters": {
+     "log_table": "B_context"
+    },
+    "steps": "1+"
+   }
+  },
+  "a_location": {
+   "slips": {
+    "family": "ConditionalCategorical",
+    "parents": [
+     "u_location[t]"
+    ],
+    "parameters": {
+     "log_table": "K_a_location"
+    },
+    "steps": "all"
+   }
+  },
+  "position": {
+   "reads": {
+    "family": "ConditionalCategorical",
+    "parents": [
+     "location[t]"
+    ],
+    "parameters": {
+     "log_table": "A_position"
+    },
+    "steps": "all"
+   }
+  },
+  "cue": {
+   "sees": {
+    "family": "ConditionalCategorical",
+    "parents": [
+     "location[t]",
+     "context[t]"
+    ],
+    "parameters": {
+     "log_table": "A_cue"
+    },
+    "steps": "all"
+   }
+  },
+  "A_cue": {
+   "prior": {
+    "family": "Dirichlet",
+    "parameters": {
+     "concentration": "A_cue_concentration"
+    }
+   }
+  }
+ },
+ "relations": {
+  "controls": {
+   "u_location": "a_location"
+  },
+  "observed": [
+   "position",
+   "cue"
+  ]
+ },
+ "clamps": {
+  "D_location": [
+   0.0,
+   -20.7232666015625,
+   -20.7232666015625,
+   -20.7232666015625
+  ],
+  "B_location": [
+   [
+    [
+     0.0,
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625
+    ],
+    [
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625
+    ],
+    [
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625
+    ],
+    [
+     0.0,
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625
+    ]
+   ],
+   [
+    [
+     -20.7232666015625,
+     0.0,
+     -20.7232666015625,
+     -20.7232666015625
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625
+    ],
+    [
+     -20.7232666015625,
+     0.0,
+     -20.7232666015625,
+     -20.7232666015625
+    ]
+   ],
+   [
+    [
+     -20.7232666015625,
+     -20.7232666015625,
+     0.0,
+     -20.7232666015625
+    ],
+    [
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     -20.7232666015625,
+     -20.7232666015625,
+     0.0,
+     -20.7232666015625
+    ]
+   ],
+   [
+    [
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625,
+     0.0
+    ],
+    [
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625
+    ],
+    [
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625
+    ],
+    [
+     -20.7232666015625,
+     -20.7232666015625,
+     -20.7232666015625,
+     0.0
+    ]
+   ]
+  ],
+  "D_context": 0.0,
+  "B_context": [
+   [
+    [
+     0.0
+    ],
+    [
+     -Infinity
+    ]
+   ],
+   [
+    [
+     -Infinity
+    ],
+    [
+     0.0
+    ]
+   ]
+  ],
+  "A_position": [
+   [
+    0.0,
+    -20.7232666015625,
+    -20.7232666015625,
+    -20.7232666015625
+   ],
+   [
+    -20.7232666015625,
+    0.0,
+    -20.7232666015625,
+    -20.7232666015625
+   ],
+   [
+    -20.7232666015625,
+    -20.7232666015625,
+    0.0,
+    -20.7232666015625
+   ],
+   [
+    -20.7232666015625,
+    -20.7232666015625,
+    -20.7232666015625,
+    0.0
+   ]
+  ],
+  "A_cue_concentration": 1.0,
+  "K_a_location": [
+   [
+    -0.10536054214877988,
+    -3.4011973295080926,
+    -3.4011973295080926,
+    -3.4011973295080926
+   ],
+   [
+    -3.4011973295080926,
+    -0.10536054214877988,
+    -3.4011973295080926,
+    -3.4011973295080926
+   ],
+   [
+    -3.4011973295080926,
+    -3.4011973295080926,
+    -0.10536054214877988,
+    -3.4011973295080926
+   ],
+   [
+    -3.4011973295080926,
+    -3.4011973295080926,
+    -3.4011973295080926,
+    -0.10536054214877988
+   ]
+  ],
+  "H_location": [
+   [
+    -3.1392061710357666,
+    -3.1392061710357666
+   ],
+   [
+    -0.13920626044273376,
+    -3.1392061710357666
+   ],
+   [
+    -3.1392061710357666,
+    -0.13920626044273376
+   ],
+   [
+    -3.1392061710357666,
+    -3.1392061710357666
+   ]
+  ]
+ },
+ "objective": {
+  "decomposition": "utility_infogain"
+ },
+ "configuration": {
+  "planning": {
+   "planner": "enumeration",
+   "horizon": 3,
+   "gamma": 16.0
+  }
+ }
+}

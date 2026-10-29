@@ -1,0 +1,277 @@
+{
+  "hybrid_aif_description": "0.2",
+  "structure": {
+    "states": [
+      {
+        "name": "rat.context",
+        "transition_parents": ["rat.context"],
+        "controlled": false,
+        "num_controls": 1,
+        "initial_parents": null,
+        "terminal_parents": null,
+        "control_parents": []
+      },
+      {
+        "name": "rat.location",
+        "transition_parents": ["rat.location"],
+        "controlled": true,
+        "num_controls": 4,
+        "initial_parents": null,
+        "terminal_parents": null,
+        "control_parents": []
+      },
+      {
+        "name": "maze.context",
+        "transition_parents": ["maze.context"],
+        "controlled": false,
+        "num_controls": 1,
+        "initial_parents": null,
+        "terminal_parents": null,
+        "control_parents": []
+      },
+      {
+        "name": "maze.location",
+        "transition_parents": ["maze.location", "maze.door"],
+        "controlled": true,
+        "num_controls": 4,
+        "initial_parents": null,
+        "terminal_parents": null,
+        "control_parents": []
+      },
+      {
+        "name": "maze.door",
+        "transition_parents": [],
+        "controlled": false,
+        "num_controls": 1,
+        "initial_parents": null,
+        "terminal_parents": null,
+        "control_parents": []
+      }
+    ],
+    "observations": [
+      {
+        "name": "rat.position",
+        "observes": ["maze.location"],
+        "source": "maze.location"
+      },
+      {
+        "name": "rat.cue",
+        "observes": ["maze.context", "maze.location"]
+      },
+      {
+        "name": "rat.outcome",
+        "observes": ["maze.context", "maze.location"]
+      }
+    ],
+    "policy_len": 2
+  },
+  "declarations": {
+    "transition:rat.context": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {
+        "log_table": {
+          "shape": [2, 2, 1],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [[[0.0], [-20.0]], [[-20.0], [0.0]]]
+        }
+      }
+    },
+    "initial_state_prior:rat.context": {
+      "family": "Categorical",
+      "arrays": {
+        "logits": {
+          "shape": [2],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [0.0, 0.0]
+        }
+      }
+    },
+    "transition:rat.location": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {
+        "log_table": {
+          "shape": [4, 4, 4],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [[0.0, -20.0, -20.0, -20.0], [-20.0, -20.0, -20.0, -20.0], [-20.0, -20.0, -20.0, -20.0], [0.0, -20.0, -20.0, -20.0]],
+            [[-20.0, 0.0, -20.0, -20.0], [0.0, 0.0, 0.0, 0.0], [-20.0, -20.0, -20.0, -20.0], [-20.0, 0.0, -20.0, -20.0]],
+            [[-20.0, -20.0, 0.0, -20.0], [-20.0, -20.0, -20.0, -20.0], [0.0, 0.0, 0.0, 0.0], [-20.0, -20.0, 0.0, -20.0]],
+            [[-20.0, -20.0, -20.0, 0.0], [-20.0, -20.0, -20.0, -20.0], [-20.0, -20.0, -20.0, -20.0], [-20.0, -20.0, -20.0, 0.0]]
+          ]
+        }
+      }
+    },
+    "initial_state_prior:rat.location": {
+      "family": "Categorical",
+      "arrays": {
+        "logits": {
+          "shape": [4],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [0.0, -20.0, -20.0, -20.0]
+        }
+      }
+    },
+    "transition:maze.context": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {
+        "log_table": {
+          "shape": [2, 2, 1],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [[[0.0], [-20.0]], [[-20.0], [0.0]]]
+        }
+      }
+    },
+    "initial_state_prior:maze.context": {
+      "family": "Categorical",
+      "arrays": {
+        "logits": {
+          "shape": [2],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [0.0, 0.0]
+        }
+      }
+    },
+    "transition:maze.location": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 3},
+      "arrays": {
+        "log_table": {
+          "shape": [4, 4, 2, 4],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [
+              [[0.0, -20.0, -20.0, -20.0], [0.0, 0.0, 0.0, 0.0]],
+              [[-20.0, -20.0, -20.0, -20.0], [0.0, 0.0, 0.0, 0.0]],
+              [[-20.0, -20.0, -20.0, -20.0], [0.0, 0.0, 0.0, 0.0]],
+              [[0.0, -20.0, -20.0, -20.0], [0.0, 0.0, 0.0, 0.0]]
+            ],
+            [
+              [[-20.0, 0.0, -20.0, -20.0], [-20.0, -20.0, -20.0, -20.0]],
+              [[0.0, 0.0, 0.0, 0.0], [-20.0, -20.0, -20.0, -20.0]],
+              [[-20.0, -20.0, -20.0, -20.0], [-20.0, -20.0, -20.0, -20.0]],
+              [[-20.0, 0.0, -20.0, -20.0], [-20.0, -20.0, -20.0, -20.0]]
+            ],
+            [
+              [[-20.0, -20.0, 0.0, -20.0], [-20.0, -20.0, -20.0, -20.0]],
+              [[-20.0, -20.0, -20.0, -20.0], [-20.0, -20.0, -20.0, -20.0]],
+              [[0.0, 0.0, 0.0, 0.0], [-20.0, -20.0, -20.0, -20.0]],
+              [[-20.0, -20.0, 0.0, -20.0], [-20.0, -20.0, -20.0, -20.0]]
+            ],
+            [
+              [[-20.0, -20.0, -20.0, 0.0], [-20.0, -20.0, -20.0, -20.0]],
+              [[-20.0, -20.0, -20.0, -20.0], [-20.0, -20.0, -20.0, -20.0]],
+              [[-20.0, -20.0, -20.0, -20.0], [-20.0, -20.0, -20.0, -20.0]],
+              [[-20.0, -20.0, -20.0, 0.0], [-20.0, -20.0, -20.0, -20.0]]
+            ]
+          ]
+        }
+      }
+    },
+    "initial_state_prior:maze.location": {
+      "family": "Categorical",
+      "arrays": {
+        "logits": {
+          "shape": [4],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [0.0, -20.0, -20.0, -20.0]
+        }
+      }
+    },
+    "transition:maze.door": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 1},
+      "arrays": {
+        "log_table": {
+          "shape": [2, 1],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [[-0.693], [-0.693]]
+        }
+      }
+    },
+    "initial_state_prior:maze.door": {
+      "family": "Categorical",
+      "arrays": {
+        "logits": {
+          "shape": [2],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [0.0, 0.0]
+        }
+      }
+    },
+    "likelihood:rat.position": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 1},
+      "arrays": {
+        "log_table": {
+          "shape": [4, 4, 1],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [[[0.0], [-20.0], [-20.0], [-20.0]], [[-20.0], [0.0], [-20.0], [-20.0]], [[-20.0], [-20.0], [0.0], [-20.0]], [[-20.0], [-20.0], [-20.0], [0.0]]]
+        }
+      }
+    },
+    "likelihood:rat.cue": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {
+        "log_table": {
+          "shape": [3, 2, 4, 1],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [
+              [[-20.0], [-20.0], [-20.0], [0.0]],
+              [[-20.0], [-20.0], [-20.0], [-20.0]]
+            ],
+            [
+              [[-20.0], [-20.0], [-20.0], [-20.0]],
+              [[-20.0], [-20.0], [-20.0], [0.0]]
+            ],
+            [
+              [[0.0], [0.0], [0.0], [-20.0]],
+              [[0.0], [0.0], [0.0], [-20.0]]
+            ]
+          ]
+        }
+      }
+    },
+    "likelihood:rat.outcome": {
+      "family": "ConditionalCategorical",
+      "static": {"parent_ndims": 2},
+      "arrays": {
+        "log_table": {
+          "shape": [3, 2, 4, 1],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [
+              [[-20.0], [-0.02], [-3.912], [-20.0]],
+              [[-20.0], [-3.912], [-0.02], [-20.0]]
+            ],
+            [
+              [[-20.0], [-3.912], [-0.02], [-20.0]],
+              [[-20.0], [-0.02], [-3.912], [-20.0]]
+            ],
+            [
+              [[0.0], [-20.0], [-20.0], [0.0]],
+              [[0.0], [-20.0], [-20.0], [0.0]]
+            ]
+          ]
+        }
+      }
+    }
+  }
+}

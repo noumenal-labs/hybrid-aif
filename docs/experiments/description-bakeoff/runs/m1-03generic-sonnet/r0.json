@@ -1,0 +1,160 @@
+{
+  "hybrid_aif_description": "0.3",
+  "variables": {
+    "loc": {"domain": "categorical", "levels": 4},
+    "ctx": {"domain": "categorical", "levels": 2},
+    "u_loc": {"domain": "categorical", "levels": 4},
+    "a_loc": {"domain": "categorical", "levels": 4},
+    "pos": {"domain": "categorical", "levels": 4},
+    "cue": {"domain": "categorical", "levels": 3},
+    "outcome": {"domain": "categorical", "levels": 3},
+    "D_loc": {"domain": "logits", "shape": [4]},
+    "B_loc": {"domain": "log_simplex", "shape": [4, 4, 4]},
+    "D_ctx": {"domain": "logits", "shape": [2]},
+    "B_ctx": {"domain": "log_simplex", "shape": [2, 2]},
+    "A_pos": {"domain": "log_simplex", "shape": [4, 4]},
+    "A_cue": {"domain": "log_simplex", "shape": [3, 4, 2]},
+    "A_outcome": {"domain": "log_simplex", "shape": [3, 4, 2]},
+    "C_outcome": {"domain": "logits", "shape": [3]}
+  },
+  "factors": {
+    "loc": {
+      "loc_start": {
+        "family": "Categorical",
+        "parameters": {"logits": "D_loc"},
+        "steps": "0"
+      },
+      "loc_move": {
+        "family": "ConditionalCategorical",
+        "parents": ["loc[t-1]", "u_loc[t-1]"],
+        "parameters": {"log_table": "B_loc"},
+        "steps": "1+"
+      }
+    },
+    "ctx": {
+      "ctx_start": {
+        "family": "Categorical",
+        "parameters": {"logits": "D_ctx"},
+        "steps": "0"
+      },
+      "ctx_stay": {
+        "family": "ConditionalCategorical",
+        "parents": ["ctx[t-1]"],
+        "parameters": {"log_table": "B_ctx"},
+        "steps": "1+"
+      }
+    },
+    "pos": {
+      "pos_seen": {
+        "family": "ConditionalCategorical",
+        "parents": ["loc[t]"],
+        "parameters": {"log_table": "A_pos"},
+        "steps": "all"
+      }
+    },
+    "cue": {
+      "cue_seen": {
+        "family": "ConditionalCategorical",
+        "parents": ["loc[t]", "ctx[t]"],
+        "parameters": {"log_table": "A_cue"},
+        "steps": "all"
+      }
+    },
+    "outcome": {
+      "outcome_seen": {
+        "family": "ConditionalCategorical",
+        "parents": ["loc[t]", "ctx[t]"],
+        "parameters": {"log_table": "A_outcome"},
+        "steps": "all"
+      },
+      "target": {
+        "family": "Categorical",
+        "parameters": {"logits": "C_outcome"}
+      }
+    }
+  },
+  "relations": {
+    "controls": {"u_loc": "a_loc"},
+    "observed": ["pos", "cue", "outcome"]
+  },
+  "clamps": {
+    "D_loc": [0.0, -Infinity, -Infinity, -Infinity],
+    "B_loc": [
+      [
+        [0.0, -Infinity, -Infinity, -Infinity],
+        [-Infinity, -Infinity, -Infinity, -Infinity],
+        [-Infinity, -Infinity, -Infinity, -Infinity],
+        [0.0, -Infinity, -Infinity, -Infinity]
+      ],
+      [
+        [-Infinity, 0.0, -Infinity, -Infinity],
+        [0.0, 0.0, 0.0, 0.0],
+        [-Infinity, -Infinity, -Infinity, -Infinity],
+        [-Infinity, 0.0, -Infinity, -Infinity]
+      ],
+      [
+        [-Infinity, -Infinity, 0.0, -Infinity],
+        [-Infinity, -Infinity, -Infinity, -Infinity],
+        [0.0, 0.0, 0.0, 0.0],
+        [-Infinity, -Infinity, 0.0, -Infinity]
+      ],
+      [
+        [-Infinity, -Infinity, -Infinity, 0.0],
+        [-Infinity, -Infinity, -Infinity, -Infinity],
+        [-Infinity, -Infinity, -Infinity, -Infinity],
+        [-Infinity, -Infinity, -Infinity, 0.0]
+      ]
+    ],
+    "D_ctx": [0.0, 0.0],
+    "B_ctx": [[0.0, -Infinity], [-Infinity, 0.0]],
+    "A_pos": [
+      [0.0, -Infinity, -Infinity, -Infinity],
+      [-Infinity, 0.0, -Infinity, -Infinity],
+      [-Infinity, -Infinity, 0.0, -Infinity],
+      [-Infinity, -Infinity, -Infinity, 0.0]
+    ],
+    "A_cue": [
+      [
+        [-Infinity, -Infinity],
+        [-Infinity, -Infinity],
+        [-Infinity, -Infinity],
+        [0.0, -Infinity]
+      ],
+      [
+        [-Infinity, -Infinity],
+        [-Infinity, -Infinity],
+        [-Infinity, -Infinity],
+        [-Infinity, 0.0]
+      ],
+      [
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [-Infinity, -Infinity]
+      ]
+    ],
+    "A_outcome": [
+      [
+        [-Infinity, -Infinity],
+        [-0.020202707317519466, -3.912023005428146],
+        [-3.912023005428146, -0.020202707317519466],
+        [-Infinity, -Infinity]
+      ],
+      [
+        [-Infinity, -Infinity],
+        [-3.912023005428146, -0.020202707317519466],
+        [-0.020202707317519466, -3.912023005428146],
+        [-Infinity, -Infinity]
+      ],
+      [
+        [0.0, 0.0],
+        [-Infinity, -Infinity],
+        [-Infinity, -Infinity],
+        [0.0, 0.0]
+      ]
+    ],
+    "C_outcome": [3.0, -3.0, 0.0]
+  },
+  "objective": {"decomposition": "utility_infogain"},
+  "configuration": {"planning": {"planner": "enumeration", "horizon": 2}}
+}

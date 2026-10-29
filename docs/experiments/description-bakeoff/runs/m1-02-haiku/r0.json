@@ -1,0 +1,210 @@
+{
+  "hybrid_aif_description": "0.2",
+  "structure": {
+    "states": [
+      {
+        "name": "location",
+        "transition_parents": ["location"],
+        "controlled": true,
+        "num_controls": 4
+      },
+      {
+        "name": "context",
+        "transition_parents": ["context"],
+        "controlled": false,
+        "num_controls": 1
+      }
+    ],
+    "observations": [
+      {
+        "name": "position",
+        "observes": ["location"],
+        "source": "external"
+      },
+      {
+        "name": "cue",
+        "observes": ["location", "context"],
+        "source": "external"
+      },
+      {
+        "name": "outcome",
+        "observes": ["location", "context"],
+        "source": "external"
+      }
+    ],
+    "policy_len": 2
+  },
+  "declarations": {
+    "transition:location": {
+      "family": "ConditionalCategorical",
+      "static": {
+        "parent_ndims": 2
+      },
+      "arrays": {
+        "log_table": {
+          "shape": [4, 4, 4],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [
+              [0.0, -20.0, -20.0, -20.0],
+              [-20.0, -20.0, -20.0, -20.0],
+              [-20.0, -20.0, -20.0, -20.0],
+              [0.0, -20.0, -20.0, -20.0]
+            ],
+            [
+              [-20.0, 0.0, -20.0, -20.0],
+              [0.0, 0.0, 0.0, 0.0],
+              [-20.0, 0.0, -20.0, -20.0],
+              [-20.0, 0.0, -20.0, -20.0]
+            ],
+            [
+              [-20.0, -20.0, 0.0, -20.0],
+              [-20.0, -20.0, -20.0, -20.0],
+              [0.0, 0.0, 0.0, 0.0],
+              [-20.0, -20.0, 0.0, -20.0]
+            ],
+            [
+              [-20.0, -20.0, -20.0, 0.0],
+              [-20.0, -20.0, -20.0, -20.0],
+              [-20.0, -20.0, -20.0, -20.0],
+              [-20.0, -20.0, -20.0, 0.0]
+            ]
+          ]
+        }
+      }
+    },
+    "transition:context": {
+      "family": "ConditionalCategorical",
+      "static": {
+        "parent_ndims": 2
+      },
+      "arrays": {
+        "log_table": {
+          "shape": [2, 2, 1],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [
+              [0.0],
+              [-20.0]
+            ],
+            [
+              [-20.0],
+              [0.0]
+            ]
+          ]
+        }
+      }
+    },
+    "initial_state_prior:location": {
+      "family": "Categorical",
+      "static": {},
+      "arrays": {
+        "logits": {
+          "shape": [4],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [0.0, -20.0, -20.0, -20.0]
+        }
+      }
+    },
+    "initial_state_prior:context": {
+      "family": "Categorical",
+      "static": {},
+      "arrays": {
+        "logits": {
+          "shape": [2],
+          "dtype": "float32",
+          "domain": "logits",
+          "values": [0.0, 0.0]
+        }
+      }
+    },
+    "likelihood:position": {
+      "family": "ConditionalCategorical",
+      "static": {
+        "parent_ndims": 1
+      },
+      "arrays": {
+        "log_table": {
+          "shape": [4, 4],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [0.0, -20.0, -20.0, -20.0],
+            [-20.0, 0.0, -20.0, -20.0],
+            [-20.0, -20.0, 0.0, -20.0],
+            [-20.0, -20.0, -20.0, 0.0]
+          ]
+        }
+      }
+    },
+    "likelihood:cue": {
+      "family": "ConditionalCategorical",
+      "static": {
+        "parent_ndims": 2
+      },
+      "arrays": {
+        "log_table": {
+          "shape": [3, 4, 2],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [
+              [-20.0, -20.0],
+              [-20.0, -20.0],
+              [-20.0, -20.0],
+              [0.0, -20.0]
+            ],
+            [
+              [-20.0, -20.0],
+              [-20.0, -20.0],
+              [-20.0, -20.0],
+              [-20.0, 0.0]
+            ],
+            [
+              [0.0, 0.0],
+              [0.0, 0.0],
+              [0.0, 0.0],
+              [-20.0, -20.0]
+            ]
+          ]
+        }
+      }
+    },
+    "likelihood:outcome": {
+      "family": "ConditionalCategorical",
+      "static": {
+        "parent_ndims": 2
+      },
+      "arrays": {
+        "log_table": {
+          "shape": [3, 4, 2],
+          "dtype": "float32",
+          "domain": "log_probability",
+          "values": [
+            [
+              [-20.0, -20.0],
+              [-0.0202, -20.0],
+              [-20.0, -0.0202],
+              [-20.0, -20.0]
+            ],
+            [
+              [-20.0, -20.0],
+              [-20.0, -0.0202],
+              [-0.0202, -20.0],
+              [-20.0, -20.0]
+            ],
+            [
+              [0.0, 0.0],
+              [-3.912, -3.912],
+              [-3.912, -3.912],
+              [0.0, 0.0]
+            ]
+          ]
+        }
+      }
+    }
+  }
+}

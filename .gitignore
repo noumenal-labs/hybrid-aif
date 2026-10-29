@@ -1,0 +1,124 @@
+# ==============================================================================
+# OS Artifacts (macOS, Windows, Ubuntu/Linux)
+# ==============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+*.icloud
+
+# Windows
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+*.lnk
+
+# Linux / Ubuntu
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ==============================================================================
+# Python (Bytecode, Packages, and Environments)
+# ==============================================================================
+
+# Byte-compiled / optimized / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments (Standard, Poetry, Pipenv, etc.)
+.venv/
+venv/
+ENV/
+env/
+.poetry/
+.pipenv/
+pip-log.txt
+pip-delete-this-check.txt
+
+# Distribution / packaging artifacts
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Testing and coverage tools
+.pytest_cache/
+.jax_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# ==============================================================================
+# Common IDEs and Editors (VS Code, PyCharm, Sublime, Vim)
+# ==============================================================================
+
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# JetBrains / PyCharm
+.idea/
+
+# Vim / Sublime / Notepad++
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+*~
+
+# ==============================================================================
+# Upstream repos consulted during scoping (local clones, never tracked)
+# ==============================================================================
+# The TOP-LEVEL reference/ only. It holds clones of other projects' code
+# (pymdp, PGMax, ...) that docs/scoping-review.md surveyed; nothing in this
+# repo imports from it. It is unrelated to src/hybrid_aif/reference/ — the
+# package's second tier of declared reference models, environments and
+# fixtures.
+
+/reference/
+
+# Claude Code worktrees
+.claude/worktrees/
+
+# ==============================================================================
+# Run artifacts (P1' chunk 2d)
+# ==============================================================================
+# `hybrid_aif.reference.raif.run --out runs/...` writes scores.jsonl, metrics.jsonl
+# and multi-hundred-MB equinox checkpoints here. The *numbers* land in
+# docs/design/amortization-p0-addendum.md §7; the run directory itself is
+# reproducible output and is never tracked. Anchored to the repo root, so a
+# `runs/` inside some future package would have to opt out on its own.
+
+/runs/
