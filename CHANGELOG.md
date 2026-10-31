@@ -6,6 +6,7 @@ recorded here; the per-release capability and migration notes are in
 
 | version | date | summary |
 |---|---|---|
+| 0.18.1 | 2026-10-31 | Two planner tests tolerate the rounding of a jax point release |
 | 0.18.0 | 2026-10-22 | Planning improvements, including a planner for mixed control spaces |
 | 0.17.0 | 2026-10-21 | A shared innovation noise across modes, fused leaves over a dimension selection, and the posterior chain with noise maps at 0.14.0 speed |
 | 0.16.0 | 2026-10-21 | A modality over an action node in planning, presence per level of a control node, and a faster evaluation of the linear-Gaussian epistemic leaves |
