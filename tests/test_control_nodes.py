@@ -498,7 +498,8 @@ def test_a_shared_node_learns_and_steps_by_its_parent_positions():
             action={system.names.actions[0]: jnp.asarray(2)},
         )
         learned.append(new.transition["b"].concentration)
-    assert jnp.array_equal(jnp.swapaxes(learned[1], 1, 2), learned[0])
+    # equal up to the rounding of the two contraction orders
+    assert jnp.allclose(jnp.swapaxes(learned[1], 1, 2), learned[0], rtol=1e-6, atol=0.0)
     env_s, ep_s = sugar.as_env(p)
     env_n, ep_n = native.as_env(q)
     key = jax.random.PRNGKey(0)

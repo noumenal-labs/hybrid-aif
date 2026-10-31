@@ -77,5 +77,8 @@ re-recorded with its tolerance measured.
 - *Quality against the previous rule.* Over a battery of fixtures and seeded warm starts the
   returned `G` is better than the previous rule's by more than 1e-5 in most cases that differ
   and worse by more than 1e-5 in a few unconverged ones (over 203 cases: better in 64, worse in
-  6). The detour agent from the box midpoint is one: 400 steps end at -3.187774 against -3.187862
-  (worse by 8.8e-5), and 10 000 steps at -3.556134 against -3.556169 (3.5e-5).
+  6). The detour agent from the box midpoint is one: under jax 0.11.0, 400 steps end at
+  -3.187774 against -3.187862 (worse by 8.8e-5), and 10 000 steps at -3.556134 against -3.556169
+  (3.5e-5). The 400-step end point moves with the jax release (under 0.11.2, -3.182964 against
+  -3.186740), the 10 000-step one much less (-3.556261 against -3.555888, better by 3.7e-4), so
+  the test compares the 10 000-step end points within 5e-4.

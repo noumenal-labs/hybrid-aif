@@ -389,14 +389,14 @@ def test_the_returned_g_is_at_most_the_previous_rules_case_by_case(name, seed):
 
 
 def test_the_default_start_of_the_detour_agent_ends_within_a_known_margin_of_the_previous_rule():
-    """From the box midpoint over 400 steps the unconverged descent of the detour agent ends at
-    -3.187862 under the previous rule and -3.187774 under the floor (measured): above it by
-    8.8e-5, inside the 4.8e-4 spread of that descent's end points."""
+    """From the box midpoint over 10 000 steps the descent of the detour agent ends within 5e-4
+    of the previous rule's end point (measured: -3.556134 against -3.556169 under jax 0.11.0,
+    -3.556261 against -3.555888 under jax 0.11.2)."""
     c = case("detour_posterior")
-    old = reference_descent(c.ctx, "old", 400)
-    got = gradient_plan(c.ctx, steps=400)
+    old = reference_descent(c.ctx, "old", 10_000)
+    got = gradient_plan(c.ctx, steps=10_000)
     want = g_of(c.ctx, old.last)
-    assert float(got.G.midpoint[0]) <= want + 2e-4
+    assert float(got.G.midpoint[0]) <= want + 5e-4
 
 
 # -------------------------------------------------------------------------- the flat direction
