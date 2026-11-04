@@ -47,6 +47,7 @@ from hybrid_aif.objectives.base import INFOGAIN, TermTree
 from hybrid_aif.objectives.discrete import _block_names, _check_mask, _full, risk, terminal_risk
 
 __all__ = [
+    "ComponentHead",
     "ambiguity",
     "conditional_correlation",
     "conditional_obs_entropy",
@@ -540,6 +541,18 @@ def emission_info_gain(
     return {INFOGAIN: leaves}
 
 
+class ComponentHead(NamedTuple):
+    """A neural channel over a mixture-carried factor, read at the belief: one linear-Gaussian
+    head per component and per joint mode configuration of its categorical parents. ``H`` is
+    ``(K, M, d_obs, d)``, ``c`` ``(K, M, d_obs)`` and ``R_chol`` ``(K, M, d_obs, d_obs)``, ``M``
+    the number of mode configurations (``1`` without categorical parents), the configurations
+    flattened row-major. Design: docs/design/recognition-beside-analytic.md L4."""
+
+    H: Array
+    c: Array
+    R_chol: Array
+
+
 def _predictive_obs(
     q: Gaussian | MixtureGaussian, H: Array, c: Array, R_chol: Array
 ) -> MixtureGaussian:
@@ -582,19 +595,28 @@ def _flatten_modes(arr: Array, m: int, event_ndims: int) -> Array:
 
 
 def _predictive_obs_switching(
-    q: Gaussian | MixtureGaussian, H: Array, c: Array, R_chol: Array, mode_logq: Array
+    q: Gaussian | MixtureGaussian,
+    H: Array,
+    c: Array,
+    R_chol: Array,
+    mode_logq: Array,
+    per_component: bool = False,
 ) -> MixtureGaussian:
     """Predictive observation density of a switching LG modality: the (K·M) mixture.
 
     Each ``(component k, mode j)`` gives ``N(H_j mu_k + c_j, H_j Sigma_k H_j^T +
     R_j)`` with weight ``w_k · q(mode=j)``; ``mode_logq`` is the joint mode
-    log-belief ``(..., M)``. Component-major layout (slot ``k*M + j``).
+    log-belief ``(..., M)``. Component-major layout (slot ``k*M + j``). With ``per_component``
+    the arrays already lead with ``(K, M)`` (a :class:`ComponentHead`).
     """
     m = q if isinstance(q, MixtureGaussian) else MixtureGaussian.from_gaussian(q)
     mm = mode_logq.shape[-1]
-    Hs = _flatten_modes(H, mm, 2)  # (M, d_obs, d)
-    cs = _flatten_modes(c, mm, 1)  # (M, d_obs)
-    Rs = _flatten_modes(R_chol, mm, 2)  # (M, d_obs, d_obs)
+    if per_component:
+        Hs, cs, Rs = H, c, R_chol  # (K, M, ...)
+    else:
+        Hs = _flatten_modes(H, mm, 2)  # (M, d_obs, d)
+        cs = _flatten_modes(c, mm, 1)  # (M, d_obs)
+        Rs = _flatten_modes(R_chol, mm, 2)  # (M, d_obs, d_obs)
     comps = m.components
     mu = comps.loc[..., :, None, :]  # (..., K, 1, d)
     means = (Hs @ mu[..., None])[..., 0] + cs  # (..., K, M, d_obs)
@@ -622,8 +644,16 @@ def predictive_obs(
     Returns a ``K·M``-component mixture: one component per belief component, times
     one per joint mode configuration (flattened row-major) of ``mode_beliefs``, the
     modality's discrete parent beliefs in declaration order (empty when it does not
-    switch). A :class:`Gaussian` belief is the ``K=1`` case.
+    switch). A :class:`Gaussian` belief is the ``K=1`` case. A :class:`ComponentHead` carries a
+    head per component and mode configuration.
     """
+    if isinstance(model, ComponentHead):
+        logq = (
+            _joint_mode_log_probs(mode_beliefs) if mode_beliefs else jnp.zeros((1,), model.c.dtype)
+        )
+        return _predictive_obs_switching(
+            q, model.H, model.c, model.R_chol, logq, per_component=True
+        )
     if mode_beliefs:
         return _predictive_obs_switching(
             q, model.H, model.c, model.R_chol, _joint_mode_log_probs(mode_beliefs)
@@ -669,8 +699,21 @@ def conditional_obs_entropy(
     mode are known. The entropy given the factor alone, with the mode unknown, is
     :func:`selected_obs_entropy`'s business. A noise map (``model.noise_map``) is read at the
     belief ``q``'s component means and averaged under its weights, the extended filter's
-    convention, so ``q`` is required then.
+    convention, so ``q`` is required then. For a :class:`ComponentHead` the noise is averaged
+    under the belief's component weights and the mode beliefs, ``q`` required.
     """
+    if isinstance(model, ComponentHead):
+        if q is None:
+            raise ValueError(
+                "a neural channel's conditional entropy needs the belief it is read at"
+            )
+        w = jax.nn.softmax(_component_means(q)[1], axis=-1)
+        qj = (
+            jax.nn.softmax(_joint_mode_log_probs(mode_beliefs), axis=-1)
+            if mode_beliefs
+            else jnp.ones((1,), w.dtype)
+        )
+        return jnp.einsum("...k,...kj,...j->...", w, _observation_entropy(model.R_chol), qj)
     if not mode_beliefs:
         if not model.noise_map:
             return _observation_entropy(model.R_chol)
@@ -792,7 +835,12 @@ def selected_obs_entropy(
     Design: docs/design/per-variable-infogain.md V9
     """
     if _full(selected):
-        return Interval.exact(conditional_obs_entropy(model, mode_beliefs))
+        return Interval.exact(conditional_obs_entropy(model, mode_beliefs, q=q))
+    if isinstance(model, ComponentHead):
+        raise NotImplementedError(
+            "a partial parent selection on a neural channel over a mixture-carried factor is "
+            "not built; select the whole channel (design: recognition-beside-analytic.md L4)"
+        )
     _check_mask(selected, len(mode_beliefs) + 1)
     m = q if isinstance(q, MixtureGaussian) else MixtureGaussian.from_gaussian(q)
     sizes = tuple(b.probs.shape[-1] for b in mode_beliefs)
@@ -916,7 +964,8 @@ def state_info_gain(
     leaves = {}
     for i, (name, q, model) in enumerate(zip(names, q_blocks, models, strict=True)):
         parents = () if mode_beliefs is None else tuple(mode_beliefs[i])
-        model = lg_point(model)  # one noise lowering shared by both terms
+        if not isinstance(model, ComponentHead):
+            model = lg_point(model)  # one noise lowering shared by both terms
         if dims is not None and dims[i] is not None:
             cond_h = Interval.exact(sub_block_obs_entropy(q, model, dims[i]))
         elif _full(masks[i]):

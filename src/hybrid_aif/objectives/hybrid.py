@@ -64,11 +64,13 @@ from hybrid_aif.factors import (
 )
 from hybrid_aif.inference.emission import is_emission
 from hybrid_aif.inference.linear_gaussian import condition_on_expected, predict
+from hybrid_aif.inference.linearise import linearise
 from hybrid_aif.inference.mixture_rollout import propagate
 from hybrid_aif.interval import Interval
 from hybrid_aif.objectives import registry
 from hybrid_aif.objectives.base import INFOGAIN, TermTree, merge
 from hybrid_aif.objectives.continuous import (
+    ComponentHead,
     conditional_correlation,
     emission_entropies,
     lg_ambiguity,
@@ -79,6 +81,7 @@ from hybrid_aif.objectives.continuous import (
     predictive_entropy,
     predictive_obs,
     risk,
+    state_info_gain,
     sub_block_readings,
 )
 from hybrid_aif.objectives.discrete import (
@@ -220,21 +223,24 @@ def _validate_lg_obs_shapes(
     parent_shape: tuple[int, ...],
     modality_name: str,
     factor_name: str,
+    selects: bool = False,
 ) -> None:
     """Validate a (possibly switching) LG observation's H/c/R_chol shapes.
 
     Each array is shared (event shape only) or per-mode (leading ``parent_shape``
     axes). ``d_obs`` comes from ``H``; ``d`` must match the observed factor. Named
-    categorical parents require at least one per-mode array.
+    categorical parents require at least one per-mode array. A noise map on a switching
+    channel is built where the channel ``selects`` (its parents are all action nodes, so the
+    observed factor is read at one level); its leading level axes are ``parent_shape``.
     """
     d_obs = A_m.H.shape[-2]
     if A_m.noise_map:
-        if parent_shape:
+        if parent_shape and not selects:
             raise NotImplementedError(
-                f"modality {modality_name!r}: a noise map on a switching LG observation is not "
-                "built; a map is read at the observed factor's mean, and a mode-conditioned "
-                "channel has one mean per mode rather than one (design: "
-                "planning-with-observations.md D3)"
+                f"modality {modality_name!r}: a noise map on a switching LG observation is built "
+                "only for a channel whose mode parents are all action nodes; a map is read at "
+                "the observed factor's mean, and a channel on a state mode parent has one mean "
+                "per mode rather than one (design: planning-with-observations.md D3)"
             )
         noise = A_m.noise
         bad = [a for a in getattr(noise, "axes", ()) if not 0 <= a < d]
@@ -531,7 +537,7 @@ def validate_structure(
             #  the step's level, so the Gaussian-carried factor it observes stays one Gaussian
             selects = (
                 bool(mode_parents)
-                and family_of(obs_f) == GAUSSIAN
+                and selects_by_nodes(A_m, family_of(obs_f))
                 and all(g >= len(families) for g in mode_parents)
             )
             if is_emission(A_m):
@@ -583,13 +589,9 @@ def validate_structure(
                     f"got non-categorical {non_cat} in A_deps {deps}"
                 )
             parent_shape = tuple(levels_of(p) for p in mode_parents)
-            _validate_lg_obs_shapes(A_m, D[obs_f].dim, parent_shape, mods[m], name_of(obs_f))
-            if A_m.noise_map and family_of(obs_f) == MIXTURE:
-                raise NotImplementedError(
-                    f"modality {mods[m]!r}: a noise map over the mixture-carried factor "
-                    f"{facs[obs_f]!r} is not built; a map is read at a Gaussian-carried factor's "
-                    "mean (design: planning-with-observations.md D3)"
-                )
+            _validate_lg_obs_shapes(
+                A_m, D[obs_f].dim, parent_shape, mods[m], name_of(obs_f), selects
+            )
             if mode_parents and family_of(obs_f) != MIXTURE and not selects:
                 raise ValueError(
                     f"modality {mods[m]!r} is a switching LG observation (categorical parent(s) "
@@ -611,21 +613,55 @@ def validate_structure(
                 None,
                 f"modality {mods[m]!r}",
                 "one parent per factor named in A_deps, in that order (a categorical parent "
-                "as its belief's probability vector — the one-hot convention, "
+                "as its belief's probability vector, the one-hot convention, "
                 "amortization.md A1)",
             )
+            continuous = [name_of(g) for g in deps if family_of(g) != CATEGORICAL]
+            if len(continuous) > 1:
+                raise NotImplementedError(
+                    f"modality {mods[m]!r}: a neural modality names the continuous factors "
+                    f"{continuous}; it is read as a linear-Gaussian model of one continuous "
+                    "factor, so a neural modality over two continuous factors is not built "
+                    "(design: recognition-beside-analytic.md L1). Merge the factors into one "
+                    "or split the modality"
+                )
+            if continuous:
+                if family_of(deps[0]) == CATEGORICAL:
+                    raise ValueError(
+                        f"modality {mods[m]!r}: a neural modality names its continuous factor "
+                        f"{continuous[0]!r} first in A_deps, then its categorical parents, got "
+                        f"A_deps {deps}"
+                    )
+                mode_parents = deps[1:]
+                selects = (
+                    bool(mode_parents)
+                    and family_of(deps[0]) == GAUSSIAN
+                    and all(g >= len(families) for g in mode_parents)
+                )
+                if mode_parents and family_of(deps[0]) != MIXTURE and not selects:
+                    raise ValueError(
+                        f"modality {mods[m]!r} is a switching neural observation (categorical "
+                        f"parent(s) {[name_of(p) for p in mode_parents]}), but the observed "
+                        f"factor {facs[deps[0]]!r} is {family_of(deps[0])}-family; conditioning "
+                        "it on an uncertain mode grows it to a mixture, so it must be carried "
+                        "as a mixture. Declare its D as a MixtureGaussian (a 1-component "
+                        "mixture is fine) and set System.mixture_k."
+                    )
         else:
             raise ValueError(
                 f"modality {mods[m]!r}: unknown observation declaration type {type(A_m).__name__}"
             )
 
     for m, A_m in enumerate(A):
-        if not (isinstance(A_m, LGObservation) and mods[m] in obs_targets):
+        if not (isinstance(A_m, LGObservation | MLPConditional) and mods[m] in obs_targets):
             continue
-        target, d_obs = obs_targets[mods[m]], A_m.H.shape[-2]
+        neural = isinstance(A_m, MLPConditional)
+        target = obs_targets[mods[m]]
+        d_obs = A_m.child_dim if neural else A_m.H.shape[-2]
+        kind = "a neural" if neural else "an LG"
         if not isinstance(target, Gaussian | MixtureGaussian | ConditionalGaussian):
             raise ValueError(
-                f"obs_targets[{mods[m]!r}]: an LG modality's C designation is a preference over "
+                f"obs_targets[{mods[m]!r}]: {kind} modality's C designation is a preference over "
                 f"its *continuous* observation, so the target is a Gaussian or MixtureGaussian "
                 f"over R^{d_obs} (covariance-as-tolerance, the same reading state_targets has), "
                 f"or a ConditionalGaussian over it per level of its C_deps parents, got "
@@ -633,28 +669,14 @@ def validate_structure(
             )
         if target.dim != d_obs:
             obs_f = A_deps[m][0]
+            read_off = "child_dim" if neural else "H"
             raise ValueError(
                 f"obs_targets[{mods[m]!r}]: target dim {target.dim} != the modality's "
-                f"observation dim {d_obs} (read off H); a C designation lives on the observation "
-                f"space, not on the observed factor's state space (factor {facs[obs_f]!r} is "
-                f"{D[obs_f].dim}-dimensional — designate it via state_targets if that is what "
-                "you meant)"
+                f"observation dim {d_obs} (read off {read_off}); a C designation lives on the "
+                f"observation space, not on the observed factor's state space (factor "
+                f"{facs[obs_f]!r} is {D[obs_f].dim}-dimensional; designate it via state_targets "
+                "if that is what you meant)"
             )
-    mlp_targeted = sorted(
-        mods[m]
-        for m, A_m in enumerate(A)
-        if isinstance(A_m, MLPConditional) and mods[m] in obs_targets
-    )
-    if mlp_targeted:
-        raise ValueError(
-            f"obs_targets on neural modality(ies) {mlp_targeted}: a C designation over a "
-            "continuous predicted observation is scored against the modality's predicted "
-            "observation density, and a net has no closed-form pushforward of the belief — the "
-            "LG modalities have one (H, c, R) and are supported; this needs the amortized "
-            "predictive that is not built (design: amortization.md A1). Designate the underlying "
-            "factor via state_targets, or declare a LinearGaussianObservation. Raising rather "
-            'than ignoring: a silently dropped designation is exactly the "toggle lies" failure.'
-        )
     return families
 
 
@@ -742,10 +764,16 @@ class BeliefPair(NamedTuple):
 
 class Conditioner(NamedTuple):
     """One linear-Gaussian modality the epistemic chain conditions on: the factor it observes,
-    its column in the availability mask, its head, and the noise at a mean. A channel whose mode
+    its column in the availability mask, its head, and the noise at a mean (a channel whose mode
+    parents are action nodes reads per-level noise there: a noise map's levelled factors at the
+    mean, or arrays that ignore it). A channel whose mode
     parents are action nodes (``nodes``, their engine positions) holds per-level arrays, and
     ``modality`` and ``factor_name`` name it in the sentence a non-point step is refused with;
-    the step selects its level (:func:`select_conditioner`)."""
+    the step selects its level (:func:`select_conditioner`). A neural modality has no constant
+    head: ``read(q, levels)`` gives ``(H, c, R_chol)`` linearised at the belief ``q``
+    (:func:`neural_read`), ``levels`` the step's levels of its action-node parents, and ``H`` and
+    ``c`` are zero templates of the head's shapes; :meth:`at` returns the conditioner as a
+    constant one at ``q``."""
 
     factor: int
     column: int
@@ -755,10 +783,155 @@ class Conditioner(NamedTuple):
     nodes: tuple[int, ...] = ()
     modality: str = ""
     factor_name: str = ""
+    read: Callable[..., tuple[Array, Array, Array]] | None = None
+
+    def at(self, q: Gaussian) -> "Conditioner":
+        """This conditioner read at the belief ``q``: itself when its head is constant."""
+        if self.read is None:
+            return self
+        H, c, R_chol = self.read(q)
+        return self._replace(H=H, c=c, R_chol_at=lambda loc, R=R_chol: R, read=None)
 
 
-def soft_selection_error(modality: str, factor: str, node: str, why: str) -> ValueError:
+class NeuralHead(NamedTuple):
+    """A neural modality as the step terms read it: the declaration, and the levels (one per
+    categorical parent, in order) of the parents it is read at when they are action nodes at a
+    point level; ``None`` when the categorical parents are beliefs (:func:`neural_model`)."""
+
+    decl: MLPConditional
+    levels: tuple[Array, ...] | None = None
+
+
+def _mode_grid(sizes: tuple[int, ...]) -> tuple[Array, ...]:
+    """One-hots of every joint configuration of categorical parents of the given ``sizes``,
+    row-major: one ``(M, size)`` array per parent."""
+    grid = np.stack(np.meshgrid(*[np.arange(n) for n in sizes], indexing="ij"), axis=-1)
+    grid = grid.reshape(-1, len(sizes))
+    return tuple(jax.nn.one_hot(grid[:, i], n) for i, n in enumerate(sizes))
+
+
+def neural_read(
+    decl: MLPConditional,
+    q: Gaussian | MixtureGaussian,
+    sizes: tuple[int, ...] = (),
+    levels: tuple[Array, ...] | None = None,
+) -> tuple[Array, Array, Array]:
+    """``(H, c, R_chol)`` of the neural conditional ``decl`` linearised at the belief ``q`` over
+    its first parent, the declaration's ``propagation`` (:func:`~hybrid_aif.inference.linearise.
+    linearise`).
+
+    The categorical parents (``sizes``, their widths) are held at the one-hots of ``levels`` when
+    given. On a Gaussian the head is ``(d_obs, d)``. On a mixture it is one per component, and
+    without ``levels`` one per joint mode configuration of the parents too: ``(K, M, ...)``
+    (``M = 1`` with none), the switching form. Design: recognition-beside-analytic.md L1, L4."""
+    prop = getattr(decl, "propagation", "first_order")
+
+    def head_at(loc: Array, chol: Array, onehots: tuple[Array, ...]):
+        return linearise(decl, loc, chol, (loc, *onehots), 0, prop)
+
+    fixed = (
+        ()
+        if levels is None
+        else tuple(jax.nn.one_hot(lv, n) for lv, n in zip(levels, sizes, strict=True))
+    )
+    if isinstance(q, Gaussian):
+        if sizes and levels is None:
+            raise ValueError(
+                "a neural modality with categorical parents is read at a Gaussian belief only "
+                "where those parents are fixed at levels; a Gaussian-carried factor observed "
+                "through an uncertain mode is carried as a mixture"
+            )
+        return head_at(q.loc, q.chol, fixed)
+    comps = q.components
+    if levels is not None or not sizes:
+        out = jax.vmap(lambda loc, chol: head_at(loc, chol, fixed))(comps.loc, comps.chol)
+        return tuple(a[:, None] for a in out)
+    grid = _mode_grid(sizes)
+
+    def per_component(loc: Array, chol: Array):
+        return jax.vmap(lambda *onehots: head_at(loc, chol, onehots))(*grid)
+
+    return jax.vmap(per_component)(comps.loc, comps.chol)
+
+
+def _categorical_only(deps: tuple[int, ...], families: tuple[str, ...]) -> bool:
+    """Whether every parent in ``deps`` is a categorical factor or an action node."""
+    return all(g >= len(families) or families[g] == CATEGORICAL for g in deps)
+
+
+def neural_emission(decl: MLPConditional) -> LinearGaussianObservation:
+    """The Gaussian emission a neural conditional over categorical parents alone tabulates: for
+    every joint parent configuration ``e``, ``c = m(e)`` and ``R = diag sigma(e)^2``, with no
+    state columns (design: recognition-beside-analytic.md L4)."""
+    sizes = tuple(decl.parent_dims)
+    grid = _mode_grid(sizes)
+    mean, scale = jax.vmap(lambda *onehots: decl.diag_moments(onehots))(*grid)
+    d_obs = decl.child_dim
+    mean = mean.reshape(*sizes, d_obs)
+    noise = jax.vmap(jnp.diag)(scale).reshape(*sizes, d_obs, d_obs)
+    return LinearGaussianObservation(H=jnp.zeros((*sizes, d_obs, 0)), c=mean, noise=noise)
+
+
+def neural_model(head: NeuralHead, q: Gaussian | MixtureGaussian):
+    """The neural modality ``head`` read at the belief ``q``: a point
+    :class:`~hybrid_aif.factors.LinearGaussianObservation` over a Gaussian belief, a
+    :class:`~hybrid_aif.objectives.continuous.ComponentHead` (a head per component and mode
+    configuration) over a mixture."""
+    sizes = tuple(head.decl.parent_dims[1:])
+    H, c, R_chol = neural_read(head.decl, q, sizes, head.levels)
+    if isinstance(q, MixtureGaussian):
+        return ComponentHead(H, c, R_chol)
+    return LinearGaussianObservation(H=H, c=c, noise=R_chol)
+
+
+def neural_conditioner(
+    decl: MLPConditional,
+    *,
+    factor: int,
+    column: int,
+    nodes: tuple[int, ...] = (),
+    modality: str = "",
+    factor_name: str = "",
+) -> Conditioner:
+    """The :class:`Conditioner` of a neural modality over one Gaussian-carried factor, its
+    head linearised at the belief the chain conditions (design: recognition-beside-analytic.md
+    L4). ``nodes`` are its action-node parents, whose levels the step selects."""
+    sizes = tuple(decl.parent_dims[1:])
+
+    def read(q: Gaussian, levels: tuple[Array, ...] | None = None):
+        return neural_read(decl, q, sizes, levels)
+
+    def no_constant_noise(loc: Array) -> Array:
+        raise ValueError(
+            f"modality {modality!r}: a neural modality's noise is read at the belief "
+            "(Conditioner.at), not at a mean"
+        )
+
+    d, d_obs = decl.parent_dims[0], decl.child_dim
+    return Conditioner(
+        factor=factor,
+        column=column,
+        H=jnp.zeros((d_obs, d)),
+        c=jnp.zeros((d_obs,)),
+        R_chol_at=no_constant_noise,
+        nodes=nodes,
+        modality=modality,
+        factor_name=factor_name,
+        read=read,
+    )
+
+
+def soft_selection_error(
+    modality: str, factor: str, node: str, why: str, mixture: bool = False
+) -> ValueError:
     """The refusal for a selecting channel whose action node is not a point."""
+    if mixture:
+        return ValueError(
+            f"modality {modality!r} selects its noise map by action node {node!r}, and the "
+            f"map over the mixture-carried factor {factor!r} it observes is read at one level "
+            f"only while that node's belief is a point; here it is {why}. Clamp the node to "
+            "one level"
+        )
     return ValueError(
         f"modality {modality!r} selects its head and noise by action node {node!r}, and the "
         f"Gaussian-carried factor {factor!r} it observes stays one Gaussian only while that "
@@ -769,7 +942,12 @@ def soft_selection_error(modality: str, factor: str, node: str, why: str) -> Val
 
 
 def point_level(
-    entry: object, column: int, sensed: SensedNodes, modality: str, factor: str
+    entry: object,
+    column: int,
+    sensed: SensedNodes,
+    modality: str,
+    factor: str,
+    mixture: bool = False,
 ) -> Array:
     """The level a selecting channel reads action node ``column`` at, from the node's entry at
     one plan step: the clamped level under the delta kernel. A probability vector or a node with
@@ -777,7 +955,7 @@ def point_level(
     name = sensed.names[sensed.columns.index(column)]
     if is_belief(entry):
         raise soft_selection_error(
-            modality, factor, name, "a probability vector over its levels at this step"
+            modality, factor, name, "a probability vector over its levels at this step", mixture
         )
     if column in sensed.kernels:
         raise soft_selection_error(
@@ -785,11 +963,14 @@ def point_level(
             factor,
             name,
             "spread over its levels by the kernel declared in params.actuator",
+            mixture,
         )
     return jnp.asarray(entry, jnp.int32)
 
 
-def prior_point_level(q: Categorical, node: str, modality: str, factor: str) -> Array:
+def prior_point_level(
+    q: Categorical, node: str, modality: str, factor: str, mixture: bool = False
+) -> Array:
     """The level of an action node's prior, which must be a point (one level holding all the
     mass): the efference copy under the delta kernel. A prior that is not raises, at once for a
     concrete one and when the computation runs for a traced one."""
@@ -798,11 +979,11 @@ def prior_point_level(q: Categorical, node: str, modality: str, factor: str) -> 
     level = jnp.argmax(probs, axis=-1).astype(jnp.int32)
     if isinstance(peak, jax.core.Tracer):
         why = "spread over its levels in the prior the call was given"
-        error = soft_selection_error(modality, factor, node, why)
+        error = soft_selection_error(modality, factor, node, why, mixture)
         return eqx.error_if(level, peak < 1.0 - 1e-6, str(error))
     if float(peak) < 1.0 - 1e-6:
         why = f"the prior {np.asarray(probs).tolist()}"
-        raise soft_selection_error(modality, factor, node, why)
+        raise soft_selection_error(modality, factor, node, why, mixture)
     return level
 
 
@@ -818,10 +999,14 @@ def _take_modes(arr: Array, event_ndims: int, levels: tuple[Array, ...]) -> Arra
 def select_observation(model: LinearGaussianObservation, levels: tuple[Array, ...]):
     """A linear-Gaussian observation's head and noise at the action nodes' ``levels``: a
     point declaration over its factor alone, which every unconditional channel's leaf scores."""
+    if model.noise_map:
+        noise = model.noise.select(levels) if model.noise_levels else model.noise
+    else:
+        noise = _take_modes(model.R_chol, 2, levels)
     return LinearGaussianObservation(
         H=_take_modes(model.H, 2, levels),
         c=_take_modes(model.c, 1, levels),
-        noise=_take_modes(model.R_chol, 2, levels),
+        noise=noise,
     )
 
 
@@ -842,13 +1027,24 @@ def select_conditioner(
         )
         for d in cond.nodes
     )
-    R_chol = _take_modes(cond.R_chol_at(None), 2, levels)
+    if cond.read is not None:  # a neural head is read at the belief, at these levels
+        return cond._replace(
+            read=lambda q, read=cond.read: read(q, levels),
+            nodes=(),
+        )
     return cond._replace(
         H=_take_modes(cond.H, 2, levels),
         c=_take_modes(cond.c, 1, levels),
-        R_chol_at=lambda loc, R_chol=R_chol: R_chol,
+        R_chol_at=lambda loc, read=cond.R_chol_at: _take_modes(read(loc), 2, levels),
         nodes=(),
     )
+
+
+def selects_by_nodes(model: object, family: str) -> bool:
+    """Whether a linear-Gaussian channel over action nodes alone selects its head and noise at
+    the nodes' levels before it is read: always on a Gaussian-carried factor, and on a
+    mixture-carried one when the noise is a map, which each component reads at its own mean."""
+    return family == GAUSSIAN or (family == MIXTURE and bool(getattr(model, "noise_map", False)))
 
 
 def selecting_channels(A: tuple, A_deps: tuple[tuple[int, ...], ...], families, offset: int):
@@ -858,11 +1054,11 @@ def selecting_channels(A: tuple, A_deps: tuple[tuple[int, ...], ...], families, 
     return {
         m: deps[1:]
         for m, (a, deps) in enumerate(zip(A, A_deps, strict=True))
-        if isinstance(a, LGObservation)
+        if isinstance(a, LGObservation | MLPConditional)
         and not is_emission(a)
         and len(deps) > 1
         and deps[0] < offset
-        and families[deps[0]] == GAUSSIAN
+        and selects_by_nodes(a, families[deps[0]])
         and all(g >= offset for g in deps[1:])
     }
 
@@ -876,10 +1072,10 @@ def _seed_noises(q: Gaussian, factor: int, conditioners: tuple["Conditioner", ..
         if cond.factor != factor:
             continue
         if cond.nodes:
-            R = cond.R_chol_at(None)
-            out[cond.column] = jnp.zeros(R.shape[-2:], R.dtype)
+            d_obs = cond.H.shape[-2]
+            out[cond.column] = jnp.zeros((d_obs, d_obs), cond.H.dtype)
         else:
-            out[cond.column] = cond.R_chol_at(q.loc)
+            out[cond.column] = cond.at(q).R_chol_at(q.loc)
     return out
 
 
@@ -1203,6 +1399,7 @@ def _step_pair(
     for cond in conditioners:
         flag = None if present is None else present[cond.column]
         cond_t = cond if at_step is None else at_step(cond)
+        cond_t = cond_t.at(epistemic)  # a neural head is read at the belief it conditions
         # the mean is the epistemic one throughout: conditioning leaves it unchanged
         noises[cond.column] = cond_t.R_chol_at(epistemic.loc)
         conditioned = condition_expected(conditioned, cond_t, flag, noises[cond.column])
@@ -1559,19 +1756,25 @@ def make_step_terms(
             *qs,
             *(Categorical.from_probs(p) for p in action_node_beliefs(action, sensed)),
         )
+
+        def levels_of(m: int) -> tuple[Array, ...]:
+            return tuple(
+                point_level(
+                    node_entry(action, sensed.columns[g - sensed.offset], sensed.layout),
+                    sensed.columns[g - sensed.offset],
+                    sensed,
+                    modality_names[m],
+                    factor_names[A_deps[m][0]],
+                    families[A_deps[m][0]] == MIXTURE,
+                )
+                for g in selecting[m]
+            )
+
         A_t = tuple(
-            select_observation(
-                lg_point(a),
-                tuple(
-                    point_level(
-                        node_entry(action, sensed.columns[g - sensed.offset], sensed.layout),
-                        sensed.columns[g - sensed.offset],
-                        sensed,
-                        modality_names[m],
-                        factor_names[A_deps[m][0]],
-                    )
-                    for g in selecting[m]
-                ),
+            (
+                NeuralHead(a, levels_of(m))
+                if isinstance(a, MLPConditional)
+                else select_observation(lg_point(a), levels_of(m))
             )
             if m in selecting
             else a
@@ -1622,13 +1825,37 @@ def _make_step_terms(
     # leaves below read H/c/R_chol as fields rather than re-factorising a
     # distributional noise on every access.
     declared = A
-    A = tuple(lg_point(a) if isinstance(a, LGObservation) else a for a in A)
+    # the approximation status reads the declarations, before a neural emission is lowered
+    approx = registry.approximate_status(B, declared, B_deps, A_deps, facs, mods)
+    A = tuple(
+        lg_point(neural_emission(a))
+        if isinstance(a, MLPConditional) and _categorical_only(A_deps[m], families)
+        else lg_point(a)
+        if isinstance(a, LGObservation)
+        else NeuralHead(a)
+        if isinstance(a, MLPConditional)
+        else a
+        for m, a in enumerate(A)
+    )
+    # a neural modality is read at each step's belief as the linear-Gaussian model linearised
+    # there (design: recognition-beside-analytic.md L4); one over categorical parents alone was
+    # lowered above to the Gaussian emission it tabulates
+    neural_mods = tuple(m for m, a in enumerate(A) if isinstance(a, NeuralHead))
+    for m in neural_mods:
+        if A_deps[m][0] >= len(families) or families[A_deps[m][0]] == CATEGORICAL:
+            raise NotImplementedError(
+                f"modality {mods[m]!r}: a neural modality whose first parent is categorical "
+                "alongside a continuous one has no belief to linearise at; list the continuous "
+                "factor first (design: recognition-beside-analytic.md L1)"
+            )
     cat_mods = tuple(m for m, a in enumerate(A) if isinstance(a, TabularObservation))
     # a Gaussian emission over categorical parents alone has no state behind it: its leaves
     # read its parents' configurations (per-variable-infogain.md V11 decision 7)
     emission_mods = tuple(m for m, a in enumerate(A) if is_emission(a))
     lg_mods = tuple(
-        m for m, a in enumerate(A) if isinstance(a, LGObservation) and m not in emission_mods
+        m
+        for m, a in enumerate(A)
+        if (isinstance(a, LGObservation) and m not in emission_mods) or m in neural_mods
     )
     emission_sel = tuple(m for m in emission_mods if m in state_infogain_modalities)
 
@@ -1791,6 +2018,25 @@ def _make_step_terms(
         )
         present_t = None if present is None else presence_at(present, action, t, layout)
 
+        # a neural modality as the linear-Gaussian model at this step's belief over its factor:
+        # the epistemic chain's (the belief before the step's observations), else the predictive
+        def read_at(m: int, epistemic: bool = True):
+            f = A_deps[m][0]
+            use = epistemic and qs_epistemic is not None and families[f] == GAUSSIAN
+            return neural_model(A[m], qs_epistemic[f] if use else qs[f])
+
+        A_t = tuple(read_at(m) if m in neural_mods else a for m, a in enumerate(A))
+        # the risk and utility leaves read the predictive belief; the two reads differ only
+        # under the quadrature rule, whose model depends on the belief's spread
+        A_p = tuple(
+            read_at(m, False)
+            if m in neural_mods
+            and qs_epistemic is not None
+            and getattr(A[m].decl, "propagation", "first_order") == "unscented"
+            else a
+            for m, a in enumerate(A_t)
+        )
+
         def present_at(chans):
             return None if present_t is None else present_t[np.asarray(chans)]
 
@@ -1818,7 +2064,7 @@ def _make_step_terms(
             if f in sub_groups:
                 if live:
                     fused = sub_block_readings(
-                        held[f], sub(A, live), sub_blocks[f], present_at(live), chols
+                        held[f], sub(A_t, live), sub_blocks[f], present_at(live), chols
                     )
                     interaction = fused.interaction
                     total, conditional = fused.total_correlation, fused.conditional_correlation
@@ -1835,23 +2081,44 @@ def _make_step_terms(
                     ambiguities.update({m: zero_leaf() for m in chans if m in absent})
             elif live:
                 gains, total_correlations[f] = linear_gaussian_readings(
-                    held[f], sub(A, live), present_at(live), chols
+                    held[f], sub(A_t, live), present_at(live), chols
                 )
             else:
                 total_correlations[f] = zero_leaf()
             if ig_decomposition:
                 readings.update(zip(live, gains, strict=True))
                 readings.update({m: Interval.exact(zero_leaf()) for m in chans if m in absent})
+        if ig_decomposition:
+            # a neural channel's information gain is evaluated here, at its step's model, and
+            # handed to the mounted estimator as a reading (the estimator holds the declaration)
+            for m in neural_mods:
+                if m not in sig_all or m in readings:
+                    continue
+                f = A_deps[m][0]
+                if m in absent:
+                    readings[m] = Interval.exact(jnp.zeros((), qs[f].loc.dtype))
+                    continue
+                switching = len(A_deps[m]) > 1
+                belief = qs[f] if qs_epistemic is None or switching else qs_epistemic[f]
+                leaf = state_info_gain(
+                    (belief,),
+                    (A_t[m],),
+                    (mods[m],),
+                    mode_beliefs=(lg_mode_beliefs(qs_all, (m,))[0],),
+                    selected=(masks[m],),
+                    dims=(sub_blocks[f] if not switching else None,),
+                )[INFOGAIN]
+                readings[m] = leaf[mods[m]]
         trees: list[TermTree] = []
         if obs_idx:
-            q_obs = expected_obs(qs_all, sub(A, obs_idx), sub(A_deps, obs_idx))
+            q_obs = expected_obs(qs_all, sub(A_t, obs_idx), sub(A_deps, obs_idx))
             names = sub(mods, obs_idx)
             trees.append(
                 utility(q_obs, obs_t, names) if ig_decomposition else risk(q_obs, obs_t, names)
             )
         if lg_obs_idx:
             q_lg = tuple(
-                predictive_obs(qs[A_deps[m][0]], A[m], parents)
+                predictive_obs(qs[A_deps[m][0]], A_p[m], parents)
                 for m, parents in zip(lg_obs_idx, lg_mode_beliefs(qs_all, lg_obs_idx), strict=True)
             )
             names = sub(mods, lg_obs_idx)
@@ -1859,13 +2126,13 @@ def _make_step_terms(
                 lg_utility(q_lg, obs_t, names) if ig_decomposition else risk(q_lg, obs_t, names)
             )
         if flat_idx:
-            q_flat = expected_obs(qs_all, sub(A, flat_idx), sub(A_deps, flat_idx))
+            q_flat = expected_obs(qs_all, sub(A_t, flat_idx), sub(A_deps, flat_idx))
             trees.append(flat_risk(q_flat, sub(mods, flat_idx)))
         if lg_flat_idx:
             trees.append(
                 {
                     "risk": {
-                        mods[m]: -predictive_entropy(qs[A_deps[m][0]], A[m], parents)
+                        mods[m]: -predictive_entropy(qs[A_deps[m][0]], A_p[m], parents)
                         for m, parents in zip(
                             lg_flat_idx, lg_mode_beliefs(qs_all, lg_flat_idx), strict=True
                         )
@@ -1876,13 +2143,13 @@ def _make_step_terms(
             selected = sub(masks, amb_idx) if partial else None
             trees.append(
                 ambiguity(
-                    qs_all, sub(A, amb_idx), sub(A_deps, amb_idx), sub(mods, amb_idx), selected
+                    qs_all, sub(A_t, amb_idx), sub(A_deps, amb_idx), sub(mods, amb_idx), selected
                 )
             )
         if lg_rest_idx:
             trees.append(
                 lg_ambiguity(
-                    sub(A, lg_rest_idx),
+                    sub(A_t, lg_rest_idx),
                     lg_mode_beliefs(qs_all, lg_rest_idx),
                     sub(mods, lg_rest_idx),
                     q_blocks=tuple(qs[A_deps[m][0]] for m in lg_rest_idx),
@@ -1899,7 +2166,9 @@ def _make_step_terms(
             # its ambiguity where the selector mounts it
             risk_leaves, amb_leaves = {}, {}
             for m in emission_mods:
-                h, h_cond = emission_entropies(A[m], tuple(qs_all[g] for g in A_deps[m]), masks[m])
+                h, h_cond = emission_entropies(
+                    A_t[m], tuple(qs_all[g] for g in A_deps[m]), masks[m]
+                )
                 risk_leaves[mods[m]] = -h
                 if m in emission_sel:
                     amb_leaves[mods[m]] = h_cond
@@ -1923,6 +2192,11 @@ def _make_step_terms(
                 trees.append({INFOGAIN: leaves})
             trees.extend({term: step(ctx)} for term, step in row_steps)
 
+        def group_approx(chans) -> bool:
+            # a leaf over a group of channels is approximate iff any channel it reads is
+            # (design: recognition-beside-analytic.md L7)
+            return any(approx.modalities.get(mods[m], False) for m in chans)
+
         if correlated:
             trees.append(
                 {
@@ -1930,7 +2204,8 @@ def _make_step_terms(
                         facs[f]: Interval.exact(
                             total_correlations[f]
                             if f in total_correlations
-                            else observation_correlation(qs[f], sub(A, chans), present_at(chans))
+                            else observation_correlation(qs[f], sub(A_t, chans), present_at(chans)),
+                            approximate=group_approx(chans),
                         )
                         for f, chans in correlated
                     }
@@ -1945,7 +2220,7 @@ def _make_step_terms(
                     facs[f]: total_correlations[f]
                     if f in total_correlations
                     else observation_interaction(
-                        held[f], sub(A, chans), sub_blocks[f], present_at(chans)
+                        held[f], sub(A_t, chans), sub_blocks[f], present_at(chans)
                     )
                     for f, chans in interacting
                 }
@@ -1954,11 +2229,18 @@ def _make_step_terms(
                     facs[f]: -conditional_correlations[f]
                     if f in conditional_correlations and sub_groups[f] == chans
                     else -conditional_correlation(
-                        qs[f], sub(A, chans), sub_blocks[f], present_at(chans)
+                        qs[f], sub(A_t, chans), sub_blocks[f], present_at(chans)
                     )
                     for f, chans in interacting
                 }
-            trees.append({INTERACTION: {k: Interval.exact(v) for k, v in leaves.items()}})
+            flags = {facs[f]: group_approx(chans) for f, chans in interacting}
+            trees.append(
+                {
+                    INTERACTION: {
+                        k: Interval.exact(v, approximate=flags[k]) for k, v in leaves.items()
+                    }
+                }
+            )
         if state_t and (branching or not cross_entropy_targets):
             score = cross_entropy_risk if branching else risk
             trees.append(score(qs, state_t, facs))
@@ -1968,7 +2250,7 @@ def _make_step_terms(
             if kl_targets:
                 trees.append(risk(qs, kl_targets, facs))
             trees.append(cross_entropy_risk(qs, ce_targets, facs))
-        tree = merge(*trees)
+        tree = registry.stamp_tree(merge(*trees), approx)
         if present_t is not None:
             tree = mask_absent(tree, present_t, mods)
         return tree
@@ -1982,6 +2264,7 @@ def make_terminal_terms(
     h_deps: tuple[tuple[int, ...], ...] | None = None,
     branching: bool = False,
     cross_entropy_targets: frozenset[str] = frozenset(),
+    approximation: registry.Approximation | None = None,
 ):
     """Family-generic terminal-risk evaluator, or None without H designations.
 
@@ -1990,10 +2273,16 @@ def make_terminal_terms(
     cross-entropy (:func:`~hybrid_aif.objectives.discrete.terminal_cross_entropy_risk`; design:
     per-variable-infogain.md V11 decision 8). ``cross_entropy_targets`` names the factors whose
     terminal targets an open-loop closure scores by their cross-entropy, the targets a
-    closed-loop pass corrects (:mod:`hybrid_aif.objectives.closed_loop`).
+    closed-loop pass corrects (:mod:`hybrid_aif.objectives.closed_loop`). ``approximation`` is
+    the System's static :class:`~hybrid_aif.objectives.registry.Approximation`, stamped on the
+    leaves.
     """
     if not terminal_targets:
         return None
+
+    def stamped(tree: TermTree) -> TermTree:
+        return tree if approximation is None else registry.stamp_tree(tree, approximation)
+
     ce_targets = {k: v for k, v in terminal_targets.items() if k in cross_entropy_targets}
     terminal_targets = {k: v for k, v in terminal_targets.items() if k not in cross_entropy_targets}
     deps = h_deps if h_deps is not None else ((),) * len(factor_names)
@@ -2003,7 +2292,7 @@ def make_terminal_terms(
         qs_final = predictive_beliefs(qs_final)
         if branching:
             every = {**terminal_targets, **ce_targets}
-            return terminal_cross_entropy_risk(qs_final, every, deps, factor_names)
+            return stamped(terminal_cross_entropy_risk(qs_final, every, deps, factor_names))
         targets = (
             resolve_conditional_targets(terminal_targets, deps, qs_final, factor_names)
             if conditional
@@ -2014,6 +2303,6 @@ def make_terminal_terms(
             no_deps = ((),) * len(factor_names)
             covered = terminal_cross_entropy_risk(qs_final, ce_targets, no_deps, factor_names)
             tree = {"terminal_risk": {**tree["terminal_risk"], **covered["terminal_risk"]}}
-        return tree
+        return stamped(tree)
 
     return terminal_terms

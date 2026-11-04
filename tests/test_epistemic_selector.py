@@ -485,8 +485,8 @@ def test_obs_keys_restore_the_cue_ablation_config():
 
 def test_obs_key_on_an_ineligible_channel_resolves_empty():
     """Known-but-ineligible resolves empty, matching how a bare state name treats
-    an unobserved variable: a neural likelihood has no state-information estimator, so
-    naming it is a no-op, not an error. A Gaussian emission over categorical parents alone
+    an unobserved variable: a channel with no state-information estimator resolves
+    empty, a no-op, not an error. A Gaussian emission over categorical parents alone
     is eligible (per-variable-infogain.md V11), its information about those parents."""
     from hybrid_aif.distributions import MLPConditional
     from tests.test_structure_learning import _mixture_system
@@ -503,7 +503,8 @@ def test_obs_key_on_an_ineligible_channel_resolves_empty():
         (lg_p.initial_state_prior["x"].loc.shape[-1],), 1, key=jax.random.PRNGKey(0)
     )
     neural = dataclasses.replace(lg_p, likelihood={"y": net})
-    assert dataclasses.replace(lg_s, epistemic=("obs:y",))._term_targets(neural) == ((), (), ())
+    # a neural channel over a Gaussian factor is read as the LG model at the belief: eligible
+    assert dataclasses.replace(lg_s, epistemic=("obs:y",))._term_targets(neural) == ((0,), (), ())
     # an LG channel over a plain Gaussian factor is eligible (V11 decision 3): it mounts
     # its channel leaf, and the factor carries none of its own
     lg_s, lg_p = _two_block_lg()

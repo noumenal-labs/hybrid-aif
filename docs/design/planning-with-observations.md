@@ -209,6 +209,23 @@ a traced rotation and offset applied to the mean before indexing with its two va
 the description's noise record, is the item to build if a second user needs it; the first
 user's resampling route is sound.
 
+*Amendment (2026-11-03): a map on a mixture-carried factor.* The map is admitted on a modality
+over a mixture-carried factor whose categorical parents are all action nodes, or that has none.
+Each component reads its own factor, `R_k = map(mu_k)`, at the component's mean (the convention
+above applied per component): `infer_states` conditions component `k` on `R_k`, re-scores the
+weights and sends the mode evidence message from those per-component likelihoods; the predictive
+and the ambiguity leaf read the map at every component's mean (`conditional_obs_entropy` averages
+it under the weights). A levelled map on such a channel is selected at the action nodes' levels
+first, which must be a point (the efference copy at inference, the clamped level at a plan
+step), so what is read is a plain map; a node belief that is not a point is refused with a
+sentence naming the mixture-carried factor. The Kolchinsky-Tracey pair bounds a mixture's
+entropy whatever its components' covariances are, so the gain leaf's interval stays sound with a
+different `R_k` per component. The epistemic chain still skips a mixture-carried factor (D2), so
+the map is read at the mixture's own predicted means. The refusal is kept for a channel whose
+mode parent is a state factor: its partially selected entropy bounds are not derived for a
+per-component noise, and it is deferred. The environment draws at the true state as before, and
+the description writes and prices the map as it does on a Gaussian-carried factor.
+
 ## D4 — Per-step availability in planning (SETTLED, Alex 2026-10-15)
 
 `infer_states` takes `present`; planning scores every modality at every step. The planner

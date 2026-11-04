@@ -40,6 +40,8 @@ docs/design/control-states.md C13.
 """
 
 import dataclasses
+import math
+import numbers
 from collections.abc import Callable, Mapping
 from typing import Literal, NamedTuple
 
@@ -50,7 +52,7 @@ import numpy as np
 from jax import Array
 
 from hybrid_aif.composition.couple import Wiring
-from hybrid_aif.controls import FLOAT
+from hybrid_aif.controls import FLOAT, LEVEL
 from hybrid_aif.distributions import Categorical
 from hybrid_aif.envs.generative import ACTUATOR_TAG
 from hybrid_aif.planning.base import Planner
@@ -225,6 +227,111 @@ class ProcessRecord(NamedTuple):
 
     states: dict[str, Array]
     observations: dict[str, Array]
+
+
+class HoldCarry(NamedTuple):
+    """A held mind's carry: the wrapped mind's own, the rounds still to hold, the held action."""
+
+    inner: MindCarry
+    remaining: int
+    action: Mapping[str, Array]
+
+
+def hold(
+    system: System,
+    params: SystemParams,
+    respond: RespondFn,
+    ticks_per_unit: numbers.Real | Array = 1,
+) -> RespondFn:
+    """A mind that decides once per option: ``respond`` held for the option's duration.
+
+    On a decision round the wrapper calls ``respond``, stores its action and reads the duration
+    with :meth:`System.elapsed`; the action is then returned unchanged for ``duration *
+    ticks_per_unit`` rounds in all (the decision round included), counting down on the host and
+    calling nothing, so the mind infers and plans once per option. The first round always
+    decides, whether ``run`` seeds a bare :class:`MindCarry` or ``carries=`` supplies one; the
+    wrapped carry is a :class:`HoldCarry`, and a ``HoldCarry`` supplied in ``carries=`` resumes
+    a count.
+
+    ``system`` and ``params`` are the ones ``respond`` is closed over (in the composite form,
+    the mind's :func:`~hybrid_aif.composition.merge.subsystem` view), and must declare
+    ``params.durations``. Durations are in the preference's unit; ``ticks_per_unit`` converts
+    that unit to rounds (a positive number, checked at construction), and a duration whose product
+    with it is shorter than one round or not a whole number of rounds (to a relative 1e-5) is
+    refused when the action is read. A non-identity actuator kernel (``params.actuator``) on any
+    action node is refused at construction, since the driver realises every action node every
+    round, so a draw would repeat each round of the option; an identity kernel is accepted.
+
+    In the composite form (:func:`~hybrid_aif.composition.merge.merge`) the held mind's System
+    must own no world process: its factors are beliefs and the world is a separate component,
+    or the composite environment would apply the option's whole-step kernel once per round of
+    the fast tier. The wired form (:func:`~hybrid_aif.composition.couple.couple`) has no such
+    restriction. This is not checked. Design: step-durations.md T9.
+    """
+    scalar = isinstance(ticks_per_unit, numbers.Real) or (
+        isinstance(ticks_per_unit, np.ndarray | Array) and ticks_per_unit.ndim == 0
+    )
+    if isinstance(ticks_per_unit, bool | np.bool_) or not scalar:
+        raise ValueError(
+            f"hold: ticks_per_unit={ticks_per_unit!r} is not a number; pass a positive real "
+            "number or a scalar array, the rounds one unit of duration lasts"
+        )
+    ticks_per_unit = float(ticks_per_unit)
+    if not ticks_per_unit > 0 or not math.isfinite(ticks_per_unit):
+        raise ValueError(
+            f"hold: ticks_per_unit={ticks_per_unit!r} is not positive and finite; pass the "
+            "number of rounds one unit of duration lasts"
+        )
+    node = _durations_node(system, params)
+    for action_node, kernel in system._actuator(params, "hold").items():
+        table = np.asarray(kernel)
+        if table.ndim == 2 and table.shape[0] == table.shape[1]:
+            if np.allclose(table, np.eye(table.shape[0])):
+                continue  # an identity kernel changes nothing
+        raise ValueError(
+            f"hold: action node {action_node!r} has a non-identity actuator in params.actuator; "
+            "a held mind is refused under one, since the driver realises every "
+            "action node every round, so a held node's draw would be repeated each round of the "
+            "option and the duration is read off the realised level (step-durations.md T9)"
+        )
+
+    def decide(key, obs, carry):
+        inner = carry.inner if isinstance(carry, HoldCarry) else carry
+        action, inner = respond(key, obs, inner)
+        unit = float(system.elapsed(action, params))
+        value = unit * ticks_per_unit
+        rounds = round(value)
+        if value < 1 - 1e-5:
+            raise ValueError(
+                f"hold: the duration of control node {node!r} at the chosen level is {unit:g}, "
+                f"which times ticks_per_unit={ticks_per_unit} is shorter than one round"
+            )
+        if abs(value - rounds) > 1e-5 * max(1.0, abs(value)):
+            raise ValueError(
+                f"hold: the duration of control node {node!r} at the chosen level is "
+                f"{unit:g}, which times ticks_per_unit={ticks_per_unit} is "
+                "not a whole number of rounds"
+            )
+        return action, HoldCarry(inner, rounds - 1, action)
+
+    def held(key, obs, carry):
+        if isinstance(carry, HoldCarry) and carry.remaining > 0:
+            return carry.action, carry._replace(remaining=carry.remaining - 1)
+        return decide(key, obs, carry)
+
+    return held
+
+
+def _durations_node(system: System, params: SystemParams) -> str:
+    """The control node that carries ``params.durations``, or a refusal when none is declared."""
+    declared = system._durations(system._params_in(params, "hold"), "hold")
+    if not declared:
+        raise ValueError(
+            "hold: this System declares no params.durations, so there is no option to hold; "
+            "a mind with no durations is a plain respond"
+        )
+    ((node, _),) = declared.items()
+    return node
 
 
 def run(
@@ -406,8 +513,17 @@ def _run_composite(
     live = {name: MindCarry() for name in minds}
     live.update(carries or {})
 
+    #  each action node's kind and width, read from the composite's control layout
+    typed = composite._names(composite._params_in(params, "run"))
+    node_types = {a: (typed.kind(k), typed.sizes[k]) for k, a in enumerate(c_names.actions)}
+
     def no_op() -> dict[str, Array]:
-        return {k: jnp.zeros((), jnp.int32) for k in c_names.actions}
+        return {
+            k: jnp.zeros((), jnp.int32)
+            if node_types[k][0] == LEVEL
+            else jnp.zeros((node_types[k][1],), jnp.float32)
+            for k in c_names.actions
+        }
 
     action = no_op()
     realised = no_op()
@@ -446,7 +562,10 @@ def _run_composite(
             name, respond = names[j], minds[names[j]]
             mods, ports = routes[name]
             chosen, live[name] = respond(keys[j], {m: obs[m] for m in mods}, live[name])
-            action = {**action, **_check_action(chosen, ports, name, action_of)}
+            action = {
+                **action,
+                **_check_action(chosen, ports, name, action_of, {a: node_types[a] for a in ports}),
+            }
             if tick_order in ("sequential", "async"):
                 k_step = keys[len(minds) + j]
                 realised = {**realised, **actuate(k_step, ports)}

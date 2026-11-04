@@ -1,13 +1,16 @@
 """The inference faces of :class:`~hybrid_aif.system.System`: ``infer_states``, ``predict_beliefs``
 and ``update_empirical_prior``."""
 
+import math
 from collections.abc import Mapping
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax import Array
 
-from hybrid_aif.distributions import Gaussian, MixtureGaussian, MLPConditional
+from hybrid_aif.controls import LEVEL
+from hybrid_aif.distributions import Categorical, MixtureGaussian, MLPConditional
 from hybrid_aif.factors import LGObservation, TabularObservation
 from hybrid_aif.inference import amortized as _amortized
 from hybrid_aif.inference import emission as _emission
@@ -15,9 +18,11 @@ from hybrid_aif.inference import sample as _sample
 from hybrid_aif.inference.detail import InferenceDetail
 from hybrid_aif.inference.discrete import SUPPORT_FLOOR, fpi_support, mean_field_free_energy
 from hybrid_aif.inference.linear_gaussian import condition
+from hybrid_aif.inference.linearise import linearise
 from hybrid_aif.inference.mixture_filter import (
+    _per_mode,
     condition_mixture_components,
-    condition_mixture_switching,
+    condition_mixture_switching_components,
     mode_bank_evidence,
     mode_evidence_message,
     switching_mode_message,
@@ -46,6 +51,282 @@ def _present_select(present, updated: list, previous: list | None, log_ev):
     return kept, jnp.where(present, log_ev, jnp.zeros_like(log_ev))
 
 
+def _measurements(
+    system,
+    params: SystemParams,
+    priors: tuple[Belief, ...],
+    observations: tuple[Array | None, ...],
+    externals: Mapping[str, Array] | None,
+    masks: tuple[bool | Array, ...] | None,
+    categorical: tuple[bool, ...],
+) -> tuple[_amortized.Measurement, ...]:
+    """The tick's recognition messages, from one :func:`~hybrid_aif.inference.amortized.
+    analytic_recognize` pass over the entries in derived order (before any update).
+
+    ``categorical[f]`` says whether state factor ``f`` is categorical; ``priors`` give each
+    factor's width.
+    """
+    if not system.recognition:
+        return ()
+    s = len(categorical)
+    kinds = tuple(
+        _amortized.CATEGORICAL_KIND if cat else _amortized.GAUSSIAN_KIND for cat in categorical
+    )
+    widths = tuple(
+        q.probs.shape[-1] if isinstance(q, Categorical) else q.mean().shape[-1] for q in priors[:s]
+    )
+    return _amortized.analytic_recognize(
+        _amortized.analytic_order(system.recognition),
+        params.recognition,
+        observations,
+        externals,
+        masks,
+        system.modality_names,
+        system._facs[:s],
+        kinds,
+        widths,
+    )
+
+
+def _append_rows(sub_lls, sub_deps, sub_obs, sub_masks, exempt, rows, pos):
+    """The tabular sweep's inputs extended by each categorical measurement as a one-row tensor
+    over its factor (``pos`` maps a factor to its place in the sweep), support-exempt like an
+    emission's scores: the row is a likelihood over the levels, not a probability of an event."""
+    if not rows:
+        return sub_lls, sub_deps, sub_obs, sub_masks, exempt
+    n = len(sub_lls)
+    masks = (True,) * n if sub_masks is None else tuple(sub_masks)
+    return (
+        (*sub_lls, *(r.row[None] for r in rows)),
+        (*sub_deps, *((pos[r.factor],) for r in rows)),
+        (*sub_obs, *(jnp.zeros((), jnp.int32) for _ in rows)),
+        (*masks, *(r.present for r in rows)),
+        (*exempt, *range(n, n + len(rows))),
+    )
+
+
+def _categorical_terms(rows, pre, final, pos, terms: list, log_z_by_name: dict) -> None:
+    """Record each categorical measurement's ``- log Z + E_q[log m]`` (``terms``) and ``log Z``.
+
+    ``log Z = log sum_k q_pre_k r_k`` reads the belief the sweep gives without the rows (``pre``),
+    ``E_q[log m] = sum_k q_k log r_k`` the final belief; a measurement absent at the tick adds
+    nothing.
+    """
+    for r in rows:
+        log_z = _amortized.categorical_message_log_evidence(pre[pos[r.factor]].log_probs, r.row)
+        term = -log_z + _amortized.categorical_message_expectation(final[r.factor].probs, r.row)
+        if r.present is not True:
+            log_z, term = (jnp.where(r.present, x, jnp.zeros_like(x)) for x in (log_z, term))
+        terms.append(term)
+        log_z_by_name[f"recognition:{r.variable}"] = log_z
+
+
+def _neural_continuous(system, m: int, families, s: int) -> list[int]:
+    """The continuous factors a neural modality reads; more than one is refused by name."""
+    continuous = [
+        g for g in system._engine_A_deps[m] if g < s and families[g] != _hybrid.CATEGORICAL
+    ]
+    if len(continuous) > 1:
+        raise NotImplementedError(
+            f"modality {system.modality_names[m]!r} is a neural likelihood over the continuous "
+            f"factors {[system._facs[g] for g in continuous]}; a neural modality reads exactly "
+            "one continuous factor, the rest of its parents being categorical (design: "
+            "recognition-beside-analytic.md L1)"
+        )
+    return continuous
+
+
+def _config_grid(sizes: tuple[int, ...]) -> Array:
+    """The ``(M, len(sizes))`` int grid of mode configurations, row-major, ``M = prod(sizes)``."""
+    total = math.prod(sizes)
+    if not sizes:
+        return jnp.zeros((1, 0), jnp.int32)
+    return jnp.stack(jnp.unravel_index(jnp.arange(total), sizes), axis=-1).astype(jnp.int32)
+
+
+def _belief_components(q) -> tuple[Array, Array]:
+    """``(locs, chols)`` of a Gaussian or mixture belief, with a leading component axis."""
+    if isinstance(q, MixtureGaussian):
+        return q.means, q.chols
+    return q.loc[None], q.chol[None]
+
+
+def _dense_model(system, a, m: int, q, out, priors, families, s: int):
+    """Modality ``m``'s observation model at the belief ``q`` over its factor, as
+    ``(H, c, R_chol, axes)`` with leading ``(K, M)`` axes: ``K`` the belief's components (one for a
+    Gaussian), ``M`` the mode configurations over the parents ``axes`` (one where there are none),
+    row-major in ``axes`` order.
+
+    A linear-Gaussian modality reads its declared arrays (a noise map at each component's mean;
+    action nodes alone select their level). A neural one is linearised at each component's mean
+    and, per configuration of its categorical state parents, at their one-hots; its action-node
+    parents are held at the one-hot of their point prior's level (``priors[g]``).
+    """
+    mods, facs = system.modality_names, system._facs
+    deps = system._engine_A_deps[m]
+    locs, chols = _belief_components(q)
+    k = locs.shape[0]
+    mixture = isinstance(q, MixtureGaussian)
+
+    def level_of(g: int, f: int):
+        return _hybrid.prior_point_level(
+            priors[g], system._sensed[g - s], mods[m], facs[f], mixture
+        )
+
+    if isinstance(a, MLPConditional):
+        f = next(g for g in deps if g < s and families[g] != _hybrid.CATEGORICAL)
+        axes = tuple(g for g in deps if g < s and g != f)
+        node_vec = {
+            g: jax.nn.one_hot(level_of(g, f), a.parent_dims[deps.index(g)]) for g in deps if g >= s
+        }
+        sizes = tuple(out[g].probs.shape[-1] for g in axes)
+        grid = _config_grid(sizes)
+
+        def at(loc, chol, cfg):
+            parents = tuple(
+                loc
+                if g == f
+                else jax.nn.one_hot(cfg[axes.index(g)], sizes[axes.index(g)])
+                if g in axes
+                else node_vec[g]
+                for g in deps
+            )
+            return linearise(a, loc, chol, parents, deps.index(f), a.propagation)
+
+        H, c, R = jax.vmap(lambda loc, chol: jax.vmap(lambda cfg: at(loc, chol, cfg))(grid))(
+            locs, chols
+        )
+        return H, c, R, axes
+    f, obs_parents = deps[0], deps[1:]
+    if (
+        obs_parents
+        and _hybrid.selects_by_nodes(a, families[f])
+        and all(g >= s for g in obs_parents)
+    ):
+        a = _hybrid.select_observation(
+            _continuous.lg_point(a), tuple(level_of(g, f) for g in obs_parents)
+        )
+        obs_parents = ()
+    if obs_parents:
+        n_modes = math.prod(out[g].probs.shape[-1] for g in obs_parents)
+        Hm, cm, Rm = (
+            _per_mode(a.H, n_modes, 2),
+            _per_mode(a.c, n_modes, 1),
+            _per_mode(a.R_chol, n_modes, 2),
+        )
+        tile = lambda x: jnp.broadcast_to(x, (k, *x.shape))  # noqa: E731
+        return tile(Hm), tile(cm), tile(Rm), tuple(obs_parents)
+    R = a.R_chol_at(locs) if a.noise_map else jnp.broadcast_to(a.R_chol, (k, *a.R_chol.shape))
+    H, c = jnp.broadcast_to(a.H, (k, *a.H.shape)), jnp.broadcast_to(a.c, (k, *a.c.shape))
+    return H[:, None], c[:, None], R[:, None], ()
+
+
+def _joint_weights(system, q, out, axes: tuple[int, ...], f: int) -> Array:
+    """The ``(K, M)`` weight of each (component, mode configuration) pair under the belief.
+
+    A Gaussian weighs one. A mixture's components weigh by their weights; where the modes are
+    the factor's own mode parents (mode-aligned banks) a component holds its bank's
+    configuration, otherwise the configurations weigh by the mode beliefs.
+    """
+    if not isinstance(q, MixtureGaussian):
+        return jnp.ones((1, 1))
+    w = jax.nn.softmax(q.log_weights, axis=-1)
+    if not axes:
+        return w[:, None]
+    n_modes = math.prod(out[g].probs.shape[-1] for g in axes)
+    own = tuple(g for g in system._B[f] if g < len(out) and isinstance(out[g], Categorical))
+    k = w.shape[-1]
+    if own == axes and system.mixture_schedule == "mode_aligned" and k % n_modes == 0:
+        bank = jnp.arange(k) // (k // n_modes)
+        return w[:, None] * (bank[:, None] == jnp.arange(n_modes)[None, :])
+    q_modes = jax.nn.softmax(_hybrid._mode_log_weights(tuple(out[g] for g in axes)), axis=-1)
+    return w[:, None] * q_modes[None, :]
+
+
+def _neural_table(a: MLPConditional, y: Array, deps: tuple[int, ...], sizes: tuple[int, ...]):
+    """``log p(y | parents)`` at every configuration of a neural modality's categorical
+    parents (one-hots), shaped ``sizes``."""
+    grid = _config_grid(sizes)
+
+    def one(cfg):
+        return a.log_prob(y, tuple(jax.nn.one_hot(cfg[i], n) for i, n in enumerate(sizes)))
+
+    return jax.vmap(one)(grid).reshape(sizes)
+
+
+def expected_nll(system, a, m: int, y: Array, out, priors, families, s: int) -> Array:
+    """``- E_q[log p(y | s)]`` of modality ``m`` (declaration ``a``) under the beliefs ``out``.
+
+    A linear-Gaussian or neural modality over a continuous factor takes the closed-form Gaussian
+    expectation of the quadratic per component, weighted (:func:`~hybrid_aif.inference.amortized.
+    expected_gaussian_nll`; for a neural one, with ``(H, c, R)`` linearised at each component's
+    mean, ``-log p(y | mu) + 1/2 tr(J^T R^-1 J Sigma)`` to first order). An emission or neural
+    modality over categorical parents alone takes the expectation of its log table
+    under the mean-field parent beliefs.
+    """
+    deps = system._engine_A_deps[m]
+    y = jnp.asarray(y)
+    cont = [g for g in deps if g < s and families[g] != _hybrid.CATEGORICAL]
+    if not cont:
+        sizes = tuple(out[g].probs.shape[-1] for g in deps)
+        if isinstance(a, MLPConditional):
+            table = _neural_table(a, y, deps, sizes)
+        elif _emission.is_emission(a):
+            table = jnp.broadcast_to(_emission.emission_scores(a, y), sizes)
+        else:
+            raise TypeError(f"modality {system.modality_names[m]!r}: no expected log-likelihood")
+        joint = out[deps[0]].probs
+        for g in deps[1:]:
+            joint = joint[..., None] * out[g].probs
+        return -jnp.sum(joint * table)
+    f = cont[0] if isinstance(a, MLPConditional) else deps[0]
+    q = out[f]
+    H, c, R, axes = _dense_model(system, a, m, q, out, priors, families, s)
+    locs, chols = _belief_components(q)
+    return _amortized.expected_gaussian_nll(
+        locs, chols, H, c, R, y, _joint_weights(system, q, out, axes, f)
+    )
+
+
+def _condition_mixture(system, out: list, f: int, H, c, R_chol, y, who: str, families):
+    """Condition the mode-aligned mixture factor ``f`` of ``out`` on ``y = H x + c + eps``.
+
+    Every component takes the Kalman update and the weights are re-scored; ``H``, ``c`` and
+    ``R_chol`` are each one array for every component or one per component (``(K, d_obs, d)``,
+    ``(K, d_obs)``, ``(K, d_obs, d_obs)``: a linearised neural modality reads each component at
+    its own mean). Where the factor has
+    categorical mode parents, their beliefs in ``out`` are replaced by the mode evidence message
+    and the returned log evidence reads the mode belief the tabular stage left. Returns
+    ``(posterior, log_evidence, per_component_loglik or None)``; the caller stores the posterior.
+    """
+    if system.mixture_schedule != "mode_aligned":
+        raise NotImplementedError(
+            f"{who} observes mixture-carried factor {system._facs[f]!r} under "
+            "mixture_schedule='runnalls': filtering a mixture belief against evidence "
+            "needs mode-owned slots (the per-mode evidence a cross-mode Runnalls merge "
+            'destroys). Declare System(mixture_schedule="mode_aligned") to enable it.'
+        )
+    q = out[f]
+    posterior, log_ev, ll = condition_mixture_components(q, H, c, R_chol, y)
+    mode_parents = tuple(g for g in system._B[f] if families[g] == _hybrid.CATEGORICAL)
+    if not mode_parents:
+        return posterior, log_ev, None
+    mode_beliefs = tuple(out[g] for g in mode_parents)
+    # the evidence of y reads the mode belief the tabular stage left, as the
+    # switching path does, not the mixture's own bank masses, which still carry
+    # the prior mode mass
+    n_modes = 1
+    for b in mode_beliefs:
+        n_modes *= b.probs.shape[-1]
+    log_ev = jax.scipy.special.logsumexp(
+        _hybrid._mode_log_weights(mode_beliefs) + mode_bank_evidence(q.log_weights, ll, n_modes)
+    )
+    updated = mode_evidence_message(mode_beliefs, q.log_weights, ll)
+    for g, q_mode in zip(mode_parents, updated, strict=True):
+        out[g] = q_mode
+    return posterior, log_ev, ll
+
+
 def infer_states(
     system,
     params: SystemParams,
@@ -63,10 +344,10 @@ def infer_states(
     positional_priors = (
         None if priors is None else system._beliefs_in(params, priors, "infer_states")
     )
-    prev_beliefs, prev_action = _previous_in(system, previous, "infer_states")
+    prev_beliefs, prev_action = _previous_in(system, params, previous, "infer_states")
     sensed = None
     if system._sensed_columns:
-        sensed = system._sensed_priors(params, priors, "infer_states")
+        sensed = system._sensed_priors(params, priors, "infer_states", prev_action)
         if positional_priors is None:
             positional_priors = system._initial_priors(params, "infer_states")
         positional_priors = (*positional_priors, *sensed)
@@ -197,6 +478,7 @@ def _infer_states_expected(
         if together is not None:  # traced flags: all present, or a predict-only tick
             beliefs = tuple(_hybrid.where_tree(together, beliefs, priors))
         return beliefs, None
+    validation._validate_analytic_declaration(system, params)  # before any family derivation
     n_mods = len(params.likelihood)
     pre_reduce: list[MixtureGaussian | None] = [None] * n_mods
     mode_log_ev: list[Array | None] = [None] * n_mods
@@ -205,6 +487,11 @@ def _infer_states_expected(
     free_energy: list[Array | None] = [None]
     # each LG modality's log evidence, the term the tick's free energy subtracts
     evidence_terms: list[Array | None] = [None] * n_mods
+    # each recognition message's ``- log Z + E_q[log m]`` and its log normaliser, and each
+    # covered modality's ``- E_q[log p(o | s)]`` by modality name
+    message_terms: list[Array] = []
+    message_log_z: dict[str, Array] = {}
+    covered_terms: dict[str, Array] = {}
 
     def _detail() -> InferenceDetail | None:
         if not detail:
@@ -213,12 +500,19 @@ def _infer_states_expected(
         for ev in evidence_terms:
             if ev is not None:
                 total = total - ev
+        for term in message_terms:
+            total = total + term
+        for entry in system.recognition or ():  # an absent entry's normaliser is zero
+            if entry.variable in system._facs:
+                message_log_z.setdefault(f"recognition:{entry.variable}", jnp.zeros(()))
         return InferenceDetail(
             pre_reduce=tuple(pre_reduce),
             mode_log_evidence=tuple(mode_log_ev),
             log_evidence=tuple(log_ev),
             unsupported=tuple(flags),
             free_energy=total,
+            recognition_log_evidence=dict(message_log_z),
+            covered_terms=dict(covered_terms),
         )
 
     if not system._is_hybrid(params):
@@ -230,19 +524,65 @@ def _infer_states_expected(
             at = {n + k: s + i for i, k in enumerate(system._sensed_columns)}
             A_deps = tuple(tuple(at.get(g, g) for g in deps) for deps in A_deps)
         priors_used = system._initial_priors(params, face) if priors is None else priors
-        beliefs, sub_flags = fpi_support(
-            params.likelihood,
-            A_deps,
-            priors_used,
+        rows = _measurements(
+            system,
+            params,
+            tuple(priors_used),
             observations,
+            externals,
+            masks,
+            (True,) * len(system.B_deps),
+        )
+        # a modality a recognition entry covers is not inverted: the entry's message stands for it
+        tab_covered = _amortized.covered_modalities(system.recognition, system.modality_names)
+        kept = tuple(m for m in range(len(params.likelihood)) if m not in tab_covered)
+        lls, deps, obs_all, masks_all, exempt = _append_rows(
+            tuple(params.likelihood[m] for m in kept),
+            tuple(A_deps[m] for m in kept),
+            tuple(observations[m] for m in kept),
+            None if masks is None else tuple(masks[m] for m in kept),
+            (),
+            rows,
+            {f: f for f in range(len(priors_used))},
+        )
+        beliefs, sub_flags = fpi_support(
+            lls,
+            deps,
+            priors_used,
+            obs_all,
             num_iters=system.num_iters,
-            masks=masks,
+            masks=masks_all,
             support_floor=support_floor,
+            support_exempt=exempt,
         )
         flags[:] = list(sub_flags)[: len(flags)]
+        pre = beliefs
+        if detail and rows:
+            pre, _ = fpi_support(
+                tuple(params.likelihood[m] for m in kept),
+                tuple(A_deps[m] for m in kept),
+                priors_used,
+                tuple(observations[m] for m in kept),
+                num_iters=system.num_iters,
+                masks=None if masks is None else tuple(masks[m] for m in kept),
+                support_floor=support_floor,
+            )
         if detail:
             free_energy[0] = mean_field_free_energy(
-                params.likelihood, A_deps, priors_used, beliefs, observations, masks
+                tuple(params.likelihood[m] for m in kept),
+                tuple(A_deps[m] for m in kept),
+                priors_used,
+                pre,
+                tuple(observations[m] for m in kept),
+                None if masks is None else tuple(masks[m] for m in kept),
+            )
+            _categorical_terms(
+                rows,
+                pre,
+                beliefs,
+                {f: f for f in range(len(priors_used))},
+                message_terms,
+                message_log_z,
             )
         return beliefs, _detail()
     s, n_sensed = system._table.num_states, len(system._sensed_columns)
@@ -255,15 +595,8 @@ def _infer_states_expected(
         if isinstance(a, LGObservation):
             continue
         if isinstance(a, MLPConditional):
-            raise NotImplementedError(
-                f"modality {mods[m]!r} declares a neural (MLPConditional) likelihood: "
-                "conditioning state beliefs *through* a net needs an inference strategy "
-                "the registry does not have: structured/moment-matched filtering "
-                "through the net (design: amortization.md A1(a)) or an amortized "
-                "recognition model q(s | o, s_prev) (A1(b), the P3 track). The "
-                "declaration itself is legal and gradient-learnable through learn(); "
-                "only infer_states through it is unbuilt."
-            )
+            _neural_continuous(system, m, families, s)  # refuses two continuous parents
+            continue
         continuous = [facs[f] for f in A_deps[m] if f < s and families[f] != _hybrid.CATEGORICAL]
         if continuous:
             raise NotImplementedError(
@@ -271,21 +604,48 @@ def _infer_states_expected(
                 f"non-linear-Gaussian likelihood ({type(a).__name__}): discrete-given-"
                 "continuous / MNLR observation models are out of scope"
             )
-    system._validate(params, face)
+    system._validate(params, face, declared=True)
     priors = system._initial_priors(params, face) if priors is None else priors
     out: list[Belief] = list(priors)
+    measurements = _measurements(
+        system,
+        params,
+        tuple(priors),
+        observations,
+        externals,
+        masks,
+        tuple(fam == _hybrid.CATEGORICAL for fam in families[:s]),
+    )
+    rows = tuple(r for r in measurements if r.kind == _amortized.CATEGORICAL_KIND)
     cat_f = (
         *(f for f, fam in enumerate(families) if fam == _hybrid.CATEGORICAL),
         *range(s, s + n_sensed),
     )
-    cat_m = tuple(m for m, a in enumerate(params.likelihood) if isinstance(a, TabularObservation))
+    covered = _amortized.covered_modalities(system.recognition, mods)
+    cat_m = tuple(
+        m
+        for m, a in enumerate(params.likelihood)
+        if isinstance(a, TabularObservation) and m not in covered
+    )
     # a Gaussian emission over categorical parents alone joins the tabular sweep as the
     # one-row tensor of its predictive scores (structure-learning.md S2); its scores are
     # densities, so the support check skips it
-    emission_m = tuple(m for m, a in enumerate(params.likelihood) if _emission.is_emission(a))
+    emission_m = tuple(
+        m for m, a in enumerate(params.likelihood) if _emission.is_emission(a) and m not in covered
+    )
+    # a neural likelihood over categorical parents alone joins the sweep as its log-density table
+    neural_tab_m = tuple(
+        m
+        for m, a in enumerate(params.likelihood)
+        if isinstance(a, MLPConditional)
+        and m not in covered
+        and not any(g < s and families[g] != _hybrid.CATEGORICAL for g in A_deps[m])
+    )
+    pos: dict[int, int] = {}
+    row_pre: tuple = ()
     if cat_f:
         pos = {f: i for i, f in enumerate(cat_f)}
-        sub_m = cat_m + emission_m
+        sub_m = cat_m + emission_m + neural_tab_m
         sub_lls: list = [params.likelihood[m] for m in cat_m]
         sub_obs: list = [observations[m] for m in cat_m]
         for m in emission_m:
@@ -297,47 +657,95 @@ def _infer_states_expected(
                     _emission.emission_log_likelihood(params.likelihood[m], observations[m], shape)
                 )
             sub_obs.append(jnp.zeros((), jnp.int32))
+        for m in neural_tab_m:
+            shape = tuple(priors[f].probs.shape[-1] for f in A_deps[m])
+            if masks is not None and masks[m] is False:
+                sub_lls.append(jnp.zeros((1, *shape)))
+            else:
+                sub_lls.append(
+                    _neural_table(
+                        params.likelihood[m], jnp.asarray(observations[m]), A_deps[m], shape
+                    )[None]
+                )
+            sub_obs.append(jnp.zeros((), jnp.int32))
         sub_deps = tuple(tuple(pos[f] for f in A_deps[m]) for m in sub_m)
         sub_masks = None if masks is None else tuple(masks[m] for m in sub_m)
+        exempt = tuple(range(len(cat_m), len(sub_m)))
+        lls, deps, obs_all, masks_all, exempt_all = _append_rows(
+            tuple(sub_lls), sub_deps, tuple(sub_obs), sub_masks, exempt, rows, pos
+        )
         sub_posteriors, sub_flags = fpi_support(
-            tuple(sub_lls),
-            sub_deps,
+            lls,
+            deps,
             tuple(priors[f] for f in cat_f),
-            tuple(sub_obs),
+            obs_all,
             num_iters=system.num_iters,
-            masks=sub_masks,
+            masks=masks_all,
             support_floor=support_floor,
-            support_exempt=tuple(range(len(cat_m), len(sub_m))),
+            support_exempt=exempt_all,
         )
         for f, q, flag in zip(cat_f, sub_posteriors, sub_flags, strict=True):
             out[f] = q
             if f < s:
                 flags[f] = flag
         if detail:  # the tabular stage's free energy, before any LG mode message
+            pre = sub_posteriors
+            if rows:  # the belief the categorical messages are applied to: the sweep without them
+                pre, _ = fpi_support(
+                    tuple(sub_lls),
+                    sub_deps,
+                    tuple(priors[f] for f in cat_f),
+                    tuple(sub_obs),
+                    num_iters=system.num_iters,
+                    masks=sub_masks,
+                    support_floor=support_floor,
+                    support_exempt=exempt,
+                )
             free_energy[0] = mean_field_free_energy(
                 tuple(sub_lls),
                 sub_deps,
                 tuple(priors[f] for f in cat_f),
-                sub_posteriors,
+                pre,
                 tuple(sub_obs),
                 sub_masks,
             )
-    # a noise map is read at the tick's prior mean, whichever modality over the factor
-    # conditions first (the extended filter's convention)
-    prior_locs = {f: q.loc for f, q in enumerate(out) if isinstance(q, Gaussian)}
+            row_pre = pre
+    # a neural modality's linearisation and a noise map are read at the belief the factor holds
+    # when the modality is reached (the sequential extended filter): the tick's prior for the
+    # first modality over it, the running posterior after an earlier one; a mixture-carried
+    # factor is read at each of its current components' means
     for m, a in enumerate(params.likelihood):
-        if not isinstance(a, LGObservation) or m in emission_m:
-            continue  # categorical modalities and emissions handled by the FPI sub-model
+        neural = isinstance(a, MLPConditional)
+        if not (isinstance(a, LGObservation) or neural) or m in emission_m or m in covered:
+            continue  # tabular, emissions and neural tables: the FPI sub-model; covered: the entry
+        if neural and m in neural_tab_m:
+            continue
         present = True if masks is None else masks[m]
         deps = A_deps[m]
-        f, obs_parents = deps[0], deps[1:]
-        if obs_parents and families[f] == _hybrid.GAUSSIAN and all(g >= s for g in obs_parents):
+        if neural:
+            f = _neural_continuous(system, m, families, s)[0]
+            #  the state mode parents switch the model; action nodes hold their point level
+            obs_parents = tuple(g for g in deps if g < s and g != f)
+        else:
+            f, obs_parents = deps[0], deps[1:]
+        if (
+            not neural
+            and obs_parents
+            and _hybrid.selects_by_nodes(a, families[f])
+            and all(g >= s for g in obs_parents)
+        ):
             #  a channel read through action nodes alone selects its head and noise at the
-            #  node's level, the node's prior being a point; the factor stays one Gaussian
+            #  node's level, the node's prior being a point; the factor keeps its family
             a = _hybrid.select_observation(
                 _continuous.lg_point(a),
                 tuple(
-                    _hybrid.prior_point_level(priors[g], system._sensed[g - s], mods[m], facs[f])
+                    _hybrid.prior_point_level(
+                        priors[g],
+                        system._sensed[g - s],
+                        mods[m],
+                        facs[f],
+                        families[f] == _hybrid.MIXTURE,
+                    )
                     for g in obs_parents
                 ),
             )
@@ -352,69 +760,124 @@ def _infer_states_expected(
             if present is False:
                 out = before  # statically absent: the factors keep their priors
                 continue
+        if neural:
+            #  linearised at the belief the factor holds now, per component and, with
+            #  state mode parents, per mode configuration (``(K, M, ...)``)
+            lin_H, lin_c, lin_R, _ = _dense_model(system, a, m, out[f], out, priors, families, s)
         if obs_parents:
             # Switching observation: grow the factor to K*M, read the mode message from
             # the grown weights before reducing (so no mode-owned slots are needed;
             # mixture-filtering.md Guidance)
             q = out[f]
             mode_lp = _hybrid._mode_log_weights(tuple(out[g] for g in obs_parents))
-            grown, per_mode_ev = condition_mixture_switching(
-                q, a.H, a.c, a.R_chol, observations[m], mode_lp
-            )
+            if neural:
+                grown, per_mode_ev, ll_km = condition_mixture_switching_components(
+                    q, lin_H, lin_c, lin_R, observations[m], mode_lp, per_component=True
+                )
+            else:
+                grown, per_mode_ev, ll_km = condition_mixture_switching_components(
+                    q, a.H, a.c, a.R_chol, observations[m], mode_lp
+                )
             updated = switching_mode_message(tuple(out[g] for g in obs_parents), per_mode_ev)
             for g, q_mode in zip(obs_parents, updated, strict=True):
                 out[g] = q_mode
             pre_reduce[m], mode_log_ev[m] = grown, per_mode_ev
             log_ev[m] = jax.scipy.special.logsumexp(mode_lp + per_mode_ev)
+            own_modes = tuple(g for g in system._B[f] if families[g] == _hybrid.CATEGORICAL)
+            disjoint = not any(g in obs_parents for g in own_modes)
+            if own_modes and disjoint and system.mixture_schedule == "mode_aligned":
+                #  the factor's own mode parents, none of which the channel reads, take the
+                #  evidence as the non-switching update sends it: per component, the channel's
+                #  modes marginalised at their belief; a channel that reads one of them sends
+                #  its own mode message and the banks are not read
+                ll = jax.scipy.special.logsumexp(mode_lp + ll_km, axis=-1)
+                mode_beliefs = tuple(out[g] for g in own_modes)
+                n_modes = 1
+                for b in mode_beliefs:
+                    n_modes *= b.probs.shape[-1]
+                log_ev[m] = jax.scipy.special.logsumexp(
+                    _hybrid._mode_log_weights(mode_beliefs)
+                    + mode_bank_evidence(q.log_weights, ll, n_modes)
+                )
+                for g, q_mode in zip(
+                    own_modes, mode_evidence_message(mode_beliefs, q.log_weights, ll), strict=True
+                ):
+                    out[g] = q_mode
             out[f] = _hybrid.pad_mixture(grown, system.mixture_k)
             out, log_ev[m] = _present_select(present, out, before, log_ev[m])
             evidence_terms[m] = log_ev[m]
             continue
+        if neural:
+            H, c, R_chol = (x[:, 0] for x in (lin_H, lin_c, lin_R))  # one mode configuration
+            if families[f] != _hybrid.MIXTURE:
+                H, c, R_chol = H[0], c[0], R_chol[0]
+        elif families[f] != _hybrid.MIXTURE:
+            H, c = a.H, a.c
+            R_chol = a.R_chol_at(out[f].loc) if a.noise_map else a.R_chol
+        else:
+            H, c = a.H, a.c
+            R_chol = a.R_chol_at(out[f].means) if a.noise_map else a.R_chol
         if families[f] != _hybrid.MIXTURE:
-            R_chol = a.R_chol_at(prior_locs[f]) if a.noise_map else a.R_chol
-            out[f], log_ev[m] = condition(out[f], a.H, a.c, R_chol, observations[m])
+            out[f], log_ev[m] = condition(out[f], H, c, R_chol, observations[m])
             out, log_ev[m] = _present_select(present, out, before, log_ev[m])
             evidence_terms[m] = log_ev[m]
             continue
-        if system.mixture_schedule != "mode_aligned":
-            raise NotImplementedError(
-                f"modality {mods[m]!r} observes mixture-carried factor {facs[f]!r} under "
-                "mixture_schedule='runnalls': filtering a mixture belief against evidence "
-                "needs mode-owned slots (the per-mode evidence a cross-mode Runnalls merge "
-                'destroys). Declare System(mixture_schedule="mode_aligned") to enable it.'
-            )
-        q = out[f]
-        posterior, log_ev[m], ll = condition_mixture_components(
-            q, a.H, a.c, a.R_chol, observations[m]
+        posterior, log_ev[m], ll = _condition_mixture(
+            system, out, f, H, c, R_chol, observations[m], f"modality {mods[m]!r}", families
         )
-        mode_parents = tuple(g for g in system._B[f] if families[g] == _hybrid.CATEGORICAL)
-        if mode_parents:
-            mode_beliefs = tuple(out[g] for g in mode_parents)
-            # the evidence of y reads the mode belief the tabular stage left, as the
-            # switching path does, not the mixture's own bank masses, which still carry
-            # the prior mode mass
-            n_modes = 1
-            for b in mode_beliefs:
-                n_modes *= b.probs.shape[-1]
-            log_ev[m] = jax.scipy.special.logsumexp(
-                _hybrid._mode_log_weights(mode_beliefs)
-                + mode_bank_evidence(q.log_weights, ll, n_modes)
-            )
-            updated = mode_evidence_message(mode_beliefs, q.log_weights, ll)
-            for g, q_mode in zip(mode_parents, updated, strict=True):
-                out[g] = q_mode
+        if ll is not None:
             mode_log_ev[m] = ll
         out[f] = posterior
         out, log_ev[m] = _present_select(present, out, before, log_ev[m])
         evidence_terms[m] = log_ev[m]
+    for ms in measurements:
+        if ms.kind != _amortized.GAUSSIAN_KIND:
+            continue
+        # a Gaussian measurement of the factor through the identity map, applied after every
+        # modality's update so it multiplies the posterior the tick's evidence has left
+        f, present = ms.factor, ms.present
+        d = ms.loc.shape[-1]
+        H, c, R_chol = jnp.eye(d), jnp.zeros(d), jnp.diag(ms.scale)
+        before = None if present is True else list(out)
+        if families[f] == _hybrid.MIXTURE:
+            posterior, log_z, _ = _condition_mixture(
+                system, out, f, H, c, R_chol, ms.loc, f"recognition entry {ms.variable!r}", families
+            )
+            out[f] = posterior
+        else:
+            out[f], log_z = condition(out[f], H, c, R_chol, ms.loc)
+        out, log_z = _present_select(present, out, before, log_z)
+        if detail:
+            expect = (
+                _amortized.mixture_message_expectation
+                if families[f] == _hybrid.MIXTURE
+                else _amortized.gaussian_message_expectation
+            )(out[f], ms.loc, ms.scale)
+            term = -log_z + expect
+            message_terms.append(term if present is True else jnp.where(present, term, 0.0))
+            message_log_z[f"recognition:{ms.variable}"] = log_z
+    if detail:
+        _categorical_terms(rows, row_pre, out, pos, message_terms, message_log_z)
+        for m in sorted(covered):
+            a = params.likelihood[m]
+            present = True if masks is None else masks[m]
+            term = jnp.zeros(())
+            if present is not False:
+                term = expected_nll(system, a, m, observations[m], out, priors, families, s)
+                term = term if present is True else jnp.where(present, term, 0.0)
+                message_terms.append(term)
+            covered_terms[mods[m]] = term
     return tuple(out), _detail()
 
 
 def _previous_in(
-    system, previous: Mapping[str, Belief | Array] | None, face: str
-) -> tuple[tuple[Belief | None, ...] | None, Array | None]:
+    system, params: SystemParams, previous: Mapping[str, Belief | Array] | None, face: str
+) -> tuple[tuple[Belief | None, ...] | None, tuple[Array | None, ...] | None]:
     """A keyed ``previous`` as ``(prev_beliefs, prev_action)``: one belief per state factor
-    (``None`` where absent) and the positional action (``None`` without any entry)."""
+    (``None`` where absent) and one entry per action node (``None`` where ``previous`` does not
+    name it), or ``None`` without any entry. A discrete node's entry is an int32 level, checked
+    against the node's level count (eagerly when concrete, by ``eqx.error_if`` when traced); a
+    continuous node's entry is its float value."""
     if previous is None:
         return None, None
     facs = system._facs[: len(system.B_deps)]
@@ -425,12 +888,35 @@ def _previous_in(
             f"{face}: previous names {unknown}, which are neither state factors nor action nodes"
         )
     beliefs = tuple(previous.get(name) for name in facs)
-    action = None
-    if any(name in previous for name in actions):
-        action = jnp.asarray(
-            [jnp.asarray(previous.get(name, 0), jnp.int32) for name in actions], jnp.int32
+    if not any(name in previous for name in actions):
+        return beliefs, None
+    space = system._space(params)
+    entries: list[Array | None] = []
+    for k, name in enumerate(actions):
+        if name not in previous:
+            entries.append(None)
+            continue
+        if space.kinds[k] != LEVEL:
+            entries.append(jnp.asarray(previous[name], float))
+            continue
+        given, count = jnp.asarray(previous[name]), space.levels[k]
+        if not jnp.issubdtype(given.dtype, jnp.integer):
+            raise ValueError(
+                f"{face}: previous[{name!r}] is {previous[name]!r}, and action node {name!r} "
+                f"takes a level: pass an integer in [0, {count})"
+            )
+        level = given.astype(jnp.int32)
+        bad = (level < 0) | (level >= count)
+        message = (
+            f"{face}: previous[{name!r}] is a level outside action node {name!r}'s "
+            f"{count} level(s); pass an integer in [0, {count})"
         )
-    return beliefs, action
+        if isinstance(level, jax.core.Tracer):
+            level = eqx.error_if(level, jnp.any(bad), message)
+        elif bool(jnp.any(bad)):
+            raise ValueError(message)
+        entries.append(level)
+    return beliefs, tuple(entries)
 
 
 def _fill_lagged(
@@ -438,13 +924,14 @@ def _fill_lagged(
     observations: tuple[Array | None, ...],
     present: tuple[bool | Array, ...] | None,
     prev_beliefs: tuple[Belief | None, ...] | None,
-    prev_action: Array | None,
+    prev_action: Array | tuple[Array | None, ...] | None,
     first: Array | bool = False,
 ) -> tuple[tuple[Array | None, ...], tuple[bool | Array, ...] | None]:
     """The observations with every lagged modality's datum read from the carry where none
-    was given: the source factor's previous belief mean, or the previous action's level.
-    A modality with neither is absent, as is every lagged modality when ``first`` (a traced
-    flag for the tick with no carry)."""
+    was given: the source factor's previous belief mean, or the previous action's level (the
+    entry of a node ``prev_action`` does not name is absent, like a missing carry). A modality
+    with neither is absent, as is every lagged modality when ``first`` (a traced flag for the
+    tick with no carry)."""
     sources = system._lagged_sources
     if not sources:
         return observations, present
@@ -457,7 +944,8 @@ def _fill_lagged(
             q = None if prev_beliefs is None else prev_beliefs[index]
             datum = None if q is None else q.mean()
         else:
-            datum = None if prev_action is None else jnp.asarray(prev_action[index])
+            entry = None if prev_action is None else prev_action[index]
+            datum = None if entry is None else jnp.asarray(entry)
         if datum is None:
             obs[m], flags[m] = None, False
             continue

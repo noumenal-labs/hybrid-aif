@@ -22,6 +22,7 @@ import dataclasses
 from collections.abc import Mapping, Sequence
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 from jax import Array
 
@@ -36,8 +37,11 @@ from hybrid_aif.distributions import (
     Categorical,
     ConditionalCategorical,
     ConditionalDirichlet,
+    ConditionalGaussian,
+    Gaussian,
 )
-from hybrid_aif.factors import NonlinearGaussianTransition, Recognition
+from hybrid_aif.factors import LinearGaussianTransition, NonlinearGaussianTransition, Recognition
+from hybrid_aif.objectives import registry
 from hybrid_aif.planning.enumerate import enumerate_policies
 from hybrid_aif.system import _KEY_KINDS, Subsystem, System, SystemParams, _is_pattern
 
@@ -130,6 +134,41 @@ def namespaced_key(prefix: str, key: str) -> str:
     return ":".join(parts)
 
 
+def namespaced_term(prefix: str, key: str) -> str:
+    """Qualify one ``System.terms`` selector with a subsystem prefix, on its variable segment.
+
+    The row segment is library vocabulary and stays literal: ``"uncertainty:x" ->
+    "uncertainty:arm.x"``, ``"uncertainty:pose:b1" -> "uncertainty:arm.pose:b1"``,
+    ``"predicted_reward:obs:reward" -> "predicted_reward:obs:arm.reward"``,
+    ``"occupancy:transition:stoch" -> "occupancy:transition:arm.stoch"``. A row that takes no
+    target (a bare row name) is unchanged. A trailing dimension wildcard after the variable
+    segment is kept (``"uncertainty:x:*" -> "uncertainty:arm.x:*"``); a wildcard in the variable
+    segment itself raises: name the variables.
+    """
+    row, sep, rest = key.partition(":")
+    if registry.get_row(row).target is None or not sep:
+        return key
+    parts = rest.split(":")
+    at = 1 if len(parts) > 1 and parts[0] in _KEY_KINDS else 0
+    if "*" in parts[: at + 1]:
+        raise ValueError(
+            f"cannot namespace the wildcard selector terms={key!r}: a wildcard in the variable "
+            "segment would range over variables the component did not have; name the "
+            "variables, or declare the composite's terms on the returned System"
+        )
+    head = namespaced_key(prefix, ":".join(parts[: at + 1]))
+    return ":".join([row, head, *parts[at + 1 :]])
+
+
+def _namespaced_parent(prefix: str, parent: str) -> str:
+    """A recognition parent address under a component prefix: a factor, ``obs:``,
+    ``recognition:`` or ``external:`` operand, each renamed on its name."""
+    kind, sep, name = parent.partition(":")
+    if sep and kind == "external":
+        return f"external:{prefix}{SEPARATOR}{name}"
+    return namespaced_key(prefix, parent)
+
+
 def resolved_epistemic(system: System, params: SystemParams) -> tuple[str, ...]:
     """A component's ``epistemic`` selector as an explicit tuple of literal keys.
 
@@ -213,6 +252,8 @@ def _drop_control_axis(decl, name: str, keep: "int | None", weights: "Array | No
     ``ActionControl`` rewrite; only the declared ``parent_ndims`` changes); ``keep`` slices one
     level; ``weights`` averages the axis in probability space. All three end with a size-1 trailing
     control axis. A nonlinear transition is refused: its map takes the control node as an input.
+    A :class:`LinearGaussianTransition` keeps its tensors under the identification rewrite (the
+    innovations' control axis keeps its place and size and is read as a parent axis).
     """
     if isinstance(decl, NonlinearGaussianTransition):
         raise NotImplementedError(
@@ -222,6 +263,10 @@ def _drop_control_axis(decl, name: str, keep: "int | None", weights: "Array | No
             "with another control node of the same kind and size (ActionControl between two "
             "control nodes), which leaves f's inputs whole (design: nonlinear-transitions.md N5)"
         )
+    if isinstance(decl, LinearGaussianTransition):
+        if keep is None and weights is None:
+            return decl  # the axis keeps its place and size; only its reading changes
+        raise NotImplementedError(_mixture_sentence(name))
     if not isinstance(decl, ConditionalCategorical | ConditionalDirichlet):
         raise NotImplementedError(
             f"factor {name!r}: merging or terminating a control node a "
@@ -261,14 +306,60 @@ def _drop_control_axis(decl, name: str, keep: "int | None", weights: "Array | No
     )
 
 
-def _cut_axes(decl, name: str, n: int, cuts: Sequence[tuple]) -> object:
+def _mixture_sentence(name: str) -> str:
+    return (
+        f"factor {name!r}: terminating a control node a LinearGaussianTransition reads with a "
+        "distribution would average Gaussians across control levels, which is a mixture and "
+        "not a Gaussian. Pin a level instead (an int prior slices the node's axis), or "
+        "identify the node with another control node."
+    )
+
+
+def _cut_gaussian(decl: LinearGaussianTransition, name: str, cuts: Sequence[tuple], floats):
+    """Pin discrete control axes of a linear-Gaussian transition.
+
+    ``cuts`` holds ``(pos, keep, weights)`` with ``pos`` the declared-parent position; ``floats``
+    the declared positions of the factor's continuous control parents, which carry no mode axis.
+    Each pinned axis is sliced out of the innovations' ``loc`` (and ``chol`` unless shared) and of
+    a per-mode ``F`` and ``G``; a factor left with no mode axis keeps a trailing size-1 one.
+    """
+    if any(weights is not None for _, _, weights in cuts):
+        raise NotImplementedError(_mixture_sentence(name))
+    inn = decl.innovations
+    pn = inn.parent_ndims
+    axes = sorted((pos - sum(1 for c in floats if c < pos), keep) for pos, keep, _ in cuts)
+
+    def slice_modes(arr, core: int):
+        first = arr.ndim - core - pn
+        for axis, keep in reversed(axes):
+            arr = jnp.take(arr, keep, axis=first + axis)
+        if pn == len(axes):
+            arr = jnp.expand_dims(arr, arr.ndim - core)
+        return arr
+
+    loc = slice_modes(inn.loc, 1)
+    chol = inn.chol if inn.shared_chol else slice_modes(inn.chol, 2)
+    F = slice_modes(decl.F, 2) if decl.F.ndim > 2 else decl.F
+    G = decl.G if decl.G is None or decl.G.ndim <= 2 else slice_modes(decl.G, 2)
+    parent_ndims = pn - len(axes) + (1 if pn == len(axes) else 0)
+    return LinearGaussianTransition(
+        F=F,
+        innovations=ConditionalGaussian(loc=loc, chol=chol, parent_ndims=parent_ndims),
+        G=G,
+    )
+
+
+def _cut_axes(decl, name: str, n: int, cuts: Sequence[tuple], floats: Sequence[int] = ()) -> object:
     """Terminate some of a tabular transition's ``n`` control axes.
 
     ``cuts`` holds ``(pos, keep, weights)`` per axis, ``pos`` the axis's place among the
     declared parents: ``keep`` slices one level, ``weights`` averages the axis in probability
     space. The other axes keep their order; a table left reading no control node carries a
-    trailing no-op axis of size 1.
+    trailing no-op axis of size 1. ``floats`` lists the declared positions of the factor's
+    continuous control parents, which a linear-Gaussian transition's mode axes skip.
     """
+    if isinstance(decl, LinearGaussianTransition):
+        return _cut_gaussian(decl, name, cuts, floats)
     if not isinstance(decl, ConditionalCategorical | ConditionalDirichlet):
         return _drop_control_axis(decl, name, 0, None)  # raises with the family's sentence
     if n == 1 and len(cuts) == 1 and cuts[0][0] == decl.parent_ndims - 1:
@@ -336,6 +427,49 @@ def _termination(prior, nu: int, what: str) -> tuple["int | None", "Array | None
     return keep, None
 
 
+def _contract_target(target, key: str, cuts: Sequence[tuple[int, int | None, Array | None]]):
+    """A conditional per-step target with some parent axes terminated.
+
+    ``cuts`` holds ``(pos, keep, weights)`` per terminated parent, ``pos`` its place in the
+    target's ``C_deps`` order. A level slices the axis; a distribution mixes a categorical
+    target's normalized preferences in probability space (a mixture of Gaussian targets is not
+    a Gaussian, so a Gaussian target takes a level). A target left with no parent is the
+    unconditional ``Categorical`` or ``Gaussian``.
+    """
+    n = len(cuts)
+    ndims = target.parent_ndims - n
+    if isinstance(target, ConditionalGaussian):
+        if any(weights is not None for _, _, weights in cuts):
+            raise NotImplementedError(
+                f"the target on {key!r} is a Gaussian conditional on another component's control "
+                "node, and a prior spread over that node's levels makes the target a mixture of "
+                "Gaussians, which is not a Gaussian; pass an int level in partner_priors for "
+                "that node"
+            )
+        loc, chol = target.loc, target.chol
+        shared = target.shared_chol
+        for pos, keep, _ in sorted(cuts, reverse=True):
+            loc = jnp.take(loc, keep, axis=pos)
+            if not shared:
+                chol = jnp.take(chol, keep, axis=pos)
+        if ndims == 0:
+            return Gaussian(loc=loc, chol=chol)
+        return ConditionalGaussian(loc=loc, chol=chol, parent_ndims=ndims)
+    table = target.log_probs if any(w is not None for _, _, w in cuts) else target.log_table
+    for pos, keep, weights in sorted(cuts, key=lambda cut: cut[0], reverse=True):
+        axis = 1 + pos  # the child axis leads
+        if weights is None:
+            table = jnp.take(table, keep, axis=axis)
+        else:
+            #  a mixture of the slices, in probability space
+            table = jax.scipy.special.logsumexp(
+                jnp.moveaxis(table, axis, -1) + jnp.log(weights), axis=-1
+            )
+    if ndims == 0:
+        return Categorical(logits=table)
+    return ConditionalCategorical(log_table=table, parent_ndims=ndims)
+
+
 # ------------------------------------------------------------------- the builder
 
 
@@ -369,14 +503,23 @@ def merge(
       the composite's habit on the returned params). No component habit gives ``None``.
     - ``epistemic`` is resolved and unioned (:func:`resolved_epistemic`); ``dims`` moves with its
       factors, under the namespaced names (a key ``pose:b1`` becomes ``arm.pose:b1``).
+    - A modality observing an action node keeps it: the node's index at or above the component's
+      node count becomes the composite's, ``len(B_deps) + position`` among the control nodes
+      that stay (a node a same-step ``ActionControl`` made one with a driver's reads the
+      driver's action node; one a relay or ``BoundaryPrior`` removed raises).
     - Designations keep each component's preferences under namespaced keys; ``C_deps``
       namespaces its keys and parents as ``H_deps`` does, a parent following its node through a
       same-step identification or a relay.
-    - The G side does not compose: a component declaring ``System.terms``, either ``scoring`` half,
-      or a policy module in ``policy_prior`` raises. Declare it on the composite.
+    - ``System.terms`` selectors carry under the component prefix, on their variable segment
+      (:func:`namespaced_term`: ``uncertainty:x`` becomes ``uncertainty:arm.x``); the union is the
+      composite's. The rest of the G side does not compose: a component declaring either
+      ``scoring`` half, or a policy module in ``policy_prior``, raises. Declare it on the
+      composite.
     - ``recognition`` namespaces both halves, the parent addresses included (``Recognition("stoch",
       ("deter", "recognition:embed"))`` → ``Recognition("mc.stoch", ("mc.deter",
-      "recognition:mc.embed"))``).
+      "recognition:mc.embed"))``; ``obs:`` and ``external:`` operands keep their prefix and are
+      renamed on their name). ``external_inputs`` carries under the component prefix, so two
+      components' inputs of one name stay distinct.
     - A continuous control node's box (``params.control``) and an action node's kernel
       (``params.actuator``) move with their nodes, under the namespaced names; a node identified
       with a driver's node leaves its box and its action node, the driver's governing.
@@ -414,9 +557,6 @@ def merge(
             f"subsystem name(s) {bad_names} contain the namespace separator {SEPARATOR!r} "
             "(or are empty); a component name is one path segment"
         )
-    for system in subsystems.values():
-        system._refuse_sensed("merge")
-
     #  each component's params as the positional view the concatenation indexes
     params = {name: subsystems[name]._params_in(params[name], "merge") for name in subsystems}
 
@@ -439,30 +579,27 @@ def merge(
     terminal_targets: dict[str, object] = {}
     recognition_decl: list[Recognition] = []
     recognition_params: dict[str, object] = {}
+    external_inputs: list[tuple[str, int]] = []
     epistemic_keys: list[str] = []
     dims: list[tuple[str, tuple[str, ...]]] = []
     C_deps: list[tuple[str, tuple[str, ...]]] = []
     durations: dict[str, object] = {}
 
     scored = sorted(
-        name
-        for name, system in subsystems.items()
-        if system.terms or system.scoring or params[name].scoring
+        name for name, system in subsystems.items() if system.scoring or params[name].scoring
     )
     if scored:
         raise NotImplementedError(
-            f"subsystem(s) {scored} declare objective rows (System.terms / System.scoring / "
-            "SystemParams.scoring), whose composition is not built. The obstacle is the key "
-            "grammar, not the mathematics: a row is addressed by row *name* and the name "
-            "segment of a terms= key is library vocabulary that namespacing does "
-            "not touch, so two components' critics would both answer to 'g_tail' in the "
-            "composite with no way to say which. Declare the composite's rows on the returned "
-            "pair instead — its factors and modalities are namespaced, so "
-            "'occupancy:transition:mind.stoch' addresses exactly one of them (design: "
-            "amortization.md, the A12 implementation note on the terms= key grammar, flags 4 "
-            "and 5). A component's *world model* merges as it always did; it is the G side "
-            "that must be declared once, on the composite."
+            f"subsystem(s) {scored} declare scoring structure or parameters (System.scoring / "
+            "SystemParams.scoring), whose composition is not built: a row that owns a model "
+            "or parameters answers to its row name alone, so two components' critics would "
+            "both answer to 'g_tail' in the composite with no way to say which. Declare the "
+            "composite's scoring rows on the returned pair instead (design: amortization.md, "
+            "the A12 implementation note on the terms= key grammar, flags 4 and 5). A "
+            "component's plain terms= selectors (rows that carry no parameters) do merge, "
+            "namespaced on their variable segment."
         )
+    terms: list[str] = []
     for name, system in subsystems.items():
         p = params[name]
         mods, facs = (system.modality_names, system._facs)
@@ -482,7 +619,14 @@ def merge(
         fac_offset[name], mod_offset[name], node_offset[name] = f_off, m_off, k_off
         factor_names.extend(f"{name}{SEPARATOR}{f}" for f in facs)
         modality_names.extend(f"{name}{SEPARATOR}{m}" for m in mods)
-        A_deps.extend(tuple(g + f_off for g in deps) for deps in system.A_deps)
+        #  a state factor shifts by the component's offset; an action node a modality observes
+        #  (index at or above the component's node count) is held as -(node + 1) until the
+        #  bindings fix which control nodes stay
+        n_nodes = len(system.B_deps)
+        A_deps.extend(
+            tuple(g + f_off if g < n_nodes else -(k_off + g - n_nodes) - 1 for g in deps)
+            for deps in system.A_deps
+        )
         parents.extend(
             [
                 (kind, i + (f_off if kind == "state" else k_off))
@@ -527,11 +671,15 @@ def merge(
         recognition_decl.extend(
             Recognition(
                 variable=f"{name}{SEPARATOR}{entry.variable}",
-                parents=tuple(namespaced_key(name, parent) for parent in entry.parents),
+                parents=tuple(_namespaced_parent(name, parent) for parent in entry.parents),
             )
             for entry in (system.recognition or ())
         )
+        external_inputs.extend(
+            (f"{name}{SEPARATOR}{ext}", width) for ext, width in system.external_inputs
+        )
         epistemic_keys.extend(namespaced_key(name, key) for key in resolved_epistemic(system, p))
+        terms.extend(namespaced_term(name, key) for key in system.terms)
         dims.extend((f"{name}{SEPARATOR}{factor}", names) for factor, names in system.dims)
         C_deps.extend(
             (namespaced_key(name, key), tuple(namespaced_key(name, p) for p in parents))
@@ -576,7 +724,7 @@ def merge(
         return [(pos, i) for pos, (kind, i) in enumerate(parents[g]) if kind == "control"]
 
     def relay_refusal(state: str, node: str, readers: list[int], partners: list[str]):
-        """A relay into a node more than one factor reads: one sentence for either order."""
+        """A relay into a node that not exactly one factor reads: one sentence for either order."""
         source = (
             f"made one with {sorted(partners)} by a same-step ActionControl"
             if partners
@@ -585,6 +733,13 @@ def merge(
         same_step_node = (
             repr(control_name(state)) if control_name(state) in node_index else "a control node"
         )
+        if not readers:
+            return ValueError(
+                f"ActionControl({state!r} -> {node!r}) merges a state with {node!r}, which no "
+                "factor reads (only a target, a modality or durations names it); a relay "
+                f"re-reads one factor's control axis, so bind from {same_step_node} for a "
+                "same-step read, or relay into a node one factor reads"
+            )
         return ValueError(
             f"ActionControl({state!r} -> {node!r}) merges a state with {node!r}, which "
             f"{[factor_names[g] for g in sorted(readers)]} read ({source}); a relay re-reads "
@@ -658,8 +813,13 @@ def merge(
     def cut(k: int, keep, weights) -> None:
         """Slice or average node ``k`` out of every table that reads it."""
         for g, pos in readers_of(k):
+            floats = [p for p, i in control_parents(g) if nodes[i].kind == FLOAT]
             transition[g] = _cut_axes(
-                transition[g], factor_names[g], len(control_parents(g)), [(pos, keep, weights)]
+                transition[g],
+                factor_names[g],
+                len(control_parents(g)),
+                [(pos, keep, weights)],
+                floats,
             )
             del parents[g][pos]
         nodes[k].live = False
@@ -833,6 +993,36 @@ def merge(
             )
 
     same_step = {node: resolve(node) for node in same_step}
+
+    #  an observed action node, held as -(node + 1), takes its column among the live nodes: the
+    #  composite's action node k sits at len(B_deps) + k
+    live_nodes = [k for k, node in enumerate(nodes) if node.live]
+    n_states = len(factor_names)
+    n_columns = n_states + len(live_nodes)
+    for m, deps in enumerate(A_deps):
+        if all(g >= 0 for g in deps):
+            continue
+        placed = []
+        for g in deps:
+            if g >= 0:
+                placed.append(g)
+                continue
+            k = node_index.get(resolve(nodes[-g - 1].name))
+            if k is None or not nodes[k].live:
+                raise NotImplementedError(
+                    f"merge: modality {modality_names[m]!r} observes the action node "
+                    f"{nodes[-g - 1].action!r}, whose control node a binding removed (relayed "
+                    "into a state or terminated with a BoundaryPrior), so no action is realised "
+                    "there: observe the driver's node instead, or drop the binding"
+                )
+            placed.append(n_columns + live_nodes.index(k))
+        if len(set(placed)) != len(placed):
+            raise ValueError(
+                f"merge: modality {modality_names[m]!r} observes one action node twice after "
+                "its control nodes were identified; its parents must stay distinct"
+            )
+        A_deps[m] = tuple(placed)
+
     for what, targets in (("state_targets", state_targets), ("terminal_targets", terminal_targets)):
         for key in targets:
             if key in same_step and nodes[node_index[same_step[key]]].live:
@@ -948,11 +1138,13 @@ def merge(
                     relayed=tuple(relays.items()),
                     terminated=tuple(ended),
                     identified=pairs,
-                    free_modalities=tuple(m for m in mods if all(g in facs for g in A_deps[m])),
+                    free_modalities=tuple(
+                        m for m in mods if all(g in facs for g in _state_deps(A_deps[m], n_states))
+                    ),
                     bound_modalities=tuple(
-                        (m, tuple(g for g in A_deps[m] if g not in facs))
+                        (m, tuple(g for g in _state_deps(A_deps[m], n_states) if g not in facs))
                         for m in mods
-                        if any(g not in facs for g in A_deps[m])
+                        if any(g not in facs for g in _state_deps(A_deps[m], n_states))
                     ),
                     target_emissions=tuple(
                         (f, H_deps[f])
@@ -1003,7 +1195,6 @@ def merge(
             "declare the composite's durations on a control node that stays "
             "(design: step-durations.md T1)"
         )
-    n_states = len(factor_names)
     column = {k: n_states + j for j, k in enumerate(live)}
     B_deps = tuple(tuple(i if kind == "state" else column[i] for kind, i in ps) for ps in parents)
     pad = ((),) * len(live)
@@ -1020,6 +1211,7 @@ def merge(
         planning_belief=_agree("planning_belief", subsystems),
         feedback=_agree("feedback", subsystems),
         epistemic=epistemic,
+        terms=tuple(dict.fromkeys(terms)),
         mixture_k=next(iter(mixture_ks), None),
         mixture_schedule=_agree("mixture_schedule", subsystems),
         D_deps=None if all(not d for d in D_deps) else (*D_deps, *pad),
@@ -1029,6 +1221,7 @@ def merge(
         factor_names=(*factor_names, *(nodes[k].name for k in live)),
         dims=tuple(dims),
         recognition=tuple(recognition_decl) or None,
+        external_inputs=tuple(external_inputs),
         subsystems=tuple(metadata),
     )
     boxes = {nodes[k].name: nodes[k].box for k in live if nodes[k].box is not None}
@@ -1056,6 +1249,12 @@ def merge(
     )
     composite._validate(composite_params)
     return composite, composite._params_out(composite_params)
+
+
+def _state_deps(deps: tuple[int, ...], n_states: int) -> tuple[int, ...]:
+    """The state-factor parents in ``deps``: an index at or above ``n_states`` is a control or
+    action node, which no subsystem's factor set contains."""
+    return tuple(g for g in deps if g < n_states)
 
 
 def _node_order(node: str, factor_names: Sequence[str]) -> tuple[int, str]:
@@ -1190,7 +1389,7 @@ def subsystem_factors(composite: System, name: str) -> tuple[int, ...]:
     for f in meta.factors:
         stack.extend(composite._B[f] + D_deps[f] + H_deps[f])
     for m in meta.modalities:
-        stack.extend(composite.A_deps[m])
+        stack.extend(_state_deps(composite.A_deps[m], table.num_states))
     mine = {*(table.state_names[f] for f in meta.factors)}
     mine |= {composite.modality_names[m] for m in meta.modalities}
     for key, parents in composite._effective_C_deps().items():
@@ -1225,7 +1424,13 @@ def subsystem(
       marginalised under a prior over the node: uniform by default, or given in
       ``partner_priors`` keyed by the node's name, read as in :class:`BoundaryPrior`; the node
       itself is absent, as is a node merged away;
-    - nothing for an out-bound observation link.
+    - for every carried per-step target conditional on such a node (``C_deps``), that parent axis
+      contracted under the node's entry in ``partner_priors`` (required): a level slices it,
+      a distribution mixes a categorical target's preferences in probability space, as a soft
+      step does, and a Gaussian target takes a level;
+    - nothing for an out-bound observation link;
+    - the recognition entries and external inputs of the component's own, under the composite's
+      names, with their modules shared by reference.
 
     Parameters are the composite's arrays, shared by reference; beliefs are private (they live in
     the caller's carry). Other components' designations and ``epistemic`` keys naming absent
@@ -1234,7 +1439,6 @@ def subsystem(
 
     Design: docs/design/nesting-systems.md (architecture sketch; partner modeling).
     """
-    composite._refuse_sensed("subsystem")
     params = composite._params_in(params, "subsystem")
     if composite._is_amortized(params):
         raise NotImplementedError(
@@ -1254,11 +1458,28 @@ def subsystem(
     table = composite._table
     c_mods, c_facs, c_nodes = composite.modality_names, table.state_names, table.control_names
     chosen = set(meta.controls)
-    ours = [k for k, node in enumerate(c_nodes) if node in chosen]
+    #  a node a modality of the view observes joins the view as one of its own nodes, whoever
+    #  chose it in the composite: the observation reads the node's realised action, so the view
+    #  carries the node (a partner's, clamped per round by the caller's policy set)
+    n_cols = len(composite.B_deps)
+    sensed = {g - n_cols for m in mods for g in composite.A_deps[m] if g >= n_cols}
+    ours = [k for k, node in enumerate(c_nodes) if node in chosen or k in sensed]
     #  another mind's node a factor of the view reads, by node name
     partner_nodes = {
         c_nodes[k]: k for f in facs for k, _ in table.control_parents[f] if k not in ours
     }
+
+    #  a partner's node a carried target is conditional on is terminated like a factor's axis
+    view_nodes = tuple(c_nodes[k] for k in ours)
+    targeted = {c_facs[f] for f in own} | set(view_nodes)
+    target_nodes = {
+        p: c_nodes.index(p)
+        for key, c_parents in composite.C_deps
+        if key in targeted or key in {c_mods[m] for m in mods}
+        for p in c_parents
+        if p in c_nodes and p not in view_nodes
+    }
+    partner_nodes = {**partner_nodes, **target_nodes}
 
     priors = dict(partner_priors or {})
     unknown = sorted(set(priors) - set(partner_nodes))
@@ -1313,7 +1534,10 @@ def subsystem(
         for pos, k in cuts:
             prior, label = partner_prior(k)
             terminations.append((pos, *_termination(prior, levels[k], label)))
-        transition.append(_cut_axes(params.transition[f], c_facs[f], len(reads), terminations))
+        floats = [pos for k, pos in reads if space.kinds[k] == FLOAT]
+        transition.append(
+            _cut_axes(params.transition[f], c_facs[f], len(reads), terminations, floats)
+        )
 
     n_view = len(facs)
     column = {k: n_view + j for j, k in enumerate(ours)}
@@ -1322,39 +1546,66 @@ def subsystem(
     def remap(deps: tuple[int, ...]) -> tuple[int, ...]:
         return tuple(index[g] for g in deps)
 
+    def remap_observed(deps: tuple[int, ...]) -> tuple[int, ...]:
+        """A modality's parents: a state factor by its place in the view, an observed action
+        node at ``len(view B_deps) + its place among the view's nodes``."""
+        return tuple(
+            index[g] if g < n_cols else n_view + len(ours) + ours.index(g - n_cols) for g in deps
+        )
+
     D_all, H_all = composite._effective_D_deps(), composite._effective_H_deps()
     B_deps = tuple(
         tuple(index[i] if kind == "state" else column[i] for kind, i in ps) for ps in view_parents
     )
     D_deps = tuple(remap(D_all[f]) for f in facs)
     H_deps = tuple(remap(H_all[f]) if f in own else () for f in facs)
-    A_deps = tuple(remap(composite.A_deps[m]) for m in mods)
+    A_deps = tuple(remap_observed(composite.A_deps[m]) for m in mods)
 
     view_facs = tuple(c_facs[f] for f in facs)
     view_mods = tuple(c_mods[m] for m in mods)
-    view_nodes = tuple(c_nodes[k] for k in ours)
     view_actions = tuple(composite.action_names[k] for k in ours)
     #  a target on a node goes with its view while the view still chooses it
-    targeted = {c_facs[f] for f in own} | set(view_nodes)
+    contracted: dict[str, object] = {}
     C_deps = []
     for key, c_parents in composite.C_deps:
         if key not in targeted and key not in view_mods:
             continue
         absent = [p for p in c_parents if p in c_nodes and p not in view_nodes]
-        if absent:
-            raise NotImplementedError(
-                f"the view of {name!r} carries the target on {key!r}, which is conditional on "
-                f"{absent}, another component's control node; a per-mind view resolves a target "
-                "under its own choices and beliefs, and a partner's choice is neither. Condition "
-                "the target on this mind's node or a state factor, or drop it"
-            )
-        C_deps.append((key, c_parents))
+        if not absent:
+            C_deps.append((key, c_parents))
+            continue
+        cuts = []
+        for pos, p in enumerate(c_parents):
+            if p not in absent:
+                continue
+            k = c_nodes.index(p)
+            if p not in priors:
+                raise ValueError(
+                    f"the view of {name!r} carries the target on {key!r}, which is conditional on "
+                    f"{p!r}, another component's control node, and partner_priors has no entry "
+                    f"for it; pass partner_priors={{{p!r}: <level or probabilities>}} to "
+                    "terminate that axis of the target"
+                )
+            cuts.append((pos, *_termination(priors[p], levels[k], f"partner_priors[{p!r}]")))
+        scope = params.obs_targets if key in view_mods else params.state_targets
+        contracted[key] = _contract_target(scope[key], key, cuts)
+        kept = tuple(p for p in c_parents if p not in absent)
+        if kept:
+            C_deps.append((key, kept))
+    prefix = f"{name}{SEPARATOR}"
+    recognition = tuple(e for e in composite.recognition or () if e.variable.startswith(prefix))
+    external = tuple((n, w) for n, w in composite.external_inputs if n.startswith(prefix))
     view_params = SystemParams(
+        recognition={e.variable: params.recognition[e.variable] for e in recognition},
         transition=tuple(transition),
         initial_state_prior=tuple(params.initial_state_prior[f] for f in facs),
         likelihood=tuple(params.likelihood[m] for m in mods),
-        obs_targets={k: v for k, v in params.obs_targets.items() if k in set(view_mods)},
-        state_targets={k: v for k, v in params.state_targets.items() if k in targeted},
+        obs_targets={
+            k: contracted.get(k, v) for k, v in params.obs_targets.items() if k in set(view_mods)
+        },
+        state_targets={
+            k: contracted.get(k, v) for k, v in params.state_targets.items() if k in targeted
+        },
         terminal_targets={k: v for k, v in params.terminal_targets.items() if k in targeted},
         policy_prior=_view_policy_prior(composite, params, ours, name),
         control={k: v for k, v in params.control.items() if k in set(view_nodes)},
@@ -1380,13 +1631,19 @@ def subsystem(
         D_deps=None if all(not d for d in D_deps) else (*D_deps, *pad),
         H_deps=None if all(not h for h in H_deps) else (*H_deps, *pad),
         C_deps=tuple(C_deps),
+        recognition=recognition or None,
+        external_inputs=external,
         modality_names=view_mods,
         factor_names=(*view_facs, *view_nodes),
         dims=tuple((factor, names) for factor, names in composite.dims if factor in view_facs),
         subsystems=_view_metadata(composite, name, index, mod_index, set(view_nodes), A_deps),
     )
     mine = {c_facs[f] for f in own} | set(view_mods)
-    view = dataclasses.replace(view, epistemic=_view_epistemic(composite, view, view_params, mine))
+    view = dataclasses.replace(
+        view,
+        epistemic=_view_epistemic(composite, view, view_params, mine),
+        terms=_view_terms(composite, mine | set(view_nodes)),
+    )
     view._validate(view_params)
     return view, view._params_out(view_params)
 
@@ -1449,11 +1706,15 @@ def _view_metadata(
                     factors=facs,
                     modalities=mods,
                     controls=tuple(n for n in sub.controls if n in chosen),
-                    free_modalities=tuple(m for m in mods if all(g in facs for g in A_deps[m])),
-                    bound_modalities=tuple(
-                        (m, tuple(g for g in A_deps[m] if g not in facs))
+                    free_modalities=tuple(
+                        m
                         for m in mods
-                        if any(g not in facs for g in A_deps[m])
+                        if all(g in facs for g in _state_deps(A_deps[m], len(index)))
+                    ),
+                    bound_modalities=tuple(
+                        (m, tuple(g for g in _state_deps(A_deps[m], len(index)) if g not in facs))
+                        for m in mods
+                        if any(g not in facs for g in _state_deps(A_deps[m], len(index)))
                     ),
                     target_emissions=tuple(
                         (index[f], tuple(index[g] for g in parents))
@@ -1479,6 +1740,19 @@ def _view_epistemic(
         return composite.epistemic
     variables = view._epistemic_variables(view_params)
     return tuple(key for key in composite.epistemic if key in variables and _key_name(key) in ours)
+
+
+def _view_terms(composite: System, held: set[str]) -> tuple[str, ...]:
+    """The composite's ``terms`` selectors whose variable segment the view holds.
+
+    A selector on a row that takes no target carries over unchanged.
+    """
+    out = []
+    for key in composite.terms:
+        row, sep, rest = key.partition(":")
+        if not sep or registry.get_row(row).target is None or _key_name(rest) in held:
+            out.append(key)
+    return tuple(out)
 
 
 def _key_name(key: str) -> str:

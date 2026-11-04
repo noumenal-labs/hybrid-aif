@@ -288,6 +288,22 @@ an outer loop how much time passed.
   outcome for a designated Gaussian channel would extend `present=` (built 2026-10-21 as a
   per-level entry of `present=`; planning-with-observations.md D4).
 
+**T9: a mind held for an option (amendment 2026-11-03, Alex + Fable;
+`recognition-beside-analytic.md` R8).** T1 to T8 are unchanged: the library still has no clock and
+every factor still steps once per round. What is added is a driver wrapper,
+`composition.driver.hold`, so a slow tier that decides once per option runs under `run` beside a
+fast tier without a hand-written outer loop: on a decision round the wrapped mind infers and acts
+and the wrapper stores the action with the duration `System.elapsed` reports; on every other round
+it returns the stored action and counts down, inferring nothing, so the slow System's factors step
+once per option and the fast tier reads the level in force as a kernel or target parent. The count
+is in rounds of the fast tier: `ticks_per_unit` converts the preference's unit (T1) and a duration
+that is not a whole number of rounds is refused. A held System with a non-identity actuator kernel
+on any of its action nodes is refused, since the driver realises every action every round, against
+the once-per-choice draw, and T8 reads the duration off the realised level; holding on the realised
+level is a follow-on. In the composite form the slow System owns no world process, or the composite
+environment would apply its whole-step kernel (T3) once per fast round. The option node carries no
+target and no score in the fast tier; a cost per option is the slow tier's own.
+
 ## Build notes (2026-10-20)
 
 Built in two parts by subagents on this document, reviewed adversarially, the review's findings

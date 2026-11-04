@@ -64,6 +64,7 @@ from hybrid_aif.objectives.hybrid import (
     BeliefPair,
     _lg_inputs,
     _nl_inputs,
+    neural_read,
 )
 from hybrid_aif.objectives.presence import Presence, presence_from_levels
 
@@ -76,7 +77,9 @@ class _Target(NamedTuple):
     whole factor) and ``Λ``, the availability column of the channel that carries it, whether it
     scores the last step only, the leaf's sign (``−1`` for a utility, a negated cost), and
     ``parents``, the control node columns a conditional target reads, under which ``Λ`` is
-    per level, ``(*levels, d, d)``, and the pass takes each step's level's."""
+    per level, ``(*levels, d, d)``, and the pass takes each step's level's. A target on a neural
+    modality holds its declaration (``neural``) and its row ``slot`` in :attr:`Record.heads`,
+    where ``T`` is the head linearised at each step's belief; ``T`` is ``None`` for it."""
 
     term: str
     key: str
@@ -87,6 +90,8 @@ class _Target(NamedTuple):
     terminal: bool
     sign: float = 1.0
     parents: tuple[int, ...] = ()
+    neural: MLPConditional | None = None
+    slot: int | None = None
 
 
 class _Cost(NamedTuple):
@@ -125,8 +130,9 @@ class Record(NamedTuple):
     ``F`` and ``G`` the step's linearisation on the joint state and input, ``predictive``,
     ``prior`` and ``posterior`` the covered factors' covariances after the step (predict only,
     before and after its observations), ``levels`` the step's level of each discrete control
-    node (``0`` for a continuous one), which a conditional target's precision is taken at, and
-    ``t`` the next row."""
+    node (``0`` for a continuous one), which a conditional target's precision is taken at, ``t``
+    the next row, and ``heads`` the head ``(H, d_obs, d)`` of each target on a neural modality,
+    linearised at the epistemic belief of each step."""
 
     t: Array
     F: Array
@@ -135,6 +141,7 @@ class Record(NamedTuple):
     prior: Array
     posterior: Array
     levels: Array
+    heads: tuple[Array, ...] = ()
 
 
 def _precision(target) -> Array:
@@ -167,7 +174,8 @@ def coverage(
     """The targets ``feedback="linear_quadratic"`` scores in closed loop, with its refusals.
 
     Covered: a Gaussian state or terminal target on a Gaussian-carried factor, and a Gaussian
-    observation target on a linear-Gaussian channel observing one Gaussian-carried factor. A
+    observation target on a linear-Gaussian or neural channel observing one Gaussian-carried
+    factor (a neural channel's head is its linearisation at each step's belief). A
     target on a mixture-carried factor (or a channel observing one), a mixture target, and a
     covered factor with a neural transition raise :class:`ValueError`. Categorical targets are
     not covered and keep their scoring. A per-step target conditional on control nodes
@@ -232,7 +240,7 @@ def coverage(
             covered.add(f)
     obs_term = "utility" if decomposition == "utility_infogain" else "risk"
     for m, decl in enumerate(A):
-        if mods[m] not in obs_targets or not isinstance(decl, LGObservation):
+        if mods[m] not in obs_targets or not isinstance(decl, LGObservation | MLPConditional):
             continue
         what = f"obs_targets[{mods[m]!r}]"
         f = A_deps[m][0]
@@ -247,17 +255,21 @@ def coverage(
                 "Drop the target, or plan with feedback=None"
             )
         check_gaussian(obs_targets[mods[m]], what, mods[m])
+        neural = isinstance(decl, MLPConditional)
+        slot = sum(t.slot is not None for t in targets) if neural else None
         targets.append(
             _Target(
                 term=obs_term,
                 key=mods[m],
                 factor=f,
-                T=lg_point(decl).H,
+                T=None if neural else lg_point(decl).H,
                 precision=_precision(obs_targets[mods[m]]),
                 column=m,
                 terminal=False,
                 sign=-1.0 if obs_term == "utility" else 1.0,
                 parents=parents_of(mods[m]),
+                neural=decl if neural else None,
+                slot=slot,
             )
         )
         covered.add(f)
@@ -421,6 +433,11 @@ def empty_record(cov: Coverage, horizon: int, num_nodes: int, dtype) -> Record:
     """A record of ``horizon`` zero rows, its next row the first."""
     d, du = cov.dim, cov.du
     zeros = jnp.zeros((horizon, d, d), dtype)
+    heads = tuple(
+        jnp.zeros((horizon, t.neural.child_dim, t.neural.parent_dims[0]), dtype)
+        for t in cov.targets
+        if t.neural is not None
+    )
     return Record(
         t=jnp.asarray(0, jnp.int32),
         F=zeros,
@@ -429,27 +446,43 @@ def empty_record(cov: Coverage, horizon: int, num_nodes: int, dtype) -> Record:
         prior=zeros,
         posterior=zeros,
         levels=jnp.zeros((horizon, num_nodes), jnp.int32),
+        heads=heads,
     )
 
 
 # ---------------------------------------------------------------------- the pass
 
 
-def _embed(cov: Coverage, target: _Target, levels: Array) -> tuple[Array, tuple[int, int]]:
+def _embed(
+    cov: Coverage, target: _Target, levels: Array, heads: tuple[Array, ...] = ()
+) -> tuple[Array, tuple[int, int]]:
     """``Tᵀ Λ_τ T`` of a target on its factor's block at each step (``(H, d, d)``), ``Λ_τ`` the
-    level's precision under ``levels`` (``(H, K)``) for a conditional target, and the block."""
+    level's precision under ``levels`` (``(H, K)``) for a conditional target, and the block. A
+    neural target's ``T`` is its row of ``heads``, one per step."""
     span = cov.spans[cov.factors.index(target.factor)]
     T, precision = target.T, target.precision
+    if target.slot is not None:
+        T = heads[target.slot]
     if target.parents:
         precision = precision[tuple(levels[:, k] for k in target.parents)]
     else:
         precision = jnp.broadcast_to(precision, (levels.shape[0], *precision.shape))
-    weight = precision if T is None else jnp.einsum("ji,tjk,kl->til", T, precision, T)
+    if T is None:
+        weight = precision
+    elif T.ndim == 3:
+        weight = jnp.einsum("tji,tjk,tkl->til", T, precision, T)
+    else:
+        weight = jnp.einsum("ji,tjk,kl->til", T, precision, T)
     return weight, span
 
 
 def _weights(
-    cov: Coverage, horizon: int, present: Array | None, levels: Array, dtype
+    cov: Coverage,
+    horizon: int,
+    present: Array | None,
+    levels: Array,
+    dtype,
+    heads: tuple[Array, ...] = (),
 ) -> tuple[Array, Array]:
     """``W_τ`` (``(H, d, d)``, the state-cost weights at the state after step ``τ``) and
     ``R_τ`` (``(H, du, du)``) summed over the targets and control costs that score step ``τ``;
@@ -459,7 +492,7 @@ def _weights(
     steps = jnp.arange(horizon)
     W = jnp.zeros((horizon, d, d), dtype)
     for target in cov.targets:
-        weight, (lo, hi) = _embed(cov, target, levels)
+        weight, (lo, hi) = _embed(cov, target, levels, heads)
         at = jnp.ones((horizon,), dtype)
         if target.terminal:
             at = (steps == horizon - 1).astype(dtype)
@@ -508,7 +541,7 @@ def closed_loop_terms(record: Record, cov: Coverage, present: Presence | None) -
     differentiating the pseudo-inverse."""
     horizon = record.F.shape[0]
     mask = None if present is None else presence_from_levels(present, record.levels)
-    W, R = _weights(cov, horizon, mask, record.levels, record.F.dtype)
+    W, R = _weights(cov, horizon, mask, record.levels, record.F.dtype, record.heads)
     K = jax.lax.stop_gradient(riccati_gains(record.F, record.G, W, R))
     d = cov.dim
 
@@ -535,7 +568,7 @@ def closed_loop_terms(record: Record, cov: Coverage, present: Presence | None) -
         leaves[key] = leaves[key] + iv if key in leaves else iv
 
     for target in cov.targets:
-        weight, (lo, hi) = _embed(cov, target, record.levels)
+        weight, (lo, hi) = _embed(cov, target, record.levels, record.heads)
         per_step = 0.5 * jnp.einsum("tij,tji->t", weight, spread[:, lo:hi, lo:hi])
         if target.terminal:
             per_step = jnp.where(steps == horizon - 1, per_step, 0.0)
@@ -613,6 +646,14 @@ def closed_loop(
         nxt = transition_fn(inner, action)
         pred, prior, post = _covariances(beliefs_of(nxt), cov)
         t = rec.t
+        heads = rec.heads
+        if heads:
+            after = beliefs_of(nxt)
+            neural = [target for target in cov.targets if target.slot is not None]
+            heads = tuple(
+                row.at[t].set(neural_read(target.neural, after[target.factor].epistemic)[0])
+                for row, target in zip(heads, neural, strict=True)
+            )
         rec = Record(
             t=t + 1,
             F=rec.F.at[t].set(F),
@@ -621,6 +662,7 @@ def closed_loop(
             prior=rec.prior.at[t].set(prior),
             posterior=rec.posterior.at[t].set(post),
             levels=rec.levels.at[t].set(step_levels(action)),
+            heads=heads,
         )
         return nxt, rec
 

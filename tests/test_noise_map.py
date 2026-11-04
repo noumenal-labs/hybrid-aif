@@ -162,22 +162,6 @@ def test_the_map_is_refused_where_it_is_not_built():
         bad = GridNoiseMap(m.values, m.low, m.high, axes=(0, 5))
         system, params = _point_mass(bad)
         system.planner_context(params, system.initial_priors(params))
-    # a mixture-carried factor
-    system, params = _point_mass(m)
-    mixture = dataclasses.replace(
-        params,
-        initial_state_prior={
-            "x": MixtureGaussian(
-                log_weights=jnp.log(jnp.array([0.5, 0.5])),
-                means=jnp.array([[-1.0, 0.0], [-1.0, 0.2]]),
-                chols=jnp.broadcast_to(0.1 * jnp.eye(2), (2, 2, 2)),
-            )
-        },
-    )
-    with pytest.raises(NotImplementedError, match="mixture-carried"):
-        dataclasses.replace(system, mixture_k=2).planner_context(
-            mixture, dataclasses.replace(system, mixture_k=2).initial_priors(mixture)
-        )
     with pytest.raises(TypeError, match="R_chol_at"):
         _ = _emission(m).R_chol
 

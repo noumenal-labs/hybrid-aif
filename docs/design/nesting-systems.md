@@ -420,6 +420,18 @@ latent structure, and **agenthood itself is a structure-learning
 hypothesis** (BMR / birth-merge, roadmap), not an ontology the
 library pre-allocates.
 
+*Amendment 2026-11-03: a carried target contracts its partner axes too.* A
+per-step target (`C_deps`) conditional on a partner's control node is
+terminated by the same pinned prior that ends a transition axis: an int
+level slices the target's parent axis, and a distribution averages a
+categorical target's preferences in probability space (the weighted sum of
+the per-level preference probabilities, then the log), the rule a soft control
+parent takes in the composite's own step targets and in a transition axis. A
+Gaussian target takes a level only, since a mixture of Gaussian targets is not
+a Gaussian. The other parents keep their order,
+a target left with none is unconditional, and the node's entry in
+`partner_priors` is required (no uniform default for a target).
+
 **The one bright line: latents modeled as planners.** Dedicated
 machinery is justified only where the modeled dynamics of a latent
 is itself policy selection, and only for efficiency:

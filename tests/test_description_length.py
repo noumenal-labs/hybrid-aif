@@ -1220,3 +1220,21 @@ def test_a_lagged_modality_is_counted_from_an_episodes_second_tick():
     assert length.per_address["likelihood:obs_x"].n == float(ticks)
     assert length.per_address["likelihood:prev_x"].n == float(ticks - 1)
     assert length.per_address["likelihood:prev_type"].n == float(ticks - 1)
+
+
+def test_data_exact_is_the_approximate_status_of_the_replays_free_energy():
+    """``data_exact`` is ``None`` without a replay, ``True`` where every declaration entering the
+    free energy is exact, and ``False`` where a neural likelihood does (design:
+    recognition-beside-analytic.md L7)."""
+    from tests.test_neural_likelihood_inference import Y3, affine, gaussian_system, lg_of
+
+    decl = affine((2,), 3)
+    observations = {"o": jnp.tile(Y3, (4, 1))}
+    verdicts = {}
+    for name, likelihood in (("neural", decl), ("linear_gaussian", lg_of(decl, 2))):
+        system, params = gaussian_system(likelihood)
+        trace = replay(system, params, observations, {})
+        verdicts[name] = description_length(system, replay=trace, params=params).data_exact
+    assert verdicts == {"neural": False, "linear_gaussian": True}
+    system, params = gaussian_system(decl)
+    assert description_length(system, 4, params=params).data_exact is None

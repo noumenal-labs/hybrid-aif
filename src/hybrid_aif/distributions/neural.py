@@ -118,6 +118,11 @@ class MLPConditional(eqx.Module):
     Construct with :meth:`from_shapes`; the field constructor stays the dataclass default so
     ``dataclasses.replace`` and ``eqx.tree_at`` work. Freeze with
     ``dataclasses.replace(decl, frozen=True)``.
+
+    ``propagation`` (``"first_order"`` or ``"unscented"``) is how a Gaussian belief on the one
+    continuous parent is read through the network when the conditional is a likelihood on the
+    analytic path: a tangent at the mean, or the statistical linearisation over the sigma points
+    (:func:`~hybrid_aif.inference.linearise.linearise`).
     """
 
     layers: tuple[eqx.nn.Linear, ...]  # the trainable leaves live here
@@ -130,6 +135,7 @@ class MLPConditional(eqx.Module):
     head: str = eqx.field(static=True, default="softplus")  # or "bounded" — see module docstring
     minstd: float = eqx.field(static=True, default=0.1)  # bounded head only
     maxstd: float = eqx.field(static=True, default=1.0)  # bounded head only
+    propagation: str = eqx.field(static=True, default="first_order")  # see the class docstring
 
     def __check_init__(self) -> None:
         if not self.parent_dims or any(d <= 0 for d in self.parent_dims):
@@ -178,6 +184,12 @@ class MLPConditional(eqx.Module):
                 f"a bounded head needs 0 < minstd <= maxstd, got ({self.minstd}, {self.maxstd}) "
                 "— equality is the fixed-sigma case, not an error"
             )
+        if self.propagation not in ("first_order", "unscented"):
+            raise ValueError(
+                f"unknown propagation {self.propagation!r}; the rules are "
+                "['first_order', 'unscented'] (how a Gaussian belief on the continuous parent "
+                "is read through the network)"
+            )
         if self.norms and len(self.norms) != len(self.layers) - 1:
             raise ValueError(
                 f"got {len(self.norms)} norm(s) for {len(self.layers) - 1} hidden layer(s) "
@@ -205,6 +217,7 @@ class MLPConditional(eqx.Module):
         minstd: float = 0.1,
         maxstd: float = 1.0,
         init: str = "default",
+        propagation: str = "first_order",
     ) -> "MLPConditional":
         """A randomly-initialized net: ``depth`` hidden layers of ``width`` units.
 
@@ -217,6 +230,9 @@ class MLPConditional(eqx.Module):
         - ``init="trunc_normal_avg"``: :func:`trunc_normal_avg` on the hidden layers,
           :func:`uniform_avg` on the fused head layer (each half at its own ``(in, child_dim)``
           fan), every bias zero. ``init="default"`` is ``eqx.nn.Linear``'s initializer throughout.
+
+        ``propagation`` sets the static field of that name: ``"first_order"`` (default) or
+        ``"unscented"``.
         """
         parent_dims = tuple(int(d) for d in parent_dims)
         child_dim = int(child_dim)
@@ -277,6 +293,7 @@ class MLPConditional(eqx.Module):
             head=head,
             minstd=float(minstd),
             maxstd=float(maxstd),
+            propagation=propagation,
         )
 
     # -------------------------------------------------------------------- structure

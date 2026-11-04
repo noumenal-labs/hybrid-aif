@@ -31,7 +31,13 @@ import jax.numpy as jnp
 from jax import Array
 
 from hybrid_aif.controls import ControlLayout
-from hybrid_aif.distributions import MLPCategorical
+from hybrid_aif.distributions import (
+    Gaussian,
+    MixtureGaussian,
+    MLPCategorical,
+    MLPConditional,
+    MLPPredictor,
+)
 from hybrid_aif.distributions.neural import LearnedVector, PredictorHead, straight_through_onehot
 from hybrid_aif.factors import DerivedInitial, Deterministic, Recognition
 from hybrid_aif.inference.sample import collapse
@@ -211,7 +217,8 @@ def validate_structure(
                 "MLPCategorical code (design: amortization.md A11). A tabular or "
                 "linear-Gaussian factor belongs to a System without recognition declarations; "
                 "amortized recognition over a *tabular* variable has no registry row (its "
-                "exact row is what infer_states already does)."
+                "exact row is what infer_states already does). A declaration holding both a "
+                "carry or code and such a factor is refused (recognition-beside-analytic.md R1)."
             )
     widths = tuple(_decl_width(f, B[f], D[f], facs) for f in range(n_factors))
 
@@ -347,17 +354,15 @@ def _external_widths(external_inputs: tuple[tuple[str, int], ...]) -> dict[str, 
     return {name: int(width) for name, width in external_inputs}
 
 
-def _resolve_recognition(
+def check_recognition_entries(
     recognition: tuple[Recognition, ...] | None,
     recognition_params: Mapping[str, object],
-    families: tuple[str, ...],
-    widths: tuple[int, ...],
-    A: tuple,
-    mods: tuple[str, ...],
-    facs: tuple[str, ...],
-    externals: Mapping[str, int] = {},  # noqa: B006 (read-only, never mutated)
-) -> tuple[RecognitionPlan, ...]:
-    """The recognition declaration and its parameter slot, resolved to a q-side plan."""
+) -> tuple[Recognition, ...]:
+    """The checks on a recognition declaration that do not depend on the path it is read on.
+
+    One entry per variable, the structural declaration and the parameter slot naming the same
+    variables, and no module object held by two entries. Returns the declared entries.
+    """
     declared = tuple(recognition or ())
     names = [r.variable for r in declared]
     duplicated = sorted({n for n in names if names.count(n) > 1})
@@ -378,18 +383,9 @@ def _resolve_recognition(
             "parameters)."
         )
 
-    factor_of = {name: f for f, name in enumerate(facs)}
     shared: dict[int, str] = {}
     for entry in declared:
         module = recognition_params[entry.variable]
-        f = factor_of.get(entry.variable)
-        if f is not None and families[f] == CARRY:
-            raise ValueError(
-                f"recognition: {entry.variable!r} is a Deterministic carry factor, whose value "
-                "is computed forward and carried, never inferred (rule='carry'). An amortized "
-                "posterior over it has no referent — drop the recognition entry (design: "
-                "amortization.md A10 disposition 2)."
-            )
         owner = shared.setdefault(id(module), entry.variable)
         if owner != entry.variable:
             raise ValueError(
@@ -402,6 +398,441 @@ def _resolve_recognition(
                 "feature of the generic q-graph layer this slot is the restricted syntax of, "
                 "not something to smuggle in by aliasing (design: amortization.md A11, "
                 "refinement (ii))."
+            )
+
+    return declared
+
+
+def check_analytic_parents(
+    recognition: tuple[Recognition, ...] | None,
+    modality_names: tuple[str, ...],
+    external_inputs: tuple[tuple[str, int], ...] = (),
+    factor_names: tuple[str, ...] = (),
+) -> None:
+    """Refuse a recognition entry whose conditioning set the analytic path cannot read.
+
+    Parents are ``obs:<modality>``, ``external:<name>`` or ``recognition:<name>``; an empty set or a
+    bare factor name is refused (recognition-beside-analytic.md R2).
+    """
+    externals = _external_widths(external_inputs)
+    declared = {r.variable for r in recognition or ()}
+    for entry in recognition or ():
+        if not entry.parents:
+            raise ValueError(
+                f"recognition:{entry.variable}: an empty parent set is refused on the analytic "
+                "path; a measurement conditions on observations, external inputs or earlier "
+                "recognition variables (recognition-beside-analytic.md R2)"
+            )
+        for parent in entry.parents:
+            parts = parent.split(":")
+            kind = parts[0] if len(parts) == 2 else None
+            name = parts[1] if kind is not None else None
+            ok = (
+                (kind == OBS and name in modality_names)
+                or (kind == EXTERNAL and name in externals)
+                or (kind == RECOGNITION and name in declared and name != entry.variable)
+            )
+            if ok and kind == RECOGNITION and name in factor_names:
+                raise ValueError(
+                    f"recognition:{entry.variable}: parent {parent!r} is the output of the entry "
+                    f"for the factor {name!r}; an amortized variable is not a parent of another "
+                    "entry's module (the restricted syntax is disjoint stars over observations, "
+                    "externals and auxiliary variables; recognition-beside-analytic.md R2)"
+                )
+            if not ok:
+                raise ValueError(
+                    f"recognition:{entry.variable}: parent {parent!r} is not readable on the "
+                    "analytic path, whose parents are 'obs:<modality>' (a declared modality), "
+                    "'external:<name>' (a declared external input) and 'recognition:<name>' "
+                    "(another entry); a bare factor name reads the prior's prediction, which "
+                    "would count the prior twice (recognition-beside-analytic.md R2)"
+                )
+    analytic_order(recognition)
+
+
+#: The two kinds of measurement a recognition entry sends on the analytic path.
+GAUSSIAN_KIND = "gaussian"
+CATEGORICAL_KIND = "categorical"
+
+
+class Measurement(NamedTuple):
+    """One recognition entry's message to its factor, evaluated on the tick's data.
+
+    ``kind`` is :data:`GAUSSIAN_KIND` (``loc``, ``scale``: a diagonal Gaussian read as an
+    observation of the factor through the identity map) or :data:`CATEGORICAL_KIND` (``row``: a
+    log-probability row over the factor's levels). ``present`` is ``True``, or a traced 0-d bool;
+    a statically absent entry produces no :class:`Measurement`.
+    """
+
+    variable: str
+    factor: int
+    kind: str
+    loc: Array | None
+    scale: Array | None
+    row: Array | None
+    present: bool | Array
+
+
+def analytic_order(recognition: tuple[Recognition, ...] | None) -> tuple[Recognition, ...]:
+    """The entries in an evaluation order derived from their ``recognition:<name>`` parents.
+
+    Each entry follows every entry it reads; entries with no ordering between them keep their
+    declaration order. A cycle is refused (model-description-0.3.md 18.5c: the order is derived
+    from the explicit parents, so a cycle has none).
+    """
+    entries = tuple(recognition or ())
+    declared = {e.variable for e in entries}
+    reads = {
+        e.variable: {p.split(":", 1)[1] for p in e.parents if p.startswith(f"{RECOGNITION}:")}
+        & declared
+        for e in entries
+    }
+    ordered: list[Recognition] = []
+    done: set[str] = set()
+    remaining = list(entries)
+    while remaining:
+        ready = next((e for e in remaining if reads[e.variable] <= done), None)
+        if ready is None:
+            stuck = sorted(e.variable for e in remaining)
+            raise ValueError(
+                f"recognition: the entries {stuck} read one another through "
+                "'recognition:<name>' parents in a cycle; the evaluation order is derived from "
+                "the explicit parents, so a cycle has none (model-description-0.3.md 18.5c)"
+            )
+        ordered.append(ready)
+        done.add(ready.variable)
+        remaining.remove(ready)
+    return tuple(ordered)
+
+
+def _all_present(flags: list[bool | Array]) -> bool | Array:
+    """The conjunction of presence flags: ``False`` if any is, else ``True`` or a traced bool."""
+    if any(f is False for f in flags):
+        return False
+    traced = [jnp.asarray(f, bool) for f in flags if f is not True]
+    if not traced:
+        return True
+    return traced[0] if len(traced) == 1 else jnp.all(jnp.stack(traced))
+
+
+def _module_fits(module: object, kind: str, width: int | None) -> bool:
+    """Whether ``module`` is the family a factor of ``kind`` takes (width checked when known)."""
+    if kind == GAUSSIAN_KIND:
+        return isinstance(module, MLPConditional) and width in (None, module.child_dim)
+    if isinstance(module, MLPCategorical):
+        return module.num_vars == 1 and width in (None, module.num_classes)
+    return isinstance(module, MLPPredictor) and width in (None, module.out_dim)
+
+
+def _output_width(module: object) -> int | None:
+    """The width of the vector an auxiliary module outputs, where its type declares one."""
+    if isinstance(module, MLPConditional):
+        return module.child_dim
+    if isinstance(module, MLPCategorical):
+        return module.flat_dim
+    return getattr(module, "out_dim", None)
+
+
+def check_analytic_recognition(
+    recognition: tuple[Recognition, ...] | None,
+    recognition_params: Mapping[str, object],
+    modality_names: tuple[str, ...],
+    factor_names: tuple[str, ...],
+    control_names: tuple[str, ...],
+    kinds: tuple[str, ...],
+    widths: tuple[int | None, ...],
+    observation_widths: tuple[int | None, ...],
+    external_inputs: tuple[tuple[str, int], ...] = (),
+    categorical_observations: tuple[bool, ...] = (),
+) -> None:
+    """The structural checks on a recognition declaration read on the analytic path.
+
+    Parents resolve and the entries have an evaluation order (:func:`check_analytic_parents`); a
+    variable is a state factor or an auxiliary name, never a control node or a modality; an
+    auxiliary some entry reads; each factor's module fits its family (``kinds``, ``widths``); and
+    each module's ``parent_dims`` match the widths of its parents (an observation's width where
+    known, an external's declared width, an earlier entry's output width). Refusals cite
+    recognition-beside-analytic.md R2. A categorical observation (a level index, no vector) is
+    refused as a parent; ``categorical_observations`` flags the modalities that are one.
+    """
+    check_analytic_parents(recognition, modality_names, external_inputs, factor_names)
+    entries = tuple(recognition or ())
+    for entry in entries:
+        for parent in entry.parents:
+            kind, name = parent.split(":", 1)
+            if (
+                kind == OBS
+                and name in modality_names
+                and categorical_observations
+                and categorical_observations[modality_names.index(name)]
+            ):
+                raise ValueError(
+                    f"recognition:{entry.variable}: the parent {parent!r} is a categorical "
+                    "observation, a level index that is no vector for a module to read; a "
+                    "module's parents are continuous observations, external inputs and other "
+                    "entries (recognition-beside-analytic.md R2)"
+                )
+    for entry in entries:
+        if entry.variable in control_names or entry.variable in modality_names:
+            raise ValueError(
+                f"recognition:{entry.variable}: the name is a "
+                f"{'control node' if entry.variable in control_names else 'modality'}, not a "
+                "state factor or an auxiliary variable; an entry names a factor it measures or "
+                "a new auxiliary name (recognition-beside-analytic.md R2)"
+            )
+    read = {p.split(":", 1)[1] for e in entries for p in e.parents if p.startswith("recognition:")}
+    externals = _external_widths(external_inputs)
+    out_width: dict[str, int | None] = {}
+    for entry in analytic_order(entries):
+        module = recognition_params[entry.variable]
+        if entry.variable in factor_names:
+            f = factor_names.index(entry.variable)
+            if not _module_fits(module, kinds[f], widths[f]):
+                raise _family_refusal(entry.variable, module, kinds[f], widths[f])
+            out_width[entry.variable] = widths[f]
+        else:
+            if entry.variable not in read:
+                raise ValueError(
+                    f"recognition:{entry.variable}: the name is neither a state factor "
+                    f"{list(factor_names)} nor read by any entry as 'recognition:"
+                    f"{entry.variable}'; an auxiliary no entry reads is inert, which is most "
+                    "likely a mistyped factor name (recognition-beside-analytic.md R2)"
+                )
+            out_width[entry.variable] = _output_width(module)
+        supplied: list[int | None] = []
+        for parent in entry.parents:
+            kind, name = parent.split(":", 1)
+            if kind == OBS:
+                supplied.append(observation_widths[modality_names.index(name)])
+            elif kind == EXTERNAL:
+                supplied.append(externals[name])
+            else:
+                supplied.append(out_width[name])
+        declared = tuple(getattr(module, "parent_dims", ()))
+        if len(declared) != len(supplied) or any(
+            w is not None and w != d for w, d in zip(supplied, declared, strict=True)
+        ):
+            raise ValueError(
+                f"recognition:{entry.variable}: its module declares parent_dims={declared} but "
+                f"the parents {list(entry.parents)} supply widths {tuple(supplied)} (None where "
+                "the parent's width is not a vector); the module reads its parents in the "
+                "declared order (recognition-beside-analytic.md R2)"
+            )
+
+
+def _family_refusal(variable: str, module: object, kind: str, width: int) -> ValueError:
+    want = (
+        f"an MLPConditional with child_dim={width} (a diagonal Gaussian over the factor's "
+        "dimensions)"
+        if kind == GAUSSIAN_KIND
+        else f"an MLPCategorical (one variable of {width} classes) or an MLPPredictor with "
+        f"out_dim={width} (a probability vector over the levels)"
+    )
+    return ValueError(
+        f"recognition:{variable}: a {type(module).__name__} does not fit the {kind} factor "
+        f"{variable!r} on the analytic path, whose module for it is {want} "
+        "(recognition-beside-analytic.md R2)"
+    )
+
+
+def _auxiliary_output(module: object, parents: tuple[Array, ...]) -> Array:
+    """An auxiliary variable's value: the module's output vector (a conditional's mean, a
+    categorical's flattened probabilities)."""
+    if isinstance(module, MLPConditional):
+        return module.diag_moments(parents)[0]
+    if isinstance(module, MLPCategorical):
+        return _flat(module.probs(parents))
+    return jnp.asarray(module(parents))
+
+
+def _measurement_of(
+    variable: str, module: object, parents: tuple[Array, ...], kind: str, width: int
+) -> tuple[Array | None, Array | None, Array | None]:
+    """``(loc, scale, row)`` of a factor entry's output, with the module checked against the
+    factor's family and width (R2)."""
+    if not _module_fits(module, kind, width):
+        raise _family_refusal(variable, module, kind, width)
+    if kind == GAUSSIAN_KIND:
+        loc, scale = module.diag_moments(parents)
+        return loc, scale, None
+    logits = module.logits(parents)[0] if isinstance(module, MLPCategorical) else module(parents)
+    return None, None, jax.nn.log_softmax(logits, axis=-1)
+
+
+def analytic_recognize(
+    order: tuple[Recognition, ...],
+    recognition_params: Mapping[str, object],
+    observations: tuple[Array | None, ...],
+    externals: Mapping[str, Array] | None,
+    present: tuple[bool | Array, ...] | None,
+    modality_names: tuple[str, ...],
+    factor_names: tuple[str, ...],
+    kinds: tuple[str, ...],
+    widths: tuple[int, ...],
+) -> tuple[Measurement, ...]:
+    """Evaluate the recognition entries once, in ``order``, for the analytic path.
+
+    Each module is applied to its parents: ``obs:<m>`` the tick's observation, ``external:<n>`` the
+    supplied vector, ``recognition:<n>`` an earlier entry's output. A factor's entry yields a
+    :class:`Measurement` (``kinds[f]`` and ``widths[f]`` give the factor's family and width, and
+    the module must fit them); an auxiliary variable's entry yields its output vector for later
+    entries. An entry whose observed parents are not all present contributes nothing: a static
+    absence produces no measurement, a traced one is carried in ``Measurement.present``.
+    """
+    factor_of = {name: f for f, name in enumerate(factor_names)}
+    supplied = {} if externals is None else externals
+    values: dict[str, Array] = {}
+    presence: dict[str, bool | Array] = {}
+    out: list[Measurement] = []
+    for entry in order:
+        flags: list[bool | Array] = []
+        for parent in entry.parents:
+            kind, name = parent.split(":", 1)
+            if kind == OBS:
+                flags.append(True if present is None else present[modality_names.index(name)])
+            elif kind == RECOGNITION:
+                flags.append(presence[name])
+        here = _all_present(flags)
+        presence[entry.variable] = here
+        if here is False:
+            continue
+        parents: list[Array] = []
+        for parent in entry.parents:
+            kind, name = parent.split(":", 1)
+            if kind == OBS:
+                obs = observations[modality_names.index(name)]
+                if obs is None:
+                    raise ValueError(
+                        f"recognition:{entry.variable} conditions on observation {name!r}, "
+                        "whose value is None while it is marked present; pass its datum, or "
+                        "mark the modality absent with present={name: False}"
+                    )
+                parents.append(jnp.asarray(obs))
+            elif kind == EXTERNAL:
+                if name not in supplied:
+                    raise ValueError(
+                        f"recognition:{entry.variable} conditions on external input {name!r} "
+                        f"and the externals mapping carries {sorted(supplied)}; an external "
+                        "parent is supplied per call and has no default"
+                    )
+                parents.append(jnp.asarray(supplied[name]))
+            else:
+                parents.append(_flat(values[name]))
+        module = recognition_params[entry.variable]
+        f = factor_of.get(entry.variable)
+        if f is None:
+            values[entry.variable] = _auxiliary_output(module, tuple(parents))
+            continue
+        loc, scale, row = _measurement_of(
+            entry.variable, module, tuple(parents), kinds[f], widths[f]
+        )
+        values[entry.variable] = loc if row is None else jnp.exp(row)
+        out.append(Measurement(entry.variable, f, kinds[f], loc, scale, row, here))
+    return tuple(out)
+
+
+def gaussian_message_expectation(q: Gaussian, y: Array, scale: Array) -> Array:
+    """``E_q[log m(s)]`` for the measurement ``m(s) = N(y; s, R)``, ``R = diag(scale**2)``, under a
+    Gaussian belief ``q`` with mean ``mu`` and covariance ``S``:
+
+        log N(y; mu, R) - 1/2 tr(R^-1 S)
+    """
+    d = y.shape[-1]
+    log_density = (
+        -0.5 * jnp.sum(((y - q.loc) / scale) ** 2, axis=-1)
+        - jnp.sum(jnp.log(scale), axis=-1)
+        - 0.5 * d * jnp.log(2.0 * jnp.pi)
+    )
+    trace = jnp.sum(jnp.sum(q.chol**2, axis=-1) / scale**2, axis=-1)
+    return log_density - 0.5 * trace
+
+
+def mixture_message_expectation(q: MixtureGaussian, y: Array, scale: Array) -> Array:
+    """``E_q[log m(s)]`` under a mixture belief: each component's
+    :func:`gaussian_message_expectation` weighted by the belief's component weights (a dead
+    component weighs zero)."""
+    weights = jax.nn.softmax(q.log_weights, axis=-1)  # gauge-free; dead components weigh zero
+    per_component = gaussian_message_expectation(q.components, y, scale)
+    return jnp.sum(jnp.where(weights > 0, weights * per_component, 0.0), axis=-1)
+
+
+def covered_modalities(
+    recognition: tuple[Recognition, ...] | None, modality_names: tuple[str, ...]
+) -> frozenset[int]:
+    """The modalities the recognition entries cover, by index: every ``obs:<m>`` parent of an
+    entry, which includes those reached through ``recognition:<name>`` parents (an entry that
+    reads another entry covers what that one reads, and the other entry's own ``obs:`` parents
+    are in the union). The engine does not condition on a covered modality; the entry's message
+    does (design: recognition-beside-analytic.md L3).
+    """
+    return frozenset(
+        modality_names.index(p.split(":", 1)[1])
+        for e in (recognition or ())
+        for p in e.parents
+        if p.startswith(f"{OBS}:") and p.split(":", 1)[1] in modality_names
+    )
+
+
+def expected_gaussian_nll(
+    locs: Array, chols: Array, H: Array, c: Array, R_chol: Array, y: Array, weights: Array
+) -> Array:
+    """``- E_q[log N(y; H x + c, R R^T)]`` under a Gaussian belief per component, weighted.
+
+    ``locs`` ``(K, d)`` and ``chols`` ``(K, d, d)`` are the components of the belief; ``H``
+    ``(K, M, d_obs, d)``, ``c`` ``(K, M, d_obs)`` and ``R_chol`` ``(K, M, d_obs, d_obs)`` the
+    observation model of each component under each of ``M`` mode configurations; ``weights``
+    ``(K, M)`` the joint weight of each pair (zero weighs nothing). Each pair contributes the
+    closed-form expectation of the quadratic,
+    ``- log N(y; H mu + c, R) + 1/2 tr(R^-1 H Sigma H^T)``.
+    """
+    d_obs = y.shape[-1]
+
+    def pair(mu, chol, H, c, R):
+        z = jax.scipy.linalg.solve_triangular(R, y - (H @ mu + c), lower=True)
+        A = jax.scipy.linalg.solve_triangular(R, H @ chol, lower=True)
+        return 0.5 * (d_obs * jnp.log(2.0 * jnp.pi) + jnp.sum(z**2) + jnp.sum(A**2)) + jnp.sum(
+            jnp.log(jnp.diagonal(R))
+        )
+
+    per_pair = jax.vmap(jax.vmap(pair, (None, None, 0, 0, 0)), (0, 0, 0, 0, 0))(
+        locs, chols, H, c, R_chol
+    )
+    return jnp.sum(jnp.where(weights > 0, weights * per_pair, 0.0))
+
+
+def categorical_message_log_evidence(prior_log_probs: Array, log_row: Array) -> Array:
+    """``log Z = log sum_k q_prior_k r_k`` for the likelihood row ``r`` (``log_row`` is ``log r``)
+    against the belief ``q_prior`` the message is applied to."""
+    return jax.scipy.special.logsumexp(prior_log_probs + log_row, axis=-1)
+
+
+def categorical_message_expectation(probs: Array, log_row: Array) -> Array:
+    """``E_q[log m] = sum_k q_k log r_k`` for the belief ``q`` (``probs``) and the row ``r``."""
+    return jnp.sum(jnp.where(probs > 0, probs * log_row, 0.0), axis=-1)
+
+
+def _resolve_recognition(
+    recognition: tuple[Recognition, ...] | None,
+    recognition_params: Mapping[str, object],
+    families: tuple[str, ...],
+    widths: tuple[int, ...],
+    A: tuple,
+    mods: tuple[str, ...],
+    facs: tuple[str, ...],
+    externals: Mapping[str, int] = {},  # noqa: B006 (read-only, never mutated)
+) -> tuple[RecognitionPlan, ...]:
+    """The recognition declaration and its parameter slot, resolved to a q-side plan."""
+    declared = check_recognition_entries(recognition, recognition_params)
+
+    factor_of = {name: f for f, name in enumerate(facs)}
+    for entry in declared:
+        f = factor_of.get(entry.variable)
+        if f is not None and families[f] == CARRY:
+            raise ValueError(
+                f"recognition: {entry.variable!r} is a Deterministic carry factor, whose value "
+                "is computed forward and carried, never inferred (rule='carry'). An amortized "
+                "posterior over it has no referent, so drop the recognition entry (design: "
+                "amortization.md A10 disposition 2)."
             )
 
     # The amortized variables that are p-side factors: the syntax is disjoint

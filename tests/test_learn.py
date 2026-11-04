@@ -268,8 +268,8 @@ def test_no_parameter_duplicating_field_on_system_params():
     info-gain ensemble and the CRSPP are parameters no declaration holds. ``control`` holds
     each continuous control node's box, its support, which no declaration holds either, and
     ``actuator`` each action node's kernel, which the environment draws from, and
-    ``durations`` a round's length per level of the one control node that sets the clock, and
-    ``precision`` the policy precision, a scalar no declaration holds. Which
+    ``durations`` a round's length per level of the one control node that sets the clock,
+    and ``precision`` the policy precision, a scalar no declaration holds. Which
     *group* each field belongs to is ``test_scoring_slot.py``'s membership test."""
     fields = {f.name for f in dataclasses.fields(SystemParams)}
     assert fields == {

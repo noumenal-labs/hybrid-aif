@@ -27,6 +27,7 @@ from typing import Literal, NamedTuple
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 from hybrid_aif.controls import (
@@ -596,8 +597,9 @@ class System(eqx.Module):
     #   log-likelihood, greedily
     controls: tuple[int, ...] = eqx.field(static=True, default=())
     #   the control nodes, by node index, ascending: the nodes the System sets by decision
-    #   rather than by inference. They follow every state factor; each is read by at least one
-    #   transition and has no parents, initial prior or terminal target of its own. A policy
+    #   rather than by inference. They follow every state factor; each is read by a transition or
+    #   sized by another declaration that names it (a target, a modality, durations). It has no
+    #   parents, initial prior or terminal target of its own. A policy
     #   carries one column per control node, in this order
     action_names: tuple[str, ...] = eqx.field(static=True, default=None)
     #   one action node per control node, in ``controls`` order: the actuator channel, a child of
@@ -1043,7 +1045,21 @@ class System(eqx.Module):
         params = self._p(params)
         for f, parents in enumerate(self._B):  # switching dynamics, before any layout reading
             _hybrid.refuse_switching_nonlinear(params.transition[f], parents, self._facs, f)
-        return control_space(self._table, params.transition, params.control, self._facs)
+        mods = self.modality_names
+        targets = []
+        for key, parents in self.C_deps:
+            target = (params.obs_targets if key in mods else params.state_targets).get(key)
+            if target is not None:
+                targets.append((key, parents, target))
+        return control_space(
+            self._table,
+            params.transition,
+            params.control,
+            self._facs,
+            targets=targets,
+            observations=tuple(zip(mods, self.A_deps, params.likelihood, strict=True)),
+            durations=params.durations,
+        )
 
     def _control_layout(self, params: SystemParams) -> ControlLayout | None:
         """The flat action-vector layout of an all-continuous space, else ``None``."""
@@ -1116,6 +1132,10 @@ class System(eqx.Module):
                     "duration is one number per level of a discrete one"
                 )
             levels = space.sizes[k]
+            try:
+                concrete = np.asarray(value)  # raises on a tracer
+            except jax.errors.TracerArrayConversionError:
+                concrete = None
             arr = jnp.asarray(value)
             if not jnp.issubdtype(arr.dtype, jnp.floating):
                 arr = arr.astype(jnp.result_type(float))
@@ -1127,9 +1147,9 @@ class System(eqx.Module):
                     f"node {node!r} has {levels} level(s), so give {levels} number(s) or one "
                     "for every level"
                 )
-            if not isinstance(arr, jax.core.Tracer) and not bool(jnp.all(arr > 0)):
+            if concrete is not None and not bool(np.all(concrete > 0)):
                 raise ValueError(
-                    f"{face}: params.durations[{node!r}] = {arr.tolist()} has a "
+                    f"{face}: params.durations[{node!r}] = {concrete.tolist()} has a "
                     "non-positive entry; a duration is a positive number per level"
                 )
             out[node] = arr
@@ -1173,9 +1193,11 @@ class System(eqx.Module):
         table = self._table
         if table.sugar is not None:
             owners = table.sugar.owners
-        else:  # each node at its first reader's column, when no two nodes share one
+        elif all(table.readers):  # each node at its first reader's column, if no two share one
             owners = tuple(readers[0][0] for readers in table.readers)
             owners = owners if len(set(owners)) == len(owners) else None
+        else:  # a node no factor reads has no column
+            owners = None
         gone = self._bound_away()
         if params is None or not table.controls:
             return keyed.FaceNames(
@@ -1320,15 +1342,24 @@ class System(eqx.Module):
             )
 
     def _sensed_priors(
-        self, params: SystemParams, given: Mapping[str, Belief] | None, face: str
+        self,
+        params: SystemParams,
+        given: Mapping[str, Belief] | None,
+        face: str,
+        prev_action: tuple[Array | None, ...] | None = None,
     ) -> tuple[Categorical, ...]:
         """Each observed action node's prior, in column order: the entry ``given`` carries,
-        else uniform over its control node's levels."""
+        else the one-hot at the previous realised level ``prev_action`` names for that node
+        (one entry per action node, ``None`` where unnamed), else uniform over its control
+        node's levels."""
         self._check_sensed_kinds(params, face)
         levels = self._control_levels(params)
         out = []
         for k, name in zip(self._sensed_columns, self._sensed, strict=True):
             q = None if given is None else given.get(name)
+            if q is None and prev_action is not None and prev_action[k] is not None:
+                out.append(Categorical.from_probs(jax.nn.one_hot(prev_action[k], levels[k])))
+                continue
             if q is None:
                 out.append(Categorical(logits=jnp.zeros((levels[k],))))
                 continue
@@ -1782,7 +1813,7 @@ class System(eqx.Module):
         observations: tuple[Array | None, ...],
         present: tuple[bool | Array, ...] | None,
         prev_beliefs: tuple[Belief | None, ...] | None,
-        prev_action: Array | None,
+        prev_action: Array | tuple[Array | None, ...] | None,
         first: Array | bool = False,
     ) -> tuple[tuple[Array | None, ...], tuple[bool | Array, ...] | None]:
         """The engine: :func:`hybrid_aif.system.faces.infer._fill_lagged`."""
@@ -1818,6 +1849,8 @@ class System(eqx.Module):
         detail: InferenceDetail | None = None,
         learn_state: "LearnState | None" = None,
         prior: SystemParams | None = None,
+        priors: Mapping[str, Belief] | None = None,
+        externals: Mapping[str, Array] | None = None,
     ) -> "SystemParams | tuple[SystemParams, LearnState]":
         """One tick's parameter update: every learnable slot absorbs this tick's statistic.
 
@@ -1828,6 +1861,16 @@ class System(eqx.Module):
         discrete variables, a one-hot action). A transition net's parents are its factor's previous
         value then the action one-hot if controlled; a likelihood net's are the ``A_deps`` factors
         in order.
+
+        A non-frozen :class:`~hybrid_aif.distributions.MLPConditional` likelihood takes the
+        gradient of the free energy ``infer_states(detail=True)`` reports for the tick: the
+        inference pass is re-run from ``priors``, the prior beliefs ``infer_states`` was given
+        (keyed by factor name), with every other input held fixed, and differentiated in the
+        decoder. Without ``priors`` they are the prediction from ``prev_beliefs`` and ``action``
+        when ``prev_beliefs`` is given, else the initial priors. ``externals`` is the mapping
+        ``infer_states`` took for a recognition entry's external parents. A modality a
+        recognition entry covers contributes its expected negative log-likelihood under the final
+        belief, as ``infer_states`` records it.
 
         ``observations`` is keyed by modality name, ``beliefs`` and ``prev_beliefs`` by factor
         name, ``action`` by action-node name (as :meth:`act` returns it). ``action`` is
@@ -1905,6 +1948,8 @@ class System(eqx.Module):
             detail,
             learn_state,
             prior,
+            priors,
+            externals,
         )
 
     def _learn(
@@ -1924,6 +1969,8 @@ class System(eqx.Module):
         present: tuple[bool | Array, ...] | None = None,
         prior: SystemParams | None = None,
         grow: bool = True,
+        priors: tuple[Belief, ...] | None = None,
+        externals: Mapping[str, Array] | None = None,
     ) -> "SystemParams | tuple[SystemParams, LearnState]":
         """The engine: :func:`hybrid_aif.system.faces.learn._learn`."""
         return _learn_face._learn(
@@ -1943,6 +1990,8 @@ class System(eqx.Module):
             present,
             prior,
             grow,
+            priors,
+            externals,
         )
 
     def carry(
@@ -2097,20 +2146,14 @@ class System(eqx.Module):
     def _is_amortized(self, params: SystemParams) -> bool:
         """Whether this System is declared on the amortized (neural state-space) path.
 
-        Any amortized declaration family (a ``Deterministic`` carry, a categorical code, a predictor
-        head, a learned or derived initial value) or a recognition entry routes every face there,
-        and that path's validator refuses a declaration it cannot express in full.
+        True iff some transition is a ``Deterministic`` carry or an ``MLPCategorical`` code, the two
+        families the analytic engine cannot hold as a belief. A predictor head, a learned or derived
+        initial value and a recognition entry do not route by themselves; the amortized validator
+        refuses a declaration it cannot express in full and the analytic validator refuses a head or
+        a neural initial prior (design: recognition-beside-analytic.md R1).
         """
         params = self._p(params)
-        return (
-            bool(self.recognition)
-            or bool(params.recognition)
-            or any(isinstance(b, Deterministic | MLPCategorical) for b in params.transition)
-            or any(isinstance(a, PredictorHead) for a in params.likelihood)
-            or any(
-                isinstance(d, LearnedVector | DerivedInitial) for d in params.initial_state_prior
-            )
-        )
+        return any(isinstance(b, Deterministic | MLPCategorical) for b in params.transition)
 
     def _amortized_structure(
         self, params: SystemParams, face: str = "this face"
@@ -2217,9 +2260,11 @@ class System(eqx.Module):
         params = self._p(params)
         return selectors._eligible_state_blocks(self, params)
 
-    def _validate(self, params: SystemParams, face: str = "this face") -> None:
+    def _validate(
+        self, params: SystemParams, face: str = "this face", declared: bool = False
+    ) -> None:
         params = self._p(params)
-        validation._validate(self, params, face)
+        validation._validate(self, params, face, declared)
 
     def _validate_H_deps(self, params: SystemParams, facs: tuple[str, ...]) -> None:
         params = self._p(params)

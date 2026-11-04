@@ -27,6 +27,7 @@ from hybrid_aif.distributions import (
     Dirichlet,
     Gaussian,
     Learnable,
+    MLPConditional,
     TruncatedGaussian,
 )
 from hybrid_aif.factors import (
@@ -338,15 +339,18 @@ def _conditioners(
     families: tuple[str, ...],
     sensed: SensedNodes | None = None,
 ) -> tuple["_hybrid.Conditioner", ...]:
-    """The linear-Gaussian modalities the epistemic chain conditions on: those observing one
-    Gaussian-carried factor and no mode parent, and those whose mode parents are all action
-    nodes, which select their head and noise at the step's level (a switching channel on a
-    state mode parent keeps the predictive belief; design: planning-with-observations.md D2,
-    action-node-modalities.md S4)."""
+    """The modalities the epistemic chain conditions on: the linear-Gaussian and neural ones
+    observing one Gaussian-carried factor and no mode parent, and those whose mode parents are
+    all action nodes, which select their head and noise at the step's level (a switching channel
+    on a state mode parent keeps the predictive belief; design: planning-with-observations.md
+    D2, action-node-modalities.md S4). A neural modality's head is read at the belief the chain
+    conditions (recognition-beside-analytic.md L4)."""
     out = []
     engine = system._engine_A_deps
     for m, decl in enumerate(params.likelihood):
-        if not isinstance(decl, LinearGaussianObservation | LinearGaussianObservationMNIW):
+        if not isinstance(
+            decl, LinearGaussianObservation | LinearGaussianObservationMNIW | MLPConditional
+        ):
             continue
         deps = engine[m]
         if deps[0] >= len(families) or families[deps[0]] != _hybrid.GAUSSIAN:
@@ -354,8 +358,22 @@ def _conditioners(
         nodes = deps[1:]
         if nodes and (sensed is None or any(d < sensed.offset for d in nodes)):
             continue
+        if isinstance(decl, MLPConditional):
+            out.append(
+                _hybrid.neural_conditioner(
+                    decl,
+                    factor=deps[0],
+                    column=m,
+                    nodes=nodes,
+                    modality=system.modality_names[m],
+                    factor_name=system._facs[deps[0]],
+                )
+            )
+            continue
         model = _continuous.lg_point(decl)
-        R_chol = model.R_chol_at if not nodes else (lambda loc, R=model.R_chol: R)
+        R_chol = (
+            model.R_chol_at if not nodes or model.noise_map else (lambda loc, R=model.R_chol: R)
+        )
         out.append(
             _hybrid.Conditioner(
                 factor=deps[0],
@@ -397,7 +415,8 @@ def _context_without_control_risk(
 ) -> PlannerContext:
     """:meth:`_planner_context` before control-node targets are scored. Under ``feedback``
     the closures carry the closed-loop record (:func:`~hybrid_aif.objectives.closed_loop.
-    closed_loop`), whose pass reads ``control_targets`` for the corrections' cost."""
+    closed_loop`), whose pass reads ``control_targets`` for the corrections' cost.
+    ``validated`` says the caller has already validated ``params``."""
     if system._is_amortized(params):
         _refuse_feedback_amortized(system, face)
         if system.planning_belief == "posterior" or present is not None:
@@ -520,6 +539,9 @@ def _context_without_control_risk(
             system._effective_H_deps(),
             branching=branching,
             cross_entropy_targets=covered,
+            approximation=registry.approximate_status(
+                lowered, tuple(params.likelihood), system._B, A_deps, facs, mods
+            ),
         )
         init_beliefs = _hybrid.prepare_beliefs(beliefs, families, system.mixture_k)
         if system.planning_belief == "posterior":

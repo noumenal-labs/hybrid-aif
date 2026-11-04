@@ -24,9 +24,11 @@ estimators, dispatched by the mounted variable's family. Every entry is a
 ``prepare(statics) -> step(ctx)`` pair: ``prepare`` hoists loop invariants at trace
 time, ``step`` returns ``{leaf key: Interval}`` inside the planning scan, on either
 the distribution-object carrier or the fused prob-space one. Each row's ``derived``
-warrant is stamped onto every leaf it returns.
+warrant is stamped onto every leaf it returns, and the System's static ``approximate`` map
+(:func:`approximate_status`) onto every leaf keyed by an approximate factor or modality.
 
-Design: docs/design/per-variable-infogain.md V4, V11; docs/design/objective-terms.md
+Design: docs/design/per-variable-infogain.md V4, V11; docs/design/objective-terms.md;
+docs/design/recognition-beside-analytic.md L7
 """
 
 import dataclasses
@@ -53,6 +55,8 @@ from hybrid_aif.factors import (
     Deterministic,
     LinearGaussianObservation,
     LinearGaussianObservationMNIW,
+    NonlinearGaussianTransition,
+    TabularTransition,
 )
 from hybrid_aif.interval import Interval
 from hybrid_aif.objectives import continuous, discrete
@@ -242,6 +246,88 @@ class Estimator:
             )
         if self.derived is None:
             object.__setattr__(self, "derived", True)
+
+
+class Approximation(NamedTuple):
+    """Which factors and modalities are read through a linearised or quadrature model.
+
+    Two name-keyed maps from :func:`approximate_status`; a name absent from both is exact.
+    """
+
+    factors: dict[str, bool]
+    modalities: dict[str, bool]
+
+    def leaf(self, key: str) -> bool:
+        """The status of a leaf key: its factor's or modality's, ``False`` for any other key.
+
+        A slot-qualified key (``"likelihood:vision"``, ``"transition:x"``) reads its variable's.
+        """
+        name = key.split(":", 1)[1] if key.split(":", 1)[0] in ("likelihood", "transition") else key
+        return self.factors.get(name, False) or self.modalities.get(name, False)
+
+    @property
+    def any(self) -> bool:
+        """Whether any factor or modality is approximate (the total's status)."""
+        return any(self.factors.values()) or any(self.modalities.values())
+
+
+#: Transition declarations read through a linearised or quadrature model.
+_APPROXIMATE_DECLS = (MLPConditional, NonlinearGaussianTransition)
+
+
+def approximate_status(
+    B: tuple,
+    A: tuple,
+    B_deps: tuple[tuple[int, ...], ...],
+    A_deps: tuple[tuple[int, ...], ...],
+    factor_names: tuple[str, ...],
+    modality_names: tuple[str, ...],
+) -> Approximation:
+    """The static ``approximate`` map of a System (design: recognition-beside-analytic.md L7).
+
+    A factor is approximate if its transition is an ``MLPConditional`` or a
+    ``NonlinearGaussianTransition``, or any factor it reads through ``B_deps`` is, transitively;
+    a modality is approximate if its likelihood is an ``MLPConditional`` with a continuous
+    parent or it observes an approximate factor. Pure and static: a function of the declarations
+    and the dependency structure only.
+    """
+    n = len(B)
+    approx = [isinstance(b, _APPROXIMATE_DECLS) for b in B]
+    for _ in range(n):  # a fixpoint of the parent relation; n sweeps cover any chain
+        changed = False
+        for f in range(min(n, len(B_deps))):
+            if not approx[f] and any(approx[p] for p in B_deps[f] if p < n):
+                approx[f], changed = True, True
+        if not changed:
+            break
+
+    def neural_over_continuous(m: int, deps: tuple[int, ...]) -> bool:
+        # a neural modality over categorical parents alone is read exactly, as the Gaussian
+        # emission its parent configurations tabulate (design: recognition-beside-analytic.md L4)
+        if m >= len(A) or not isinstance(getattr(A[m], "decl", A[m]), MLPConditional):
+            return False
+        return any(f < n and not isinstance(B[f], TabularTransition) for f in deps)
+
+    modalities = [
+        neural_over_continuous(m, deps) or any(f < n and approx[f] for f in deps)
+        for m, deps in enumerate(A_deps)
+    ]
+    return Approximation(
+        dict(zip(factor_names, approx, strict=False)),
+        dict(zip(modality_names, modalities, strict=False)),
+    )
+
+
+def statics_approximation(statics: "Statics") -> Approximation:
+    """:func:`approximate_status` of the declarations a :class:`Statics` carries."""
+    return approximate_status(
+        statics.B,
+        statics.A,
+        statics.B_deps,
+        statics.A_deps,
+        statics.factor_names,
+        statics.modality_names,
+    )
 
 
 def scoring_trainer(name: str) -> str | None:
@@ -684,7 +770,7 @@ def prepare_row(
             "carrier; plan this model through the distribution-object path (a non-tabular "
             "declaration routes there by itself)"
         )
-    return stamp(stage(statics), row.derived)
+    return stamp(stage(statics), row.derived, statics_approximation(statics))
 
 
 def prepare(kind: str, family: str, statics: Statics, compiled: bool = False) -> Step:
@@ -706,19 +792,43 @@ def prepare(kind: str, family: str, statics: Statics, compiled: bool = False) ->
             f"estimator {est.name!r} for ({kind!r}, {family!r}) has no fused prob-space "
             "implementation; plan this model through the distribution-object path"
         )
-    return stamp(stage(statics), est.derived)
+    return stamp(stage(statics), est.derived, statics_approximation(statics))
 
 
-def stamp(step: Step, derived: bool) -> Step:
-    """Wrap a ``step`` so every Interval it returns carries its row's warrant.
+def stamp_tree(tree: dict, approximation: Approximation) -> dict:
+    """A term tree with each leaf's ``approximate`` ORed with its factor's or modality's.
 
-    The flag is ANDed with each Interval's own, so an underived leaf stays underived.
+    For a tree built outside a registry row (the risk and terminal-risk leaves): leaves keyed by
+    an approximate factor or modality gain the status, every other leaf is returned as it is.
     """
-    if derived:
+    if not approximation.any:
+        return tree
+    return {
+        term: {
+            key: Interval(iv.lower, iv.upper, iv.derived, iv.approximate or approximation.leaf(key))
+            for key, iv in blocks.items()
+        }
+        for term, blocks in tree.items()
+    }
+
+
+def stamp(step: Step, derived: bool, approximation: Approximation | None = None) -> Step:
+    """Wrap a ``step`` so every Interval it returns carries its row's warrant and status.
+
+    ``derived`` is ANDed with each Interval's own, so an underived leaf stays underived.
+    ``approximation`` ORs the status of the leaf's factor or modality into the leaf's own
+    ``approximate``; a leaf whose key names neither keeps its own.
+    """
+    flagged = approximation is not None and approximation.any
+    if derived and not flagged:
         return step
 
     def stamped(ctx: StepContext) -> dict[str, Interval]:
-        return {key: Interval(iv.lower, iv.upper, derived=False) for key, iv in step(ctx).items()}
+        out = {}
+        for key, iv in step(ctx).items():
+            approx = iv.approximate or (flagged and approximation.leaf(key))
+            out[key] = Interval(iv.lower, iv.upper, iv.derived and derived, approx)
+        return out
 
     return stamped
 

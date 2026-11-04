@@ -65,8 +65,10 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   whether or not the agent acts (operator-coexistence pattern,
   fielded).
 - Amortized: a variable with a `recognition` entry is inferred by its
-  module (an RSSM posterior over `[deter, embed]`); the rest fall back
-  to the structured row. A recognition parent may be an **externally
+  module. On the neural path the module's output is the posterior (an
+  RSSM posterior over `[deter, embed]`); on the analytic path it is a
+  measurement combined with the analytic evidence; a factor without an
+  entry is inferred by the structured rules. A recognition parent may be an **externally
   supplied vector** (`"external:<name>"`), which is how one model
   conditions on another's embedding as data rather than by sharing a
   module. `predict_beliefs` is the open-loop rollout.
@@ -642,8 +644,7 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   `planning_belief="posterior"` and `feedback="linear_quadratic"` it conditions the epistemic
   chain at the step's level. A selecting channel refuses a node that is not a point (a declared
   kernel, a soft step, a soft prior) with a sentence naming the mixture-carried route; a channel
-  with a state mode parent keeps the mixture rule, and a noise map on a selecting channel is not
-  built; an observation target on a selecting channel under `feedback="linear_quadratic"` is
+  with a state mode parent keeps the mixture rule; an observation target on a selecting channel under `feedback="linear_quadratic"` is
   refused. `learn`, `replay`, `merge`, `subsystem`, the amortized path and a `branch_on`
   modality over an action node keep their refusals.
   `present=` on `infer_policies` and `planner_context` may be given per level of a control
@@ -715,14 +716,14 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   `"mixed"`. On the payoff model, `infer_policies` takes 6 ms for 9 policies, 16 ms for 27 and
   40 ms for 81, jitted with the default 200 steps.
 
-- **Unreleased**: a `legal=` mask held as a concrete JAX array and closed over by `jax.jit`
+- **v0.18.1 (2026-10-31)**: a `legal=` mask held as a concrete JAX array and closed over by `jax.jit`
   masks the same policies as the eager call, and the refusals of a mask that leaves no legal
   policy, or no legal level at a step, fire under `jit` as they do eagerly; a mask passed as an
   argument of the jitted function is traced and applied without them.
   Description 0.2 (the `structure`/`declarations` layout) is no longer read: `build` refuses
   such a document with a sentence naming 0.18.0, the last release that reads it, where building
   it and describing the result writes description 0.3.
-- **Unreleased**: the sophisticated planner evaluates the whole deepest level unless told
+  The sophisticated planner evaluates the whole deepest level unless told
   otherwise. `make_sophisticated_planner(split_depth=, batch_size=)` evaluates the subtrees below
   `split_depth` (1 when only a batch is given) a `batch_size` at a time with `jax.lax.map`;
   `make_sophisticated_planner(memory_budget=)` (bytes, opt-in) chooses both from an estimate of
@@ -734,6 +735,159 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   `jit`), not bit for bit. A per-step `legal=` mask, refused before, masks illegal actions out of
   each node's softmax at every depth (their `G` is `+inf` there); a first-step mask applies at the
   root as before. Design: `design/sophisticated-memory.md`.
+
+- **v0.19.0 (2026-11-04)**: recognition beside analytic factors, a neural likelihood inverted
+  by linearisation, a levelled noise map, more of `merge` and `subsystem`, and a slow-tier mind
+  that holds its action for an option's duration. Design:
+  `design/recognition-beside-analytic.md`, its amendment of 2026-11-04 included.
+  Migrating from 0.18.1 changes two things in inference: a mode-aligned mixture's own mode
+  parents now read the evidence of a switching channel over the factor (below), and a neural
+  likelihood (`MLPConditional`) over an analytic factor now conditions the belief it observes,
+  where 0.18.1 left the belief alone and scored the term at a point, so a model declaring one
+  gets a different posterior and free energy, may declare a target on it, and plans with it. It changes no declaration that ran in 0.18.1: a recognition entry
+  over analytic factors was refused at validation there (the entry routed the System to the
+  neural state-space path, whose validator admits only carries and codes), and is now admitted
+  on the analytic path, where the entry is a measurement (below). The mixed case, carries or
+  codes beside analytic factors, stays refused.
+  **Routing.** A System takes the neural state-space path if and only if it declares a
+  `Deterministic` carry or an `MLPCategorical` code, the two families the analytic engine cannot
+  hold as a belief. A recognition entry no longer routes. On the analytic path a `PredictorHead`
+  likelihood, and a `LearnedVector` or `DerivedInitial` initial prior, are refused with a
+  sentence naming the family and the families they need.
+  **Recognition beside analytic factors.** A recognition entry is admitted on the analytic path,
+  for a state factor or an auxiliary variable. Its output is a measurement of the variable, not
+  its posterior: a Gaussian output (an `MLPConditional` with `child_dim` the factor's dimension)
+  is an observation of the factor through the identity map with the module's scale as the noise,
+  applied after every modality, to every component of a mixture (under
+  `mixture_schedule="mode_aligned"`; refused under `"runnalls"`, as a modality over such a factor
+  is); a categorical output (an `MLPCategorical` or an `MLPPredictor` with a softmax) is a
+  likelihood row over the levels. The module must therefore be calibrated as a likelihood: trained
+  under a flat prior over the variable's range, or with its training prior divided out, since a
+  module trained as a posterior carries its prior and the analytic prior would be counted twice.
+  Parents are `obs:<modality>` (continuous), `external:<name>` and `recognition:<name>` of an
+  auxiliary variable, evaluated in an order derived from the parents; a bare factor name, an
+  empty parent set, a cycle, an entry's output read by another entry's factor, and a module that
+  does not fit the factor's family and width are refused. An entry whose observed parent is
+  absent contributes nothing. An entry replaces the engine's inversion of exactly the modalities
+  it covers, its `obs:` parents and, through `recognition:` parents, theirs: a covered modality,
+  analytic or neural, is not conditioned on again, and enters the free energy as the expected
+  negative log-likelihood under the tick's final belief (closed form for a linear-Gaussian
+  modality, second order at the mean for a neural one). With `detail=True` the free energy is
+  the analytic one minus each message's log normaliser plus its expected log message, plus each
+  covered modality's expectation; the normalisers are the detail's `recognition_log_evidence`,
+  keyed `recognition:<variable>`, and the expectations are its `covered_terms`, keyed by
+  modality. The module is frozen: a nonzero rate on `recognition:<variable>` in
+  `learn` is refused. A factor without an entry is inferred by the structured rules, and
+  `describe` and `build` round-trip an entry on this path as on the neural one.
+  **A neural likelihood is a likelihood.** An `MLPConditional` in `likelihood` over a
+  Gaussian-carried or mixture-carried factor, with categorical state or action-node parents, is
+  read at a belief as the linear-Gaussian model `(H, c, R)` whose moments match the belief's
+  push through the network, by the declaration's static `propagation`: `"first_order"` (the
+  default: the Jacobian at the mean, the extended Kalman reading, exact for an affine mean) or
+  `"unscented"` (the sigma points' statistical linearisation), the two values a
+  `NonlinearGaussianTransition` takes; a non-default value off the `likelihood` slot is
+  refused. `infer_states` conditions on it at the belief the factor holds when the modality is
+  reached (a noise map is read there too), per component of a mixture at the component's mean
+  and per level of a categorical parent (the switching form), its log evidence entering the
+  free energy as a linear-Gaussian modality's does; `present=` masks it. A neural modality over
+  categorical parents alone is read exactly, as the Gaussian emission it is. Planning reads the
+  same model linearised at the belief each term uses, re-taken along the plan, in every term
+  (information gain, ambiguity, risk, utility, the cross-modality rows, the closed-loop pass,
+  the gradient planner), and an `obs_targets` entry on the modality is admitted as on a
+  linear-Gaussian one, a Gaussian over its output space (an image is a preference over pixels).
+  `learn` trains the network by the gradient of the free energy `infer_states` reports, so it
+  takes the tick's `priors=` (and `externals=`) as `infer_states` does, predicting the prior
+  from `prev_beliefs` and `action` when those are given. `as_env` draws through the network. `describe` writes `propagation`
+  and `build` reads it; `merge` and `subsystem` carry the modality and its target. Refused by
+  name: two continuous factors on one neural modality, a spread prior on an action-node parent
+  (a point selects the level), and `mixture_schedule="runnalls"` over a mixture-carried factor,
+  as for a linear-Gaussian modality. An affine network (depth 0, constant scale) reproduces the
+  linear-Gaussian path's numbers under both propagations. Planning channels, the observation
+  model declared beside a neural likelihood for planning, are gone: the likelihood is the
+  model.
+  **The `approximate` status.** `Interval` carries a static `approximate` beside `derived`:
+  `derived` says the enclosure holds on the model the planner was handed, `approximate` that
+  this model is a linearised or quadrature reading of the declared one. It propagates by OR and
+  is stamped on every leaf about a factor whose transition is an `MLPConditional` or a
+  `NonlinearGaussianTransition`, or that reads such a factor through `B_deps`, and on every leaf
+  about a neural modality or a modality over such a factor; the policy totals carry it. A
+  purely linear-Gaussian model has no approximate leaf. `description_length(..., replay=...)`
+  reports `data_exact` beside `data`, the same status on the data part: `False` when a neural
+  likelihood, an `MLPConditional` transition or a `NonlinearGaussianTransition` enters the
+  replay's free energy, `True` otherwise, `None` without a replay; the model part and its
+  `exact` flag are unchanged, and a recognition entry is not priced in the model part.
+  **Composition.** `merge` carries recognition entries and external inputs
+  under the component prefix, with parents renamed, and `subsystem` slices them. A modality
+  whose `A_deps` name an action node (the 0.16.0 form) composes under `merge` and `subsystem`: the
+  composite reads the realised action of the node, and a view carries every node a modality of
+  the view observes as one of its own control nodes; `learn`, `replay` and `predict_beliefs` keep
+  their refusals. A parameter-free `terms=` selector of a component is namespaced on its variable
+  segment (`uncertainty:x` becomes `uncertainty:rover.x`), the union equal to the composite's
+  declared by hand; a component declaring `scoring` is still refused. A
+  `LinearGaussianTransition` that reads a discrete control node keeps its tensors under
+  identification with another node and is sliced at a pinned level; averaging over the node's
+  levels is a mixture and is refused.
+  **A sensed node's prior.** `infer_states` reads the prior over an action node a modality
+  observes from, in order, the entry in `priors`, the realised action `previous=` carries for
+  that node (as a one-hot), and the uniform default, so a mind that passes its previous action
+  need not seed the node by hand; with neither an entry nor a previous action the point-prior
+  refusal stands, with its hint.
+  **An unread control node.** A discrete control node no transition reads is admitted when
+  something else sizes it: a `C_deps` target conditional on it, a modality observing its action
+  node, or a per-level `params.durations` entry. Every source that names the node must give it
+  the same level count, and a node nothing sizes is refused where the params meet the System
+  (`initial_priors` and the faces), no longer at construction; the sugar form `controlled=` keeps
+  its construction-time refusal. A relay into such a node under `merge` is refused by name,
+  identification with a driver works, and `describe` and `build` round-trip it. Design:
+  `design/control-states.md`, amendment.
+  **A view contracts a partner's node in a target.** `subsystem` carries a per-step target
+  (`obs_targets`, `state_targets`) conditional on another component's control node by
+  contracting that parent axis with `partner_priors[node]`, as it terminates the node's
+  transition axis: an int slices the level, a Categorical mixes a categorical target's
+  preferences under its probabilities in probability space, as a soft step does, and a
+  Gaussian target under a spread prior is refused, as is a missing entry. Design:
+  `design/nesting-systems.md`, amendment.
+  **A levelled noise map.** `GridNoiseMap.values` may lead with one level axis per categorical
+  parent of the modality (an action node counts), `(*levels, *grid_shape, d_obs, d_obs)`; a
+  level is selected first and the grid read at the belief's mean after, so a levelled map at one
+  level equals the plain map declared for that level. It is read in inference, in planning with
+  observations, in the information-gain leaves, in the gradient planner (differentiable in the
+  mean), in the environment's draw, in `describe` and `build`, and in the description length
+  (every level's grid is counted). A map without level axes is unchanged. It is built for a
+  channel whose mode parents are all action nodes, or that has none, over a Gaussian-carried
+  or a mixture-carried factor (each component reads the map at its own mean); on a state mode
+  parent it is refused. A channel over action nodes on a mixture-carried factor selects its
+  head and noise at the nodes' levels, as on a Gaussian-carried factor, when its noise is a
+  map, and the nodes' priors must then be points; a spread prior is refused by name. A channel
+  without a map over action nodes on a mixture-carried factor keeps its switching read. Design:
+  `design/planning-with-observations.md` D3, amendment.
+  **A switching channel on a mode-aligned mixture.** A switching linear-Gaussian channel over a
+  mixture-carried factor whose categorical mode parents the channel does not read (a channel
+  over action nodes is the case) now sends those parents the evidence message the
+  non-switching update sends, per component with the channel's modes marginalised at their
+  belief, and reads its log evidence under the mode belief the tabular stage left, so a channel
+  over action nodes with or without a map gives the same factor, mode and evidence posteriors
+  when the node's belief is a point. A channel that reads one of the factor's mode parents
+  keeps its switching message, which does not read the mixture's banks; under
+  `mixture_schedule="runnalls"`, and for a factor without mode parents of its own, nothing
+  changes.
+  **A mind that holds its action for an option's duration.**
+  `composition.hold(system, params, respond, ticks_per_unit=1)` wraps a `RespondFn` so a slow
+  tier decides once per option (a temporally extended action, its duration per level in
+  `params.durations`) and holds that action while the fast tier runs every round under `run`,
+  with no hand-written outer loop. On a decision round it calls `respond`, stores the action and
+  reads the duration with `System.elapsed`; it then returns the stored action for `duration *
+  ticks_per_unit` rounds, counting down on the host and calling nothing, so the slow System's
+  factors step once per option and the fast tier reads the level in force. The first round
+  always decides; the wrapped carry is a `HoldCarry(inner, remaining, action)`. Durations are in
+  the preference's unit, and a product with `ticks_per_unit` that is shorter than a round or not
+  a whole number of rounds is refused. A System with no `params.durations`, or with a non-identity
+  actuator kernel in `params.actuator`, is refused at construction. In the composite form the
+  held System must own no world process (documented, not checked); the wired form has no such
+  restriction. `System.elapsed` is legal under `jit` and `lax.cond`: the positivity check of
+  `params.durations` reads concrete values and skips traced ones. Nothing changes for a model
+  that does not call `hold`. Design: `design/step-durations.md` T9.
+  `examples/demo.ipynb` re-executes clean under this release.
 
 ## In the field / in flight
 
@@ -757,7 +911,7 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   (declared reference models, concrete environments, fixtures), with
   the one-way import rule enforced by a test.
 
-2,788 tests (2,780 in the default selection; `-m notebook` and `-m slow`
+3,027 tests (3,019 in the default selection; `-m notebook` and `-m slow`
 are opt-in); ruff-clean; the executed notebooks (`examples/demo.ipynb`,
 `examples/objectives_a_la_carte.ipynb` — one declared T-maze under five
 objectives, `examples/hide_and_seek.ipynb` — a prey and a predator coupled

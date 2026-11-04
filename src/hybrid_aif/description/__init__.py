@@ -199,6 +199,7 @@ _MLP_OPTIONS = {
     "minstd": 0.1,
     "maxstd": 1.0,
     "norm": False,
+    "propagation": "first_order",
 }
 _TRUNK_OPTIONS = {
     "activation": "silu",
@@ -214,7 +215,9 @@ FAMILIES: dict[str, _Family] = {
         _dist.Categorical, ("logits",), labels=("initial", "target", "terminal", "policy_prior")
     ),
     "ConditionalCategorical": _Family(
-        _dist.ConditionalCategorical, ("log_table",), labels=(*_TABULAR_LABELS, "target")
+        _dist.ConditionalCategorical,
+        ("log_table",),
+        labels=(*_TABULAR_LABELS, "target"),
     ),
     "JointCategorical": _Family(_dist.JointCategorical, ("logits",), labels=("target", "terminal")),
     "Gaussian": _Family(_dist.Gaussian, ("loc", "chol"), labels=("initial", "target", "terminal")),
@@ -667,6 +670,7 @@ def _network(w: _Writer, module, var: str, address: str) -> tuple[str, dict[str,
             "minstd": module.minstd,
             "maxstd": module.maxstd,
             "norm": bool(module.norms),
+            "propagation": getattr(module, "propagation", "first_order"),
         }
         frozen, key = module.frozen, "layers"
     elif isinstance(module, _dist.MLPPredictor):
@@ -3042,10 +3046,19 @@ class _Model:
             for fac in self.transition.values():
                 if any(p == a for p, _ in fac.parents):
                     raise self._reads_action(fac, u, a)
-            if not any(u == p for fac in self.transition.values() for p, _ in fac.parents):
+            named = (
+                [fac.parents for fac in self.transition.values()]
+                + [fac.parents for fac in self.targets.values()]
+                + [[(u, 0)] for fac in self.likelihood.values() if a in dict(fac.parents)]
+            )
+            sized_by_duration = u in self.durations and (
+                np.ndim(self.variables[u]["duration"]) == 1
+            )
+            if not sized_by_duration and not any(u == p for ps in named for p, _ in ps):
                 raise self.fail(
-                    f"the control node {u!r} is read by no transition; a control node moves "
-                    "at least one latent, so list it among a transition's parents"
+                    f"the control node {u!r} is read by no transition and nothing else names "
+                    "it; list it among a transition's parents, a target's parents, or a "
+                    "modality's parents as its action node, or give it a per-level duration"
                 )
         for fac in self.transition.values():
             self._check_transition(fac)
@@ -4022,7 +4035,10 @@ class _Model:
         var = self._network_var(fac, "layers")
         parent_dims, child_dim = layout or self._layout(fac, role)
         frozen = var in self.frozen
-        config = {k: options[k] for k in ("activation", "min_scale", "head", "minstd", "maxstd")}
+        config = {
+            k: options[k]
+            for k in ("activation", "min_scale", "head", "minstd", "maxstd", "propagation")
+        }
         tree = self.network(var, fac.address)
         if isinstance(tree, _Init):
             module = self._draw(
@@ -4714,6 +4730,8 @@ class _Model:
             mods = tuple(m for m, o in enumerate(self.mods) if o.startswith(prefix))
             chosen = tuple(u for u in self.nodes if u.startswith(prefix))
             action_of = dict(zip(self.nodes, self.actions, strict=True))
+            #  an action node a modality observes is no state factor of any component
+            state_deps = [tuple(g for g in deps if g < len(self.states)) for deps in A_deps]
             out.append(
                 (
                     name,
@@ -4722,11 +4740,13 @@ class _Model:
                         modalities=mods,
                         controls=chosen,
                         actions=tuple((u, action_of[u]) for u in chosen),
-                        free_modalities=tuple(m for m in mods if all(g in facs for g in A_deps[m])),
+                        free_modalities=tuple(
+                            m for m in mods if all(g in facs for g in state_deps[m])
+                        ),
                         bound_modalities=tuple(
-                            (m, tuple(g for g in A_deps[m] if g not in facs))
+                            (m, tuple(g for g in state_deps[m] if g not in facs))
                             for m in mods
-                            if any(g not in facs for g in A_deps[m])
+                            if any(g not in facs for g in state_deps[m])
                         ),
                         target_emissions=tuple(
                             (f, H[f]) for f in facs if H[f] and any(g not in facs for g in H[f])

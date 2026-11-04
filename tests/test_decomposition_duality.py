@@ -700,7 +700,7 @@ def test_a_merged_component_s_unobserved_factor_resolves_to_nothing():
         composite.infer_policies(params, composite.initial_priors(params))
 
 
-def test_the_refusal_names_a_channel_without_an_estimator():
+def test_a_neural_channel_carries_an_information_gain_leaf():
     from hybrid_aif.distributions import MLPConditional
 
     net = MLPConditional.from_shapes((2,), 1, key=jax.random.PRNGKey(0), width=8, depth=1)
@@ -725,9 +725,7 @@ def test_the_refusal_names_a_channel_without_an_estimator():
         },
         initial_state_prior={"x": Gaussian(loc=jnp.zeros(2), chol=jnp.eye(2))},
     )
-    with pytest.raises(
-        ValueError,
-        match=r"no channel with an information-gain estimator observes \('y' observes it but "
-        r"has no information-gain estimator\)",
-    ):
-        system.infer_policies(params, system.initial_priors(params))
+    # a neural likelihood is read as the linear-Gaussian model at the belief, so its channel has
+    # an information-gain estimator (recognition-beside-analytic.md L4)
+    _, tree = system.infer_policies(params, system.initial_priors(params))
+    assert set(tree["infogain"]) == {"y"}

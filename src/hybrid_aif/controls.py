@@ -21,12 +21,13 @@ Design: docs/design/control-states.md C1, C4, C6, C11; docs/design/amortization.
 
 import dataclasses
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import NamedTuple
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jax.scipy.special import xlogy
 
@@ -328,7 +329,10 @@ def control_risk(step_terms_fn, control_targets: tuple[ControlTarget, ...], hori
             if ct.terminal:
                 last = t == horizon - 1
                 leaf = Interval(
-                    jnp.where(last, leaf.lower, 0.0), jnp.where(last, leaf.upper, 0.0), leaf.derived
+                    jnp.where(last, leaf.lower, 0.0),
+                    jnp.where(last, leaf.upper, 0.0),
+                    leaf.derived,
+                    leaf.approximate,
                 )
             tree[term] = {**tree.get(term, {}), ct.name: leaf}
         return tree
@@ -589,7 +593,8 @@ class ControlTable(NamedTuple):
     control parents left out (``D_deps`` / ``H_deps`` ``None`` when undeclared);
     ``control_parents[f]`` lists factor ``f``'s control parents as ``(column, position)``, the
     position being the parent's place in the declared ``B_deps`` entry (``arity[f]`` long), and
-    ``readers[k]`` the ``(factor, position)`` pairs reading column ``k``. ``default_wiring``
+    ``readers[k]`` the ``(factor, position)`` pairs reading column ``k`` (empty for a node only a
+    target, a modality or ``durations`` names). ``default_wiring``
     holds when each factor has at most one control parent, as its last parent, and each node has
     exactly one reader (on a sugar-shaped System: when its ``B_control_deps`` is ``None``).
     ``sugar`` is the :class:`SugarView`, or ``None`` when the System is not sugar-shaped. Which
@@ -643,7 +648,8 @@ def control_table(
 
     Takes the System's stored node-form fields (``factor_names`` one per node). Raises, with a
     sentence, on a control node that is not after every state node, that has parents of its own,
-    that is an ``A_deps`` / ``D_deps`` / ``H_deps`` parent, or that no factor reads.
+    or that is an ``A_deps`` / ``D_deps`` / ``H_deps`` parent. A node no factor reads is admitted
+    here; :func:`control_space` sizes it from the other declarations that name it.
     """
     names = factor_names
     n = len(B_deps)
@@ -721,12 +727,6 @@ def control_table(
         control_parents.append(parents)
         for k, pos in parents:
             readers[k].append((f, pos))
-    unread = [names[c] for k, c in enumerate(controls) if not readers[k]]
-    if unread:
-        raise ValueError(
-            f"control node(s) {unread} are read by no factor: a control node must be read by at "
-            "least one factor until it has a prior of its own"
-        )
     arity = tuple(len(B_deps[f]) for f in range(s))
     default = all(
         len(readers[k]) == 1 and readers[k][0][1] == arity[readers[k][0][0]] - 1
@@ -765,6 +765,9 @@ def _sugar_view(state_names, control_names, control_parents, arity):
     owners = tuple(by_name.get(name, -1) for name in control_names)
     if any(o < 0 for o in owners) or list(owners) != sorted(set(owners)):
         return None
+    read = {kk for parents in control_parents for kk, _ in parents}
+    if any(k not in read for k in range(len(owners))):
+        return None  # a node no factor reads is a node of its own, whatever its name
     for f, parents in enumerate(control_parents):
         if sorted(pos for _, pos in parents) != list(range(arity[f] - len(parents), arity[f])):
             return None
@@ -957,11 +960,72 @@ def _fenced_box(name: str, box: Box) -> Box:
     return dataclasses.replace(box, low=low)
 
 
+def _observation_axes(decl: object, n_deps: int) -> tuple[int | None, ...] | None:
+    """The sizes of a modality's parent axes, one per ``A_deps`` entry (``None`` for the
+    observed factor of a linear-Gaussian channel, which has none), or ``None`` when its family
+    declares none: a tabular likelihood's own axes, a linear-Gaussian one's leading mode axes
+    of whichever of its head and noise is per-mode."""
+    shape = getattr(decl, "parent_shape", None)
+    if shape is not None:
+        return tuple(int(n) for n in shape) if len(shape) == n_deps else None
+    head = getattr(decl, "_head_value", None)
+    if head is None:
+        head = getattr(decl, "M", None)  # the matrix-normal head of an MNIW channel
+    if head is None:
+        return None
+    leads = [head.shape[:-2]]
+    noise = getattr(decl, "noise", None)
+    if hasattr(noise, "shape"):
+        leads.append(noise.shape[:-2])
+    elif hasattr(noise, "n_levels"):  # a levelled grid map: its leading axes are the levels
+        leads.append(noise.values.shape[: noise.n_levels])
+    elif hasattr(decl, "Psi"):
+        leads.append(decl.Psi.shape[:-2])
+    for lead in leads:
+        if len(lead) == n_deps - 1:
+            return (None, *(int(n) for n in lead))
+    return None
+
+
+def _named_sizes(
+    table: ControlTable,
+    k: int,
+    name: str,
+    targets: Sequence[tuple[str, tuple[str, ...], object]] | None,
+    observations: Sequence[tuple[str, tuple[int, ...], object]] | None,
+    durations: Mapping[str, object] | None,
+) -> dict[str, int]:
+    """The level count of discrete control node ``k`` as each declaration beyond its readers
+    gives it, keyed by the declaration."""
+    out: dict[str, int] = {}
+    for key, parents, target in targets or ():
+        shape = getattr(target, "parent_shape", None)
+        if name in parents and shape is not None and len(shape) == len(parents):
+            out[f"the C_deps target on {key!r}"] = int(shape[parents.index(name)])
+    node = table.num_states + table.num_controls + k  # the node's action node in A_deps
+    for modality, deps, decl in observations or ():
+        if node not in deps:
+            continue
+        axes = _observation_axes(decl, len(deps))
+        size = None if axes is None else axes[deps.index(node)]
+        if size is not None:
+            out[f"modality {modality!r}"] = size
+    if durations and name in durations:
+        shape = np.shape(durations[name])
+        if len(shape) == 1:
+            out["params.durations"] = int(shape[0])
+    return out
+
+
 def control_space(
     table: ControlTable,
     transition: tuple,
     control: Mapping[str, object] | None,
     factor_names: tuple[str, ...],
+    *,
+    targets: Sequence[tuple[str, tuple[str, ...], object]] | None = None,
+    observations: Sequence[tuple[str, tuple[int, ...], object]] | None = None,
+    durations: Mapping[str, object] | None = None,
 ) -> ControlSpace:
     """Each control node's kind and size, read off the params; the flat layout when every node
     is continuous.
@@ -971,6 +1035,12 @@ def control_space(
     entry is its :class:`Box`, and every reader must read it as a float vector of the box's
     width. A node
     without one is discrete, its level count read off its readers' parent axes, which must agree.
+    A discrete node no reader sizes is sized by the other declarations that name it, which must
+    agree with each other: the parent axis of a conditional target (``targets``, one ``(key,
+    parents, target)`` per ``C_deps`` entry), the per-level axis of a modality that observes its
+    action node (``observations``, one ``(modality, A_deps entry, likelihood)`` per modality), and
+    the length of a per-level ``durations`` entry. A discrete node that nothing reads or sizes is
+    refused, as is a continuous node that nothing reads.
     Each sentence names what to pass instead.
     """
     names = table.control_names
@@ -1018,6 +1088,13 @@ def control_space(
     for k, name in enumerate(names):
         readers = table.readers[k]
         if kinds[k] == FLOAT:
+            if not readers:
+                raise ValueError(
+                    f"control node {name!r} has a box in params.control but no factor reads it, "
+                    "and a continuous node acts only through a reader's input: give a "
+                    f"transition a G term or a parent axis reading {name!r}, or drop its box "
+                    "to make it a discrete node a target, modality or durations entry sizes"
+                )
             dim = boxes[k].dim
             widths = {
                 factor_names[f]: w
@@ -1038,18 +1115,37 @@ def control_space(
             for f, pos in readers
             if (size := _level_axis(table, transition[f], f, pos, kinds)) is not None
         }
-        if not found:
-            raise ValueError(
-                f"control node {name!r}: none of its readers "
-                f"{[factor_names[f] for f, _ in readers]} carries an axis for it, so its level "
-                "count is unknown"
-            )
         if len(set(found.values())) > 1:
             raise ValueError(
                 f"control node {name!r} is read with different level counts {found}: every "
                 "factor that reads a control node must give it the same number of levels"
             )
-        sizes.append(next(iter(found.values())))
+        named = _named_sizes(table, k, name, targets, observations, durations)
+        if not found and not named:
+            if readers:
+                raise ValueError(
+                    f"control node {name!r}: none of its readers "
+                    f"{[factor_names[f] for f, _ in readers]} carries an axis for it, so its "
+                    "level count is unknown"
+                )
+            raise ValueError(
+                f"control node {name!r} is read by no factor and nothing else gives its level "
+                "count: a transition reading it, a C_deps target conditional on it, a modality "
+                "observing its action node, or a per-level params.durations entry sizes it; "
+                "declare one of these, or a box in params.control for a continuous node"
+            )
+        if found:
+            #  a reader's axis is the size; the other declarations that name the node are
+            #  checked against it where each is validated, which names the one that is off
+            sizes.append(next(iter(found.values())))
+            continue
+        if len(set(named.values())) > 1:
+            raise ValueError(
+                f"control node {name!r} is read by no factor and sized differently by the "
+                f"declarations that name it {named}: every target, modality and durations entry "
+                "that names a control node must give it the same number of levels"
+            )
+        sizes.append(next(iter(named.values())))
     layout = None
     if kinds and all(k == FLOAT for k in kinds):
         spans, at = [], 0

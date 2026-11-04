@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import jax.numpy as jnp
 from jax import Array
 
+from hybrid_aif.distributions import MLPConditional
 from hybrid_aif.factors import (
     LGObservation,
     LinearGaussianObservation,
@@ -276,31 +277,41 @@ def _eligible_state_blocks(
 
     Eligible modalities are the tabular ones, the LG modalities observing a continuous factor and
     the Gaussian emissions over categorical parents alone (whose information is about those
-    parents). A neural likelihood has no information-gain estimator and is not eligible. An
-    unobserved continuous factor (one no eligible channel observes) has no information to gain,
-    so it carries no ``infogain`` leaf; its entropy is the ``uncertainty`` row (design:
-    per-variable-infogain.md V11 decisions 4 and 7). Empty on the amortized path, whose state
-    epistemic term is resolved by :func:`_amortized_epistemic`.
+    parents). A neural likelihood is eligible as an LG modality is, over a continuous factor or
+    over categorical parents alone. An unobserved continuous factor (one no eligible channel
+    observes) has no information to gain, so it carries no ``infogain`` leaf; its entropy is the
+    ``uncertainty`` row (design: per-variable-infogain.md V11 decisions 4 and 7). Empty on the
+    amortized path, whose state epistemic term is resolved by :func:`_amortized_epistemic`.
     """
     if system._is_amortized(params):
         return (), ()
     if not system._is_hybrid(params):
         return tuple(range(len(params.likelihood))), ()
     families = system._families(params)
+
+    def emission_like(m: int) -> bool:
+        # a neural likelihood over categorical parents alone is planned as the Gaussian emission
+        # its parent configurations tabulate (design: recognition-beside-analytic.md L4)
+        a = params.likelihood[m]
+        return is_emission(a) or (
+            isinstance(a, MLPConditional) and _hybrid._categorical_only(system.A_deps[m], families)
+        )
+
     eligible_sig = tuple(
         m
         for m, a in enumerate(params.likelihood)
         if isinstance(a, TabularObservation)
-        or is_emission(a)
+        or emission_like(m)
         or (
-            isinstance(a, LGObservation)
+            isinstance(a, LGObservation | MLPConditional)
+            and system.A_deps[m][0] < len(families)
             and families[system.A_deps[m][0]] in (_hybrid.GAUSSIAN, _hybrid.MIXTURE)
         )
     )
     channelled = {
         system.A_deps[m][0]
         for m in eligible_sig
-        if isinstance(params.likelihood[m], LGObservation) and not is_emission(params.likelihood[m])
+        if isinstance(params.likelihood[m], LGObservation | MLPConditional) and not emission_like(m)
     }
     unobserved = tuple(
         f for f, fam in enumerate(families) if fam != _hybrid.CATEGORICAL and f not in channelled
@@ -437,13 +448,21 @@ def _resolve_param_novelty(
     )
     if sel is True:
         if unregistered and planning:
+            neural = tuple(k for k in unregistered if isinstance(table[k][2], MLPConditional))
+            hint = (
+                f" A learnable neural likelihood {sorted(neural)} has no parameter novelty: "
+                "plan with a frozen copy (dataclasses.replace(decl, frozen=True)), pass "
+                "epistemic=False, or pass a tuple naming the other variables."
+                if neural
+                else ""
+            )
             raise NotImplementedError(
                 f"epistemic=True with learnable slot(s) {sorted(unregistered)} whose "
                 "parameter family has no novelty estimator in the objectives registry "
                 "(continuous parameter novelty is deferred: design "
                 "parameter-learning.md D6/step 3, per-variable-infogain.md V4), and the "
                 "selector must not silently ignore a learnable slot. Pass an explicit "
-                "tuple naming the tabular variables to include, or False."
+                "tuple naming the tabular variables to include, or False." + hint
             )
         switching = tuple(
             f"likelihood:{system.modality_names[m]}"

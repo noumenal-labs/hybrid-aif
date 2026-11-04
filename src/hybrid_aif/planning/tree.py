@@ -118,15 +118,15 @@ def evaluate_policy_tree_total(
     The metrics-free sibling of :func:`evaluate_policy_tree`: each level's step
     tree is folded with :func:`~hybrid_aif.objectives.base.total` and added to the
     parent's G (an empty level passes it through), then the terminal terms. Seeded
-    with the step tree's static ``derived`` warrant. Returns the per-policy G and
+    with the step tree's static ``derived`` and ``approximate`` flags. Returns the per-policy G and
     the aligned policy set.
     """
     policies = enumerate_policies(num_controls, policy_len, controlled)
     actions = _first_step_actions(num_controls, controlled)
     b = actions.shape[0]
-    warrant = _step_warrant(init_qs, transition_fn, step_terms, policies)
+    warrant, approximate = _step_warrant(init_qs, transition_fn, step_terms, policies)
     qs = jtu.tree_map(lambda x: x[None], init_qs)
-    g = Interval(jnp.zeros((1,)), jnp.zeros((1,)), warrant)
+    g = Interval(jnp.zeros((1,)), jnp.zeros((1,)), warrant, approximate)
     for t in range(policy_len):
         qs, tree = expand_level(qs, actions, transition_fn, step_terms, t)
         g = _repeat_nodes(g, b)

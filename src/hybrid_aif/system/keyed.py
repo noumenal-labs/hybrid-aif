@@ -418,9 +418,9 @@ def _check_factor_columns(names: FaceNames, face: str) -> None:
     if names.controlled_factors is None:
         raise ValueError(
             f"{face}: a per-factor action holds each control node in a state factor's column, "
-            f"and two of the control nodes {list(names.actions)} are first read by the same "
-            "factor; use the System's own process (System.as_env), which takes one level per "
-            "control node"
+            f"and of the control nodes {list(names.actions)} two are first read by the same "
+            "factor or one is read by no factor; use the System's own process (System.as_env), "
+            "which takes one level per control node"
         )
 
 
@@ -572,6 +572,8 @@ def detail_in(names: FaceNames, detail: Any, face: str) -> InferenceDetail:
     else:
         out["unsupported"] = ()
     out["free_energy"] = detail.free_energy
+    out["recognition_log_evidence"] = detail.recognition_log_evidence
+    out["covered_terms"] = detail.covered_terms
     return InferenceDetail(**out)
 
 
@@ -581,6 +583,8 @@ def detail_out(names: FaceNames, detail: InferenceDetail) -> InferenceDetail:
     out = {f: observations_out(names, getattr(detail, f)) for f in _PER_MODALITY}
     out["unsupported"] = beliefs_out(names, detail.unsupported) if detail.unsupported else {}
     out["free_energy"] = detail.free_energy
+    out["recognition_log_evidence"] = detail.recognition_log_evidence
+    out["covered_terms"] = detail.covered_terms
     return InferenceDetail(**out)
 
 

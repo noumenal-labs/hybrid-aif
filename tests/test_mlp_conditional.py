@@ -31,7 +31,8 @@ import pytest
 
 from hybrid_aif.distributions import Categorical, ConditionalCategorical, Gaussian, MLPConditional
 from hybrid_aif.distributions.learnable import Learnable
-from hybrid_aif.inference.linear_gaussian import predict
+from hybrid_aif.inference.linear_gaussian import condition, predict
+from hybrid_aif.inference.linearise import linearise
 from hybrid_aif.objectives import registry
 from hybrid_aif.system import LearnState, System, SystemParams
 
@@ -267,11 +268,10 @@ def test_neural_transition_rejects_discrete_parents_and_mixture_priors():
         system._families(params)
 
 
-def test_neural_likelihood_is_declarable_but_conditioning_through_it_is_unbuilt():
-    """A1(a)/A1(b) split: the declaration is legal, rate-addressable and
-    gradient-learnable, but ``infer_states`` through a net needs an inference
-    strategy the registry does not have (structured filtering, or the P3
-    recognition row)."""
+def test_neural_likelihood_is_declarable_and_conditions_through_its_linearisation():
+    """The declaration is legal, rate-addressable and gradient-learnable, and ``infer_states``
+    conditions on it as on the linear-Gaussian model linearised at the prior belief, its
+    log evidence leaving the free energy (recognition-beside-analytic.md L1, L2)."""
     system = System(
         A_deps=((0,),),
         B_deps=((),),
@@ -299,8 +299,13 @@ def test_neural_likelihood_is_declarable_but_conditioning_through_it_is_unbuilt(
         "likelihood:y": 0.5,
         "transition:x": 0.5,
     }
-    with pytest.raises(NotImplementedError, match="A1\\(b\\), the P3 track"):
-        system.infer_states(params, {"y": jnp.asarray([0.3])})
+    prior = system.initial_priors(params)
+    post, detail = system.infer_states(params, {"y": jnp.asarray([0.3])}, detail=True)
+    H, c, R_chol = linearise(obs_net, prior["x"].loc, prior["x"].chol, (prior["x"].loc,), 0)
+    ref, log_ev = condition(prior["x"], H, c, R_chol, jnp.asarray([0.3]))
+    np.testing.assert_allclose(np.asarray(post["x"].loc), np.asarray(ref.loc), rtol=1e-6)
+    assert not np.allclose(np.asarray(post["x"].loc), np.asarray(prior["x"].loc))
+    np.testing.assert_allclose(float(detail.free_energy), -float(log_ev), rtol=1e-5)
     # ...while the FORWARD direction is fine: as_env samples observations through
     # the net (the direction a net is unproblematic in — A1's member (ii))
     env, ep = system.as_env(params)
@@ -321,14 +326,21 @@ def test_neural_likelihood_is_declarable_but_conditioning_through_it_is_unbuilt(
     assert not np.array_equal(
         np.asarray(out.likelihood["y"].layers[0].weight), np.asarray(obs_net.layers[0].weight)
     )
-    # a C designation over a neural modality would be silently dropped, so it raises —
-    # the one modality kind still fenced now that LG modalities are supported: a net has
-    # no closed-form pushforward of the belief to score the target against (A1)
+    # a C designation over a neural modality is a preference over its continuous observation
+    # (recognition-beside-analytic.md L4): a Gaussian over R^child_dim is admitted, a family
+    # that is not a density over R^child_dim is refused by name
     targeted = dataclasses.replace(params, obs_targets={"y": Categorical(logits=jnp.zeros(2))})
-    with pytest.raises(ValueError, match="obs_targets on neural modality"):
+    with pytest.raises(ValueError, match="obs_targets\\['y'\\].*neural modality"):
         system.update_empirical_prior(targeted, beliefs, {"a_x": jnp.asarray(0)})
-    with pytest.raises(ValueError, match="amortization.md A1"):
-        system.update_empirical_prior(targeted, beliefs, {"a_x": jnp.asarray(0)})
+    wrong_dim = dataclasses.replace(
+        params, obs_targets={"y": Gaussian(loc=jnp.zeros(2), chol=jnp.eye(2))}
+    )
+    with pytest.raises(ValueError, match="target dim 2 != .*observation dim 1 .*child_dim"):
+        system.update_empirical_prior(wrong_dim, beliefs, {"a_x": jnp.asarray(0)})
+    admitted = dataclasses.replace(
+        params, obs_targets={"y": Gaussian(loc=jnp.zeros(1), chol=jnp.eye(1))}
+    )
+    system.update_empirical_prior(admitted, beliefs, {"a_x": jnp.asarray(0)})
 
 
 # -------------------------------------------------------------- the prediction row (A1(a))

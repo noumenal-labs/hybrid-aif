@@ -107,6 +107,7 @@ def mask_absent(tree: TermTree, present_t: Array, modality_names: tuple[str, ...
                     jnp.where(keep, iv.lower, jnp.zeros_like(iv.lower)),
                     jnp.where(keep, iv.upper, jnp.zeros_like(iv.upper)),
                     iv.derived,
+                    iv.approximate,
                 )
             masked[key] = iv
         out[term] = masked

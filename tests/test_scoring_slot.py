@@ -45,7 +45,13 @@ GROUPS: dict[str, frozenset[str]] = {
     # 3: scoring material — no kernel of its own; interior to P(a|s)
     #    (``precision``: the policy precision scaling G in q_pi, read where ``System.gamma`` is)
     "scoring_material": frozenset(
-        {"obs_targets", "state_targets", "terminal_targets", "scoring", "precision"}
+        {
+            "obs_targets",
+            "state_targets",
+            "terminal_targets",
+            "scoring",
+            "precision",
+        }
     ),
 }
 
@@ -488,7 +494,7 @@ def test_the_row_stamps_its_warrant_as_an_and_never_an_assignment():
 # ------------------------------------------------------------------- composition
 
 
-def test_merging_a_component_with_a_g_side_names_the_key_grammar():
+def test_merging_a_component_with_scoring_names_the_key_grammar():
     """The addendum's second enforcement point. The obstacle is addressing, not
     mathematics: a row is addressed by row *name*, which namespacing deliberately
     does not qualify, so two components' critics would both answer to ``g_tail``."""
@@ -498,7 +504,7 @@ def test_merging_a_component_with_a_g_side_names_the_key_grammar():
         (dataclasses.replace(system, terms=()), params),  # structure alone
         (dataclasses.replace(system, terms=(), scoring=()), params),  # parameters alone
     ):
-        with pytest.raises(NotImplementedError, match="objective rows"):
+        with pytest.raises(NotImplementedError, match="scoring structure or parameters"):
             merge({"mind": broken_system}, {"mind": broken_params})
 
 

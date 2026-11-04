@@ -561,18 +561,12 @@ def test_every_face_that_does_not_read_an_observed_action_node_refuses_it():
                 {"push": jnp.zeros(2, jnp.int32)},
             ),
         ),
-        ("merge", lambda: merge({"m": system}, {"m": params})),
     ):
         with pytest.raises(NotImplementedError, match=remedy.format(face=face)):
             call()
     document, arrays = describe(system, params)  # a modality on an action node is a likelihood
     assert document["factors"]["feel"]["likelihood"]["parents"] == ["push"]
     assert build(document, arrays=arrays)[0] == system
-    plain, pp = pusher()
-    composite, cp = merge({"m": plain}, {"m": pp})
-    sensed = dataclasses.replace(composite, A_deps=((0,), (2,)), modality_names=("m.see", "m.feel"))
-    with pytest.raises(NotImplementedError, match=r"^subsystem: .*\['m.push'\], which subsystem"):
-        subsystem(sensed, cp, "m")
     #  the planning faces and the hybrid path's inference faces read it
     looking = dataclasses.replace(system, epistemic=True)
     tree = looking.score_policies(params, beliefs, looking.policies(params))

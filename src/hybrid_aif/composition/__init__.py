@@ -18,12 +18,14 @@ Design: docs/design/nesting-systems.md.
 
 from hybrid_aif.composition.couple import Wire, Wiring, couple
 from hybrid_aif.composition.driver import (
+    HoldCarry,
     MindCarry,
     MindRecord,
     ProcessRecord,
     Trajectory,
     agent_respond,
     ancestral_respond,
+    hold,
     run,
 )
 from hybrid_aif.composition.merge import (
@@ -41,6 +43,7 @@ from hybrid_aif.composition.merge import (
 __all__ = [
     "ActionControl",
     "BoundaryPrior",
+    "HoldCarry",
     "MindCarry",
     "MindRecord",
     "ObservationLink",
@@ -52,6 +55,7 @@ __all__ = [
     "agent_respond",
     "ancestral_respond",
     "couple",
+    "hold",
     "merge",
     "namespaced_key",
     "resolved_epistemic",

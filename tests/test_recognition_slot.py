@@ -559,10 +559,10 @@ def test_the_learned_initial_is_a_declaration_that_trains():
 
 
 def test_a_half_amortized_declaration_fails_at_the_declaration():
-    """``_is_amortized`` routes on the declaration families, and the amortized
-    validator then insists the rest of the model is one it can express — so a
-    tabular factor beside a code, or a recognition entry on a tabular System, is a
-    declaration error rather than a silent trip down the wrong path."""
+    """``_is_amortized`` routes on carries and codes, and the amortized validator then
+    insists the rest of the model is one it can express, so a code beside a mismatched
+    slot is a declaration error. A recognition entry on a tabular System routes analytic
+    and is checked there: an empty parent set is refused (R2)."""
     tabular_transition = MLPCategorical.from_shapes((8,), 3, 4, key=KEY, width=4, depth=1)
     system = System(
         A_deps=(),
@@ -586,7 +586,7 @@ def test_a_half_amortized_declaration_fails_at_the_declaration():
         )
     from hybrid_aif.distributions import Categorical, ConditionalCategorical
 
-    with pytest.raises(ValueError, match="not a transition declaration of the amortized path"):
+    with pytest.raises(ValueError, match="empty parent set is refused on the analytic path"):
         System(
             A_deps=(),
             B_deps=((),),
@@ -622,3 +622,96 @@ def test_a_continuous_action_reaches_the_carry_as_a_parent_vector():
     assert float(jnp.max(jnp.abs(left["deter"] - right["deter"]))) > 0.0
     with pytest.raises(ValueError, match="integer dtype"):
         system.predict_beliefs(params, beliefs, jnp.zeros((2, 1), jnp.int32))
+
+
+def _tabular_system(recognition=(), **kwargs):
+    from hybrid_aif.distributions import Categorical, ConditionalCategorical
+
+    system = System(
+        A_deps=(),
+        B_deps=((),),
+        controlled=(False,),
+        policy_len=1,
+        factor_names=("x",),
+        recognition=recognition,
+        **kwargs,
+    )
+    params = SystemParams(
+        transition={
+            "x": ConditionalCategorical(log_table=jnp.log(jnp.ones((2, 1)) / 2), parent_ndims=1)
+        },
+        initial_state_prior={"x": Categorical(logits=jnp.zeros(2))},
+    )
+    return system, params
+
+
+def test_routing_is_decided_by_carries_and_codes_only():
+    """A recognition entry, on the structure or in the slot, does not route a tabular System."""
+    system, params = _tabular_system(recognition=(Recognition("x", ("obs:y",)),))
+    module = MLPPredictor.from_shapes((2,), 2, key=KEY, width=2, depth=1)
+    params = dataclasses.replace(params, recognition={"x": module})
+    assert not system._is_amortized(params)
+    assert not System(
+        A_deps=(), B_deps=((),), controlled=(False,), policy_len=1, factor_names=("x",)
+    )._is_amortized(params)
+
+
+def test_the_analytic_path_refuses_what_presupposes_a_neural_factor():
+    system, params = _tabular_system()
+    head = PredictorHead.from_shapes((2,), loss="binary", key=KEY, width=2, depth=1)
+    with pytest.raises(
+        ValueError, match=r"PredictorHead.*Deterministic carry or an MLPCategorical"
+    ):
+        dataclasses.replace(system, A_deps=((0,),), modality_names=("y",))._validate(
+            dataclasses.replace(params, likelihood={"y": head})
+        )
+    for initial in (LearnedVector.zeros(2), DerivedInitial()):
+        with pytest.raises(ValueError, match=r"initial prior.*recognition-beside-analytic.md R1"):
+            system._validate(dataclasses.replace(params, initial_state_prior={"x": initial}))
+
+
+def test_the_mixed_case_keeps_its_refusal_and_points_to_r1():
+    """A code beside a tabular factor is refused by the amortized validator."""
+    code = MLPCategorical.from_shapes((8,), 3, 4, key=KEY, width=4, depth=1)
+    system = System(
+        A_deps=(),
+        B_deps=((), ()),
+        controlled=(False, False),
+        policy_len=1,
+        factor_names=("c", "x"),
+    )
+    _, tab = _tabular_system()
+    params = SystemParams(
+        transition={"c": code, **tab.transition},
+        initial_state_prior={"c": DerivedInitial(), **tab.initial_state_prior},
+    )
+    with pytest.raises(ValueError, match=r"recognition-beside-analytic.md R1"):
+        system._validate(params)
+
+
+def test_recognition_entries_are_checked_on_the_analytic_path():
+    def module(seed=0):
+        return MLPPredictor.from_shapes((2,), 2, key=jax.random.PRNGKey(seed), width=2, depth=1)
+
+    def check(recognition, slot, match):
+        system, params = _tabular_system(recognition=recognition)
+        system = dataclasses.replace(system, modality_names=())
+        with pytest.raises(ValueError, match=match):
+            system._validate(dataclasses.replace(params, recognition=slot))
+
+    entry = Recognition("x", ("obs:y",))
+    check((entry,), {}, "without a module")
+    check((), {"x": module()}, "module without a declaration")
+    check((Recognition("x", ("x",)),), {"x": module()}, r"bare factor name.*R2")
+    shared = module()
+    check(
+        (Recognition("a", ("external:e",)), Recognition("b", ("external:e",))),
+        {"a": shared, "b": shared},
+        "same module object",
+    )
+    check((Recognition("x", ("obs:nope",)),), {"x": module()}, "not readable")
+
+
+def test_the_raif_system_still_routes_neural():
+    system, params = _tiny()
+    assert system._is_amortized(params)

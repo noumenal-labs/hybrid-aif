@@ -284,8 +284,11 @@ class DescriptionLength(NamedTuple):
     family) and ``parameters`` (prior + posterior), the model part; ``data``, the data part
     (the trace's free energy summed along a replay; ``None`` for the model alone); ``total``,
     the model part plus the data part where there is one. ``per_address`` holds the links
-    behind the model part, ``exact`` whether every address's are exact (the data part's own
-    exactness is the replay's), ``unscored`` the
+    behind the model part, ``exact`` whether every address's are exact, ``data_exact`` whether
+    the data part is the exact free energy of the tick's posterior (``False`` where a neural
+    likelihood, an ``MLPConditional`` transition or a ``NonlinearGaussianTransition`` enters it,
+    each read through its linearisation, so the data part is the free energy of the linearised
+    model; ``None`` without a replay), ``unscored`` the
     ``(address, link)`` pairs reported ``None``. ``learned`` names the addresses a replay
     learned, whose family links the data part pays for instead (D6)."""
 
@@ -297,6 +300,7 @@ class DescriptionLength(NamedTuple):
     unscored: tuple[tuple[str, str], ...]
     data: float | None = None
     learned: tuple[str, ...] = ()
+    data_exact: bool | None = None
 
     @property
     def model(self) -> float:
@@ -839,7 +843,13 @@ def description_length(
 
     ``exact`` and :attr:`DescriptionLength.bits`' first two entries speak for the model part;
     the data part is the replay's free energy, the exact evidence where the tick's posterior is
-    exact and a bound elsewhere (``Replay``).
+    exact and a bound elsewhere (``Replay``). ``data_exact`` is ``False`` when a
+    neural likelihood, an ``MLPConditional`` transition or a ``NonlinearGaussianTransition``
+    enters the free energy (a neural modality ``replay.exercised`` reports absent at every valid
+    tick contributes no term and does not clear it): the data part is then the free energy of the
+    model those declarations linearise to, the ``approximate`` status of the planner's intervals
+    (design: recognition-beside-analytic.md L7). It is ``True`` otherwise, ``None`` without a
+    replay.
     """
     if isinstance(model, System):
         if params is None:
@@ -931,4 +941,19 @@ def description_length(
         unscored=tuple(u for u in out.unscored if not (u[1] == "family" and u[0] in learned)),
         data=data,
         learned=learned,
+        # design: recognition-beside-analytic.md L7 (the same status as `approximate`)
+        data_exact=not (
+            any(
+                isinstance(a, _dist.MLPConditional)
+                and (
+                    replay.exercised is None
+                    or bool(np.asarray(replay.exercised[system.modality_names[m]]))
+                )
+                for m, a in enumerate(params.likelihood)
+            )
+            or any(
+                isinstance(b, _dist.MLPConditional | _factors.NonlinearGaussianTransition)
+                for b in params.transition
+            )
+        ),
     )

@@ -789,7 +789,8 @@ CASES += [
         "observation with an initial",
         "T",
         put(F, "cue", "initial", {"family": "Categorical"}),
-        r"'cue' is observed, and an observation takes a likelihood \(every step\) and a target",
+        r"'cue' is observed, and an observation takes a likelihood \(every step\) "
+        r"and a target",
     ),
     (
         "likelihood reads a control node",

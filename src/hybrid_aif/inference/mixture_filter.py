@@ -145,19 +145,23 @@ def _per_mode(arr: Array, m: int, event_ndims: int) -> Array:
     return arr.reshape((m,) + event)
 
 
-def condition_mixture_switching(
+def condition_mixture_switching_components(
     m: MixtureGaussian,
     H: Array,
     c: Array,
     R_chol: Array,
     y: Array,
     mode_log_probs: Array,
-) -> tuple[MixtureGaussian, Array]:
+    per_component: bool = False,
+) -> tuple[MixtureGaussian, Array, Array]:
     """Grow-condition ``m`` on a switching LG observation with the mode uncertain.
 
     The model is ``y = H_j x + c_j + eps``, ``eps ~ N(0, R_j R_j^T)``, with mode prior
     ``mode_log_probs`` ``(..., M)`` (joint over the modality's categorical parents, row-major);
-    ``H``/``c``/``R_chol`` are shared or per-mode (:func:`_per_mode`). Each ``(component k, mode
+    ``H``/``c``/``R_chol`` are shared or per-mode (:func:`_per_mode`). With ``per_component`` they
+    are given per (component, mode) pair, ``(K, M, d_obs, d)``, ``(K, M, d_obs)`` and
+    ``(K, M, d_obs, d_obs)`` (a neural modality linearised at each component's mean), and every
+    pair is conditioned under its own model; the rest is as below. Each ``(component k, mode
     j)`` pair gets the exact Kalman condition under ``(H_j, c_j, R_j)`` with weight ``w_k · q(j) ·
     N(y; H_j mu_k + c_j, S_kj)``. Returns
 
@@ -165,7 +169,8 @@ def condition_mixture_switching(
       :func:`~hybrid_aif.inference.mixture_rollout.propagate`), log-weights normalized; reduce it
       afterwards under any schedule, ``runnalls`` included;
     - ``mode_log_evidence`` ``(..., M)``: ``log p(y | mode=j)``, normalized within each hypothesis
-      (the mode prior is not folded in, so :func:`switching_mode_message` counts it once).
+      (the mode prior is not folded in, so :func:`switching_mode_message` counts it once);
+    - ``log_marginal`` ``(..., K, M)``: ``log N(y; H_j mu_k + c_j, S_kj)`` per pair.
 
     Dead components stay dead; batch axes of ``m`` broadcast through.
 
@@ -173,9 +178,12 @@ def condition_mixture_switching(
     """
     mm = mode_log_probs.shape[-1]
     d = m.dim
-    Hs = _per_mode(H, mm, 2)  # (M, d_obs, d)
-    cs = _per_mode(c, mm, 1)  # (M, d_obs)
-    Rs = _per_mode(R_chol, mm, 2)  # (M, d_obs, d_obs)
+    if per_component:
+        Hs, cs, Rs = H, c, R_chol  # (K, M, ...)
+    else:
+        Hs = _per_mode(H, mm, 2)  # (M, d_obs, d)
+        cs = _per_mode(c, mm, 1)  # (M, d_obs)
+        Rs = _per_mode(R_chol, mm, 2)  # (M, d_obs, d_obs)
     comps = Gaussian(loc=m.means[..., :, None, :], chol=m.chols[..., :, None, :, :])  # (..., K, 1)
     post, log_marginal = condition(comps, Hs, cs, Rs, y[..., None, None, :])  # batch (..., K, M)
     prior_lw = log_softmax(m.log_weights, axis=-1)  # (..., K); dead stay -inf
@@ -187,6 +195,22 @@ def condition_mixture_switching(
         log_weights=grown_lw.reshape(batch + (m.num_components * mm,)),
         means=post.loc.reshape(batch + (m.num_components * mm, d)),
         chols=post.chol.reshape(batch + (m.num_components * mm, d, d)),
+    )
+    return grown, mode_log_evidence, log_marginal
+
+
+def condition_mixture_switching(
+    m: MixtureGaussian,
+    H: Array,
+    c: Array,
+    R_chol: Array,
+    y: Array,
+    mode_log_probs: Array,
+) -> tuple[MixtureGaussian, Array]:
+    """:func:`condition_mixture_switching_components` without the per-pair log-marginals:
+    the grown posterior and ``mode_log_evidence`` ``(..., M)``."""
+    grown, mode_log_evidence, _ = condition_mixture_switching_components(
+        m, H, c, R_chol, y, mode_log_probs
     )
     return grown, mode_log_evidence
 

@@ -171,6 +171,13 @@ class GridNoiseMap(NoiseMap):
     new trace: a map in a frame that moves with the agent is resampled onto a fixed body-frame
     grid each step, the grid's own axes staying aligned with the state's. A point map: no
     prior and no learning.
+
+    A map over a modality's categorical parents (an action node counts) carries one leading
+    level axis per parent, in ``A_deps`` order: ``values`` is ``(*levels, *grid_shape, d_obs,
+    d_obs)``, the leading axes being whatever ``values`` has beyond the grid and the factor
+    (:attr:`n_levels`). A level is selected first (:meth:`select`) and the grid read at the mean
+    after, so a levelled map at one level is the plain map declared for that level. Called
+    directly it returns every level's factor, ``(*levels, *batch, d_obs, d_obs)``.
     """
 
     values: Array
@@ -185,22 +192,31 @@ class GridNoiseMap(NoiseMap):
         self.low = jnp.broadcast_to(jnp.asarray(low, self.values.dtype), (k,))
         self.high = jnp.broadcast_to(jnp.asarray(high, self.values.dtype), (k,))
 
+    @property
+    def n_levels(self) -> int:
+        """How many leading level axes ``values`` carries (zero for a plain map)."""
+        return self.values.ndim - len(self.axes) - 2
+
+    @property
+    def levels(self) -> tuple[int, ...]:
+        """The sizes of the leading level axes, in ``A_deps`` order of the parents."""
+        return tuple(self.values.shape[: self.n_levels])
+
     def __check_init__(self) -> None:
         k = len(self.axes)
-        if self.values.ndim != k + 2:
+        if self.values.ndim < k + 2:
             raise ValueError(
-                f"GridNoiseMap: values has {self.values.ndim} axes, expected {k + 2}: one grid "
-                f"axis per entry of axes={self.axes} and the (d_obs, d_obs) factor"
+                f"GridNoiseMap: values has {self.values.ndim} axes, expected at least {k + 2}: "
+                f"one grid axis per entry of axes={self.axes} and the (d_obs, d_obs) factor, "
+                "after any leading level axes"
             )
         if self.values.shape[-1] != self.values.shape[-2]:
             raise ValueError(
                 f"GridNoiseMap: values' trailing shape {self.values.shape[-2:]} is not square"
             )
-        if any(n < 2 for n in self.values.shape[:k]):
-            raise ValueError(
-                "GridNoiseMap: every grid axis needs at least two nodes, got "
-                f"{self.values.shape[:k]}"
-            )
+        grid = self.values.shape[self.n_levels : self.n_levels + k]
+        if any(n < 2 for n in grid):
+            raise ValueError(f"GridNoiseMap: every grid axis needs at least two nodes, got {grid}")
         if len(set(self.axes)) != k:
             raise ValueError(f"GridNoiseMap: axes={self.axes} names a coordinate twice")
         if any(a < 0 for a in self.axes):
@@ -221,24 +237,41 @@ class GridNoiseMap(NoiseMap):
     def obs_dim(self) -> int:
         return self.values.shape[-1]
 
+    def select(self, levels: tuple[Array, ...]) -> "GridNoiseMap":
+        """The plain map at one level of each categorical parent: the leading level axes
+        indexed at ``levels`` (integer scalars, traced or not), in order."""
+        if len(levels) != self.n_levels:
+            raise ValueError(
+                f"GridNoiseMap: {len(levels)} level(s) given for a map with {self.n_levels} "
+                "level axis/es"
+            )
+        values = self.values
+        for level in levels:
+            values = jnp.take(values, level, axis=0)
+        return eqx.tree_at(lambda m: m.values, self, values)  # no re-validation: may be traced
+
     def __call__(self, loc: Array) -> Array:
-        """``R_chol`` at ``loc`` (``(..., d)``): ``(..., d_obs, d_obs)``."""
+        """``R_chol`` at ``loc`` (``(..., d)``): ``(..., d_obs, d_obs)``, or ``(*levels, ...,
+        d_obs, d_obs)`` for a levelled map."""
         loc = jnp.asarray(loc)
-        k = len(self.axes)
-        sizes = jnp.asarray(self.values.shape[:k], loc.dtype)
+        k, nl = len(self.axes), self.n_levels
+        sizes = jnp.asarray(self.values.shape[nl : nl + k], loc.dtype)
         coords = jnp.stack([loc[..., a] for a in self.axes], axis=-1)
         coords = (coords - self.low) / (self.high - self.low) * (sizes - 1.0)
         coords = jnp.clip(coords, 0.0, sizes - 1.0)
         base = jnp.minimum(jnp.floor(coords), sizes - 2.0)
         frac = coords - base
         base = base.astype(jnp.int32)
-        out = jnp.zeros((*loc.shape[:-1], *self.values.shape[-2:]), self.values.dtype)
+        out = jnp.zeros(
+            (*self.values.shape[:nl], *loc.shape[:-1], *self.values.shape[-2:]), self.values.dtype
+        )
+        whole = (slice(None),) * nl
         for corner in itertools.product((0, 1), repeat=k):
             index = tuple(base[..., j] + corner[j] for j in range(k))
             weight = jnp.ones(loc.shape[:-1], self.values.dtype)
             for j in range(k):
                 weight = weight * (frac[..., j] if corner[j] else 1.0 - frac[..., j])
-            out = out + weight[..., None, None] * self.values[index]
+            out = out + weight[..., None, None] * self.values[whole + index]
         return out
 
 
@@ -326,10 +359,17 @@ class LinearGaussianObservation(eqx.Module):
         a value or a posterior."""
         return _is_noise_map(self.noise)
 
+    @property
+    def noise_levels(self) -> int:
+        """How many leading level axes the noise map carries, one per categorical parent (zero
+        for a plain map, a point or a posterior)."""
+        return self.noise.n_levels if self.noise_map and hasattr(self.noise, "n_levels") else 0
+
     def R_chol_at(self, loc: Array) -> Array:
         """The noise as an ``R_chol`` array at a belief's mean ``loc``: a point or conjugate
         noise is the same everywhere; a noise map is evaluated there, the extended filter's
-        convention (design: planning-with-observations.md D3)."""
+        convention (design: planning-with-observations.md D3). A levelled map returns every
+        level's factor, leading ``(*levels, ...)`` like a per-mode ``R_chol``."""
         if self.noise_map:
             return self.noise(loc)
         return self.R_chol

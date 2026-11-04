@@ -23,7 +23,9 @@ from hybrid_aif.distributions import (
     ConditionalCategorical,
     ConditionalDirichlet,
     ConditionalGaussian,
+    MLPConditional,
 )
+from hybrid_aif.distributions.neural import LearnedVector, PredictorHead
 from hybrid_aif.factors import (
     DerivedInitial,
     GradientDeclaration,
@@ -31,6 +33,7 @@ from hybrid_aif.factors import (
     LinearGaussianObservationMNIW,
     TabularObservation,
 )
+from hybrid_aif.inference import amortized as _amortized
 from hybrid_aif.objectives import hybrid as _hybrid
 from hybrid_aif.objectives import registry
 from hybrid_aif.system.selectors import (
@@ -116,12 +119,102 @@ def _validate_dims(system: System, params: SystemParams) -> None:
             )
 
 
-def _validate(system: System, params: SystemParams, face: str = "this face") -> None:
+def _validate_analytic_declaration(system: System, params: SystemParams) -> None:
+    """Refuse what belongs to the neural path, and check the recognition entries' structure."""
+    facs = system._facs
+    for m, head in enumerate(params.likelihood):
+        if isinstance(head, PredictorHead):
+            raise ValueError(
+                f"modality {system.modality_names[m]!r} is a PredictorHead, a family of the "
+                "neural path, where every factor is a Deterministic carry or an MLPCategorical "
+                "code; use an analytic likelihood here (design: recognition-beside-analytic.md R1)"
+            )
+    for f, d in enumerate(params.initial_state_prior):
+        if isinstance(d, LearnedVector | DerivedInitial):
+            raise ValueError(
+                f"factor {facs[f]!r} declares a {type(d).__name__} initial prior, a family of "
+                "the neural path, where every factor is a Deterministic carry or an "
+                "MLPCategorical code; use an analytic initial prior here (design: "
+                "recognition-beside-analytic.md R1)"
+            )
+    _amortized.check_recognition_entries(system.recognition, params.recognition)
+    if not system.recognition:
+        return
+    s = len(system.B_deps)
+    families = system._families(params)[:s]
+    if system.mixture_schedule != "mode_aligned":
+        for entry in system.recognition:
+            if entry.variable in facs and families[facs.index(entry.variable)] == _hybrid.MIXTURE:
+                raise ValueError(
+                    f"recognition:{entry.variable}: a measurement of the mixture-carried factor "
+                    f"{entry.variable!r} under mixture_schedule={system.mixture_schedule!r}, "
+                    "where a cross-mode Runnalls merge destroys the per-mode evidence the "
+                    "update needs, as for a modality over it; declare "
+                    'System(mixture_schedule="mode_aligned") '
+                    "(recognition-beside-analytic.md R3)"
+                )
+    kinds = tuple(
+        _amortized.CATEGORICAL_KIND if fam == _hybrid.CATEGORICAL else _amortized.GAUSSIAN_KIND
+        for fam in families
+    )
+    widths = tuple(
+        _factor_levels(params, f) if fam == _hybrid.CATEGORICAL else _factor_dim(params, f)
+        for f, fam in enumerate(families)
+    )
+    obs_widths = tuple(
+        a.child_dim
+        if isinstance(a, MLPConditional)
+        else a.H.shape[-2]
+        if isinstance(a, LGObservation)
+        else None
+        for a in params.likelihood
+    )
+    _amortized.check_analytic_recognition(
+        system.recognition,
+        params.recognition,
+        system.modality_names,
+        facs[:s],
+        tuple(system._table.control_names),
+        kinds,
+        widths,
+        obs_widths,
+        system.external_inputs,
+        tuple(isinstance(a, TabularObservation) for a in params.likelihood),
+    )
+
+
+def _validate_propagation_slots(system: System, params: SystemParams) -> None:
+    """Refuse a non-default ``propagation`` on an ``MLPConditional`` outside the ``likelihood``
+    slot, where it is not read (design: recognition-beside-analytic.md L4)."""
+    for slot in ("transition", "recognition"):
+        decls = getattr(params, slot, None)
+        if not decls:
+            continue
+        names = (
+            tuple(decls)
+            if isinstance(decls, Mapping)
+            else (system._facs if slot == "transition" else range(len(decls)))
+        )
+        items = decls.values() if isinstance(decls, Mapping) else decls
+        for name, decl in zip(names, items, strict=False):
+            if isinstance(decl, MLPConditional) and decl.propagation != "first_order":
+                raise ValueError(
+                    f"{slot}[{name!r}]: an MLPConditional declares propagation="
+                    f"{decl.propagation!r}, which is read only on a likelihood (how a Gaussian "
+                    "belief on the observed factor is pushed through the network); a "
+                    f'{slot} entry ignores it. Leave it at the default "first_order" here'
+                )
+
+
+def _validate(
+    system: System, params: SystemParams, face: str = "this face", declared: bool = False
+) -> None:
     """Fail loudly on keys that name nothing and on ill-formed structure.
 
     Keys are designation keys and selector names; structure covers ``D_deps`` / ``H_deps``, hybrid
     family pairing, within-step ordering, family-pure modalities, a missing ``mixture_k``, and the
-    amortized path's own declaration.
+    amortized path's own declaration. ``declared`` says the caller has already run
+    :func:`_validate_analytic_declaration` on these parameters.
     """
     mods, facs = (system.modality_names, system._facs)
     targeted_controls = set(facs) | set(
@@ -139,7 +232,10 @@ def _validate(system: System, params: SystemParams, face: str = "this face") -> 
                 f"{what}: unknown block name(s) {sorted(unknown)}; "
                 f"known blocks are {sorted(allowed)}"
             )
+    if not declared and not system._is_amortized(params):
+        _validate_analytic_declaration(system, params)
     _validate_dims(system, params)
+    _validate_propagation_slots(system, params)
     system._term_targets(params, planning=False)  # one namespace, V1/V5.3
     system._dim_selections(params)  # a sub-block of a mixture-carried factor raises
     _validate_lagged(system, params)

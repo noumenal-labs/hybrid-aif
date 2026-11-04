@@ -9,7 +9,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from hybrid_aif import System
+from hybrid_aif import System, SystemParams
+from hybrid_aif.distributions import Categorical, ConditionalCategorical
 from hybrid_aif.reference.raif.world import tiny_rssm
 from tests.test_mlp_conditional import _mlp_transition_system
 from tests.test_shared_controls import shared_model, two_control_model
@@ -174,14 +175,24 @@ def test_sugar_validation_sentences():
             factor_names=("a", "u_a"),
             policy_len=1,
         )
-    with pytest.raises(ValueError, match="read by no factor"):
-        System(
-            B_deps=((), ()),
-            controls=(1,),
-            factor_names=("a", "u_go"),
-            action_names=("go",),
-            policy_len=1,
-        )
+    #  a node no factor reads is admitted at construction, since a target, a modality over its
+    #  action node or a durations entry may size it; the refusal waits for the params
+    unread = System(
+        B_deps=((), ()),
+        controls=(1,),
+        factor_names=("a", "u_go"),
+        action_names=("go",),
+        policy_len=1,
+    )
+    params = SystemParams(
+        likelihood={},
+        transition={
+            "a": ConditionalCategorical(log_table=jnp.log(jnp.eye(2)[:, :, None]), parent_ndims=2)
+        },
+        initial_state_prior={"a": Categorical(logits=jnp.zeros(2))},
+    )
+    with pytest.raises(ValueError, match="read by no factor and nothing else gives"):
+        unread.initial_priors(params)
 
 
 def test_node_beliefs_at_the_faces():

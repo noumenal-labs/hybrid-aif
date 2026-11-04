@@ -116,7 +116,7 @@ def _lower_learnable(params: SystemParams, param_key: Array | None) -> SystemPar
 # -------------------------------------------------------------- one tick's statistic
 
 
-def _belief_value(q: Belief) -> Array:
+def belief_value(q: Belief) -> Array:
     """A belief's point evidence for a neural slot: the posterior mean.
 
     Uniform across families by the ``Distribution.mean()`` contract — a
@@ -154,10 +154,10 @@ def _mlp_evidence(
       belief to a mixture — see ``objectives.hybrid.factor_families``).
     """
     if slot == "likelihood":
-        parents = tuple(_belief_value(beliefs[g]) for g in system.A_deps[i])
+        parents = tuple(belief_value(beliefs[g]) for g in system.A_deps[i])
         return jnp.asarray(observations[i]), parents
-    child = _belief_value(beliefs[i])
-    parents = (_belief_value(prev_beliefs[i]),)
+    child = belief_value(beliefs[i])
+    parents = (belief_value(prev_beliefs[i]),)
     for k, _ in system._table.control_parents[i]:
         value = node_entry(action, k, space.layout)
         parents += (

@@ -252,6 +252,19 @@ control; the one-hot followed by the first weight matrix is a learned embedding,
 missing on the neural reader. *(Amended, Alex, 2026-10-08: an earlier version refused a discrete
 node on this reader, on a premise that was wrong.)*
 
+*Amendment 2026-11-03: a node no transition reads is admitted when something else sizes it.* The
+rule that a control node be read by at least one transition (a stand-in for its own prior) is
+relaxed for a discrete node. A reader's parent axis sizes it as before, and the other
+declarations that name it are checked against that size where each is validated. A node no
+reader sizes takes its level count from the declarations that name it, which must agree with
+each other: the parent axis of a `C_deps` target; the per-level axis of a modality that
+observes its action node; the length of a per-level `durations` entry. A box in
+`params.control` sizes a continuous node as before. The node is refused only when nothing
+reads or sizes it, in the sentence that lists these ways. The
+option node of a held mind (step-durations.md T9) is the case: the fast tier reads it only
+through a target, a modality or a duration. The sugar form (`controlled=`) keeps its refusal,
+having no other declaration to size an unread node.
+
 *The planner for the LQ demo (Alex, 2026-10-08):* a gradient planner joins the registry: it descends
 `score_policies` in the float plan with projection onto the box, the mode of `q(π) ∝ exp(−G)` over
 continuous plans, as enumeration is its exact form over a finite set and CEM its sampling form. The

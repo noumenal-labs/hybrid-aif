@@ -4,8 +4,10 @@
 import dataclasses
 from collections.abc import Iterable, Mapping
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 from hybrid_aif.controls import ControlSpace
@@ -26,6 +28,7 @@ from hybrid_aif.system.core import (
     LearnState,
     SystemParams,
 )
+from hybrid_aif.system.faces import infer as _infer
 
 
 def _absorbing(key: str, decl, stats, lr, decay):
@@ -50,6 +53,8 @@ def learn(
     detail: InferenceDetail | None = None,
     learn_state: "LearnState | None" = None,
     prior: SystemParams | None = None,
+    priors: Mapping[str, Belief] | None = None,
+    externals: Mapping[str, Array] | None = None,
 ) -> "SystemParams | tuple[SystemParams, LearnState]":
     params = system._params_in(params, "learn")
     names = system._names(params)
@@ -69,6 +74,8 @@ def learn(
         learn_state=learn_state,
         face="learn",
         prior=None if prior is None else system._params_in(prior, "learn"),
+        priors=None if priors is None else system._beliefs_in(params, priors, "learn"),
+        externals=externals,
     )
     if isinstance(out, tuple):
         return system._params_out(out[0]), out[1]
@@ -92,11 +99,14 @@ def _learn(
     present: tuple[bool | Array, ...] | None = None,
     prior: SystemParams | None = None,
     grow: bool = True,
+    priors: tuple[Belief, ...] | None = None,
+    externals: Mapping[str, Array] | None = None,
 ) -> "SystemParams | tuple[SystemParams, LearnState]":
     """:meth:`learn` over positional tuples and the positional action. ``present`` is one
     flag per modality: a modality absent at the tick teaches its likelihood slot nothing
     (a static ``False`` skips it, a traced flag scales its rate). ``grow`` runs the growth
-    step and the reduction schedule; the batch form of growth calls back with it off."""
+    step and the reduction schedule; the batch form of growth calls back with it off. ``priors``
+    is the tuple of prior beliefs the tick's inference read (see :func:`learn`)."""
     system._refuse_sensed(face)
     params = system._p(params)
     prior = None if prior is None else system._p(prior)
@@ -115,6 +125,7 @@ def _learn(
     system._validate(params, face)
     mods, facs = (system.modality_names, system._facs)
     lr_rates = system._resolve_rates(lr_by_slot, "lr_by_slot", params)
+    _refuse_recognition_rates(params, lr, lr_rates)
     decay_rates = system._resolve_rates(decay_by_slot, "decay_by_slot", params)
     if len(observations) != len(params.likelihood):
         raise ValueError(
@@ -303,20 +314,29 @@ def _learn(
                 "produced this tick, from the carry — it is the net's one-hot parent)"
             )
     opt = system._resolve_learn_state(learn_state, grad_slots)
+    tick_priors = None
+    if any(slot == "likelihood" for _, slot, _, _, _ in grad_active):
+        tick_priors = _tick_priors(system, params, priors, prev_beliefs, action, face)
     for key, slot, i, decl, r in grad_active:
-        child, parents = _mlp_evidence(
-            system,
-            slot,
-            i,
-            decl,
-            observations,
-            beliefs,
-            prev_beliefs,
-            action,
-            system._space(params),
-        )
+        if slot == "likelihood":
+            stats = _likelihood_stats(
+                system, params, i, decl, observations, tick_priors, present, externals, face
+            )
+        else:
+            child, parents = _mlp_evidence(
+                system,
+                slot,
+                i,
+                decl,
+                observations,
+                beliefs,
+                prev_beliefs,
+                action,
+                system._space(params),
+            )
+            stats = decl.stats(child, parents)
         updated, opt[key] = decl.absorb(
-            decl.stats(child, parents),
+            stats,
             opt[key],
             lr=r,
             decay=rate(key, decay, decay_rates),
@@ -435,6 +455,39 @@ def grow(
     return system._params_out(_structure.grow_batch(system, params, obs, f, int(rounds), lr))
 
 
+def _refuse_recognition_rates(params: SystemParams, lr, resolved) -> None:
+    """Refuse a nonzero resolved rate on a recognition module: on the analytic path it is frozen.
+
+    ``resolved`` is the ``lr_by_slot`` mapping after the specificity ladder
+    (``System._resolve_rates``), so a rate reaches a module however its key is spelled; a module
+    no key reaches takes the base ``lr``. An explicit zero (a Python number or a concrete
+    array) is accepted, and so is a frozen module; a traced rate is refused.
+    """
+
+    def nonzero(r) -> bool:
+        if isinstance(r, jax.core.Tracer):
+            raise ValueError(
+                "a recognition module's rate is traced, so it cannot be checked as zero; "
+                "give the recognition slot a static zero (lr_by_slot={'recognition:<name>': 0.0})"
+            )
+        return bool(np.any(np.asarray(r) != 0.0))
+
+    mapping = {} if resolved is None else resolved
+    for variable, module in params.recognition.items():
+        key = f"recognition:{variable}"
+        addressed = [k for k in mapping if k == key or k.startswith(key + ":")]
+        rates = [mapping[k] for k in addressed]
+        if not addressed and getattr(module, "learnable", False):
+            rates = [lr]
+        if any(nonzero(r) for r in rates):
+            raise ValueError(
+                f"{key}: a recognition module is frozen on the analytic path, so its rate must "
+                f"be zero (lr_by_slot={{{key!r}: 0.0}}, or freeze the module); training it "
+                "means minimising the free energy through the sweep "
+                "(recognition-beside-analytic.md R5)"
+            )
+
+
 def _gradient_slots(
     system, params: SystemParams
 ) -> tuple[tuple[str, str, int, MLPConditional], ...]:
@@ -447,7 +500,9 @@ def _gradient_slots(
     return tuple(
         (key, slot, i, decl)
         for key, (slot, i, decl) in system._slot_declarations(params).items()
-        if slot != "scoring" and _gradient_learnable(decl)
+        if slot != "scoring"
+        and not (slot == "recognition" and not system._is_amortized(params))
+        and _gradient_learnable(decl)
     )
 
 
@@ -502,8 +557,55 @@ def _resolve_learn_state(
     return dict(learn_state.opt_states)
 
 
-def _belief_value(q: Belief) -> Array:
-    return conjugate_stats._belief_value(q)
+def _tick_priors(
+    system,
+    params: SystemParams,
+    priors: tuple[Belief, ...] | None,
+    prev_beliefs: tuple[Belief, ...] | None,
+    action: Array | None,
+    face: str,
+) -> tuple[Belief, ...]:
+    """The prior beliefs the tick's inference read: ``priors`` as given, else the prediction from
+    the previous tick's beliefs and action when both are present, else the initial priors."""
+    if priors is not None:
+        return priors
+    if prev_beliefs is not None:
+        return _infer._update_empirical_prior(system, params, prev_beliefs, action, face=face)
+    return tuple(system._initial_priors(params, face))
+
+
+def _likelihood_stats(
+    system,
+    params: SystemParams,
+    m: int,
+    decl: MLPConditional,
+    observations: tuple[Array, ...],
+    priors: tuple[Belief, ...],
+    present: tuple[bool | Array, ...] | None,
+    externals: Mapping[str, Array] | None,
+    face: str,
+) -> MLPConditional:
+    """The gradient, in the declaration's parameters, of the free energy ``infer_states`` reports
+    for the tick: the inference pass itself, run from the tick's ``priors`` with every other
+    input held fixed, differentiated with respect to modality ``m``'s decoder. One objective
+    serves inference and learning (design: recognition-beside-analytic.md L5).
+    """
+
+    def free_energy(d: MLPConditional) -> Array:
+        likelihood = tuple(d if i == m else a for i, a in enumerate(params.likelihood))
+        _, info = _infer._infer_states_expected(
+            system,
+            dataclasses.replace(params, likelihood=likelihood),
+            observations,
+            priors,
+            True,
+            externals,
+            present,
+            face=face,
+        )
+        return info.free_energy
+
+    return eqx.filter_grad(free_energy)(decl)
 
 
 def _mlp_evidence(

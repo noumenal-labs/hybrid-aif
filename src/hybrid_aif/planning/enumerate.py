@@ -334,12 +334,12 @@ def evaluate_policies_total(
     folded with :func:`~hybrid_aif.objectives.base.total` at once, so no leaves
     are stacked; equal up to float reassociation. An empty step tree (a
     terminal-only System) skips the per-step fold. The accumulator is seeded with
-    the step tree's static ``derived`` flag (:func:`_step_warrant`), keeping the
-    scan carry's structure fixed. Like :func:`evaluate_policies` it takes a pytree of ``(P, H,
+    the step tree's static ``derived`` and ``approximate`` flags (:func:`_step_warrant`), keeping
+    the scan carry's structure fixed. Like :func:`evaluate_policies` it takes a pytree of ``(P, H,
     ...)`` leaves (a :class:`~hybrid_aif.controls.ControlStep`) as the policy set.
     """
 
-    warrant = _step_warrant(init_qs, transition_fn, step_terms, policies)
+    warrant, approximate = _step_warrant(init_qs, transition_fn, step_terms, policies)
 
     def eval_one(policy: Array) -> Interval:
         def body(carry: tuple[Beliefs, Interval], xs: tuple[Array, Array]):
@@ -350,7 +350,7 @@ def evaluate_policies_total(
             return (qs_next, (g + total(tree)) if tree else g), None
 
         ts = jnp.arange(jtu.tree_leaves(policies)[0].shape[1], dtype=jnp.int32)
-        init = (init_qs, Interval(jnp.zeros(()), jnp.zeros(()), warrant))
+        init = (init_qs, Interval(jnp.zeros(()), jnp.zeros(()), warrant, approximate))
         (qs_final, g), _ = jax.lax.scan(body, init, (policy, ts))
         if terminal_terms is not None:
             g = g + total(terminal_terms(qs_final))
@@ -361,8 +361,8 @@ def evaluate_policies_total(
 
 def _step_warrant(
     init_qs: Beliefs, transition_fn: TransitionFn, step_terms: StepTermsFn, policies: Array
-) -> bool:
-    """Whether one step's folded G is a *derived* quantity, read statically.
+) -> tuple[bool, bool]:
+    """Whether one step's folded G is *derived* and whether it is *approximate*, read statically.
 
     Uses ``jax.eval_shape``, so no computation is emitted. An empty step tree is
     vacuously derived.
@@ -374,7 +374,8 @@ def _step_warrant(
     spec = jax.eval_shape(
         one_step, init_qs, jtu.tree_map(lambda x: x[0, 0], policies), jnp.int32(0)
     )
-    return all(iv.derived for blocks in spec.values() for iv in blocks.values())
+    leaves = [iv for blocks in spec.values() for iv in blocks.values()]
+    return all(iv.derived for iv in leaves), any(iv.approximate for iv in leaves)
 
 
 @register_planner("enumeration")

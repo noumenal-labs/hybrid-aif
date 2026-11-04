@@ -378,6 +378,18 @@ an opt-in, not a second mechanism. Convergence noted: workstream H's transducers
 frozen case of the same declaration shape — pixels at P3 land in
 this home.
 
+*Amendment 2026-11-03 (Alex + Fable; `recognition-beside-analytic.md`).* Two changes to the
+reading above, both for the analytic path. (1) Routing: a recognition entry no longer routes a
+System to the neural state-space path; that path is taken only by a System declaring a
+`Deterministic` carry or an `MLPCategorical` code (R1 there). (2) Reading: on the neural path a
+recognition entry's output is the variable's posterior, as above; on the analytic path it is a
+measurement of its variable, the brief's pseudo-observation, combined with the analytic evidence
+as a product (R3 there), which is why "a variable without an entry falls back to the
+structured/exact row" now holds in code. A module read as a measurement must be calibrated as a
+likelihood, not a posterior under a training prior. Parents on the analytic path are observed,
+external and earlier recognition variables; the module is frozen there in this release. Under E
+this is a structured q with one likelihood-type factor, so the restricted syntax retracts nothing.
+
 ### A12 — chunk 2b adjudications (Alex + Fable/Opus, 2026-08-20 → 25)
 
 The six decisions 2b was dispatched on, previously recorded only in the

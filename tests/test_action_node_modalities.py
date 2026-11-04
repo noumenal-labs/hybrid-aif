@@ -575,7 +575,6 @@ def test_the_closed_loop_credits_the_reading_a_level_buys():
 
 
 def test_the_faces_that_do_not_read_the_node_keep_their_refusals(monkeypatch):
-    from hybrid_aif.composition.merge import merge
     from hybrid_aif.replay import replay
 
     system, params = scalar_model()
@@ -590,7 +589,6 @@ def test_the_faces_that_do_not_read_the_node_keep_their_refusals(monkeypatch):
                 system, params, {"y": jnp.zeros((2, 1))}, {"a": jnp.zeros(2, jnp.int32)}
             ),
         ),
-        ("merge", lambda: merge({"m": system}, {"m": params})),
     ):
         with pytest.raises(NotImplementedError, match=remedy.format(face=face)):
             call()
@@ -605,7 +603,7 @@ def test_the_faces_that_do_not_read_the_node_keep_their_refusals(monkeypatch):
 
 
 def test_the_cases_the_selection_does_not_cover_are_refused_with_a_sentence():
-    #  a noise map on a selecting channel is not built, as on a switching one
+    #  a noise map on a selecting channel needs a level axis per parent
     from hybrid_aif.factors import GridNoiseMap
     from tests.test_action_nodes import _hybrid_sensed
 
@@ -615,7 +613,8 @@ def test_the_cases_the_selection_does_not_cover_are_refused_with_a_sentence():
         c=jnp.zeros(1),
         noise=GridNoiseMap(values=jnp.ones((2, 1, 1)), low=-1.0, high=1.0, axes=(0,)),
     )
-    with pytest.raises(NotImplementedError, match="noise map on a switching LG observation"):
+    #  a map with no level axis leaves the reading independent of the node
+    with pytest.raises(ValueError, match="does not depend on the mode"):
         system.infer_states(
             dataclasses.replace(params, likelihood={"y": mapped}),
             {"y": jnp.zeros(1)},

@@ -49,7 +49,26 @@ class InferenceDetail(eqx.Module):
     #   factor. Read off the tabular FPI stage, before any LG mode message.
     free_energy: Array | None = None
     #   The tick's variational free energy, a scalar: the mean-field posteriors' KL from their
-    #   priors less the expected tabular log-likelihoods, less every LG modality's integrated
-    #   log-evidence. ``−free_energy`` bounds the tick's log evidence from below and equals it
-    #   where every modality is LG or one categorical factor carries every tabular one
+    #   priors less the expected tabular log-likelihoods, less every LG or neural modality's
+    #   integrated log-evidence (a neural modality's read linearised at the belief the factor holds
+    #   when the modality is reached, so the bound is on the linearised model: the
+    #   ``approximate`` status of the planner's intervals),
+    #   plus ``- log Z + E_q[log m]`` for each recognition message ``m`` and ``- E_q[log p(o | s)]``
+    #   under the final belief for each modality a recognition entry covers. ``-free_energy``
+    #   bounds the tick's log evidence from below and equals it where every modality is LG or
+    #   one categorical factor carries every tabular one
     #   (``inference.discrete.mean_field_free_energy``). ``None`` on the amortized path.
+    recognition_log_evidence: Mapping[str, Array] = eqx.field(default_factory=dict)
+    #   Analytic path with recognition entries: per entry, keyed ``"recognition:<variable>"``, the
+    #   log normaliser ``log Z`` of its message applied to the belief the tick holds before it
+    #   (``condition``'s log evidence for a Gaussian or mixture factor, ``log sum_k q_k r_k`` for a
+    #   categorical one); 0.0 for an entry absent at the tick. It is not a modality evidence term:
+    #   it enters ``free_energy`` through ``- log Z + E_q[log m]``.
+    covered_terms: Mapping[str, Array] = eqx.field(default_factory=dict)
+    #   Analytic path with recognition entries: per modality an entry covers, keyed by modality
+    #   name at the faces and inside alike, the ``- E_q[log p(o | s)]`` term it adds to
+    #   ``free_energy`` under the tick's final belief (a linear-Gaussian, emission or tabular
+    #   modality in closed form, a neural one to second order at each component's mean); 0.0
+    #   for a covered modality absent at the tick. An uncovered modality has no entry. Each is a
+    #   cost (the negative of an expected log-likelihood), so it adds to ``free_energy`` where an
+    #   evidence term subtracts.
