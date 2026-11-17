@@ -42,6 +42,9 @@ Conditional families
    ~hybrid_aif.ConditionalCategorical
    ~hybrid_aif.ConditionalGaussian
    ~hybrid_aif.ConditionalDirichlet
+   ~hybrid_aif.TabularObservation
+   ~hybrid_aif.TabularTransition
+   ~hybrid_aif.TabularPrior
    ~hybrid_aif.MLPCategorical
    ~hybrid_aif.MLPConditional
    ~hybrid_aif.MLPPredictor
