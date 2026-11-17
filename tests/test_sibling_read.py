@@ -150,7 +150,10 @@ def _recorded(step, log, mind: str):
     @functools.wraps(step)
     def wrapped(system, key, obs, carry, params):
         if obs is not None:
-            log.append((mind, dict(obs), carry))
+            #  logged on the host: the rounds after the first run in one compiled scan
+            jax.debug.callback(
+                lambda o, c: log.append((mind, o, c)), dict(obs), carry, ordered=True
+            )
         return step(system, key, obs, carry, params)
 
     return wrapped

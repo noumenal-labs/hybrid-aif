@@ -804,6 +804,52 @@ already designed, carrying a stated gate on when they must be paid.
   repo's first external code PR. Since a0f4916 (entry 092) it folds
   over the shared expansion in `planning/tree.py`.
 
+- **[recorded 2026-11-17, after 0.21.0] Follow-ons the 0.21.0 release left open.** Each is
+  a bounded extension of machinery that shipped; the design record named in brackets holds
+  the reasoning. None blocks a user of the release: every one is a refusal with a sentence
+  today, not a silent approximation.
+  - *Process noise* (`design/process-noise-learning.md` D2, D3, as built). Learn `Q` on a
+    switching or mixture-carried factor (the pairwise posterior per component is needed
+    before the reduce, the O3 loss); the unscented statistic (pairwise moments under sigma
+    points); a belief-valued continuous control at learn time; the epistemic estimator for
+    `Q` (the transition-side twin of the observation noise's D10 estimator, so a planner can
+    seek information about its own process noise); `Q` carried inside `plan_learning`;
+    `durations.compose` under a learned noise, exact first for identity `F` (the composed
+    noise is `n Q`, and the inverse-Wishart is closed under scaling), non-conjugate in
+    general. The tabular twin of D2, the Dirichlet transition's pairwise statistic in place
+    of the product of marginals, is the same gap on the discrete side.
+  - *A probability vector into a nonlinear reader* (`design/nesting-and-coupling.md` N8, A5).
+    A held control node supplied with `stats` is refused by a nonlinear transition because it
+    has no table to average. The switching mixture of 0.21.0 lifts this exactly: push per
+    level, weight by the vector. The linear bank's table average is the Jensen-bounded
+    mean-dynamics reading; it could be offered the same mixture.
+  - *From the REBUS reply* (gist, 2026-11-16). A continuous precision state: expressible at
+    0.20.0 (`noise_scale="per_coordinate"`, `f` returning `(mean, scale)`) but not inferable
+    by a Gaussian filter, since a precision enters the covariance only; an HGF-class
+    variational update is the route, and the discrete ladder (levelled noise, mode-aligned
+    mixture, per-mode evidence) is native today. Named blocks within one Gaussian factor, so
+    a continuous-to-continuous hierarchy is one exact stacked block with block-wise
+    declarations and pricing, rather than `B_deps` parents under mean-field, which lose the
+    upward message. The noise register of `merge` (`noise_reads`, D4) folded into
+    `references` through a field entry.
+  - *The survey demo* (`build/step2C/C16-plan-learning/RESULTS.md`). `plan_learning` on the
+    shipped rover is +0.15 coverage alone and removes the scheduler's early lead, so the
+    two-tier story becomes energy management; the wall belongs in the vehicle step (a clip,
+    propagated unscented), after which the Gaussian-mixture preference is a constraint no
+    longer needed but still the carrier of the page's G bracket. A 0.22 decision.
+  - *A batch axis for `run`* (2026-11-17, the multi-rover survey). `run` is a Python round
+    loop with no batch axis; the only vmapped simulation is `rollout` over the `Env` interface,
+    and `replay.stack_traces` for replays. Replicas of a closed System (seeds, starts) run one
+    after another today. The build: a traceable round body (holds as masked steps, write-backs
+    traced, every step jittable), dynamic rather than static slicing of a view at a driven
+    node's realised level (the blocker: replicas or copies at different option levels must
+    share one program), then `vmap` over replicas. The same body vmapped over copies of one
+    leaf within a round, write-backs summed at the boundary, is the batched leaf the two-rover
+    demo wants; the two are one build.
+  - *Small.* `dataclasses.replace(s, branch_on=())` on a System declared through
+    `sophisticated=` re-lowers silently; nine Markdown files fail `ruff format` at HEAD
+    (ruff 0.17.3 formats code blocks in Markdown).
+
 Licensing note for anything above: AXIOM/CAVI-CMN/VBGS are academic-license
 (reimplement ideas only); Fountas and k-cybulski/dem are GPL (ideas only);
 the Priorelli and SR-AIF repos have no license (unusable as-is); gameworld,

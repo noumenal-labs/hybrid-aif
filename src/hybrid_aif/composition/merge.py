@@ -42,6 +42,7 @@ nesting-and-coupling.md N2, N3.
 """
 
 import dataclasses
+import functools
 from collections.abc import Mapping, Sequence
 from typing import NamedTuple
 
@@ -654,8 +655,10 @@ def _prior_weights(prior, nu: int, what: str) -> Array:
 def _termination(prior, nu: int, what: str) -> tuple["int | None", "Array | None"]:
     """A terminating prior over a control node, as ``(keep, weights)``.
 
-    An ``int`` is a level (slice the axis), anything else a distribution over levels (average it).
-    Shared by :class:`Clamp` in :func:`merge` and the partner nodes of :func:`subsystem`.
+    An ``int`` is a level (slice the axis), anything else a distribution over levels (average
+    it); a traced integer scalar is a level too, kept as the traced index of the gathers (the
+    level of a view sliced inside ``run``'s scanned round, design batched-run.md R4). Shared by
+    :class:`Clamp` in :func:`merge` and the partner nodes of :func:`subsystem`.
     """
     scalar = not isinstance(prior, Categorical) and jnp.ndim(prior) == 0
     if scalar and not jnp.issubdtype(jnp.asarray(prior).dtype, jnp.integer):
@@ -666,6 +669,10 @@ def _termination(prior, nu: int, what: str) -> tuple["int | None", "Array | None
         )
     if not scalar:
         return None, _prior_weights(prior, nu, what)
+    if isinstance(prior, jax.core.Tracer):
+        #  a level traced inside ``run``'s scanned round: the gathers take it as an index, and its
+        #  range is its producer's contract (an action node is realised in range)
+        return jnp.asarray(prior, jnp.int32), None
     keep = int(prior)
     if not 0 <= keep < nu:
         raise ValueError(f"{what} pins level {keep}, which is not one of its {nu} control level(s)")
@@ -2300,6 +2307,15 @@ def write_back(
     one particle; nothing writes another particle's parameters. Design: nesting-and-coupling.md N4,
     N6.
     """
+    return _write_back(composite, params, name, before, after)
+
+
+def _write_back(composite, params, name, before, after, flag=None) -> SystemParams:
+    """:func:`write_back`, also over traced params (inside ``run``'s scanned round): the check
+    that ``before`` is current is made on concrete values only (``run`` takes every view from the
+    home it writes back to), and a traced concentration that is not positive is handed to
+    ``flag`` (``flag(bad, variable, sentence)``, which records a fault), the variable then keeping
+    its current value. Design: batched-run.md R6."""
     params = composite._params_in(params, "write_back")
     unknown = sorted(set(before.parameters) - set(params.parameters))
     if unknown:
@@ -2323,7 +2339,10 @@ def write_back(
                 f"composite now holds a {type(current).__name__} of shape "
                 f"{tuple(_table_of(current).shape)}; take the view again from the composite"
             )
-        if not bool(jnp.array_equal(_table_of(start), _table_of(current))):
+        stale = not isinstance(_table_of(start), jax.core.Tracer) and not bool(
+            jnp.array_equal(_table_of(start), _table_of(current))
+        )
+        if stale:
             raise ValueError(
                 f"write_back: the view of {name!r} was taken before the composite's parameter "
                 f"variable {var!r} last changed, so writing it back would erase that change. "
@@ -2336,12 +2355,21 @@ def write_back(
                 f"write_back: the view of {name!r} holds parameter variable {var!r} after "
                 "learning in another form than before"
             )
-        if isinstance(end, ConditionalDirichlet) and not bool(jnp.all(end.concentration > 0.0)):
-            raise ValueError(
+        if isinstance(end, ConditionalDirichlet):
+            positive = jnp.all(end.concentration > 0.0)
+            sentence = (
                 f"write_back: parameter variable {var!r} has a concentration that is not "
                 f"positive after the view of {name!r} learned (a decay or rate that overshoots "
                 "the anchor); it is not a Dirichlet and is not written"
             )
+            if not isinstance(positive, jax.core.Tracer):
+                if not bool(positive):
+                    raise ValueError(sentence)
+            elif flag is None:
+                raise ValueError(sentence)
+            else:
+                flag(~positive, var, sentence)
+                end = jax.tree_util.tree_map(functools.partial(jnp.where, positive), end, current)
         homes[var] = end
     out = dataclasses.replace(params, parameters=homes)
     for slot, i, home in params.references:  # every reader's position holds its variable's table

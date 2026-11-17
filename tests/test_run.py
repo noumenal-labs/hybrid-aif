@@ -34,6 +34,7 @@ from hybrid_aif.composition import (
 )
 from hybrid_aif.system import System, SystemParams
 from hybrid_aif.system.mirror import mirror
+from tests.host_log import logged, noted
 from tests.test_action_nodes import KERNEL, pusher
 from tests.test_merge import agent_and_world
 from tests.test_merge_gaussian_control import float_composite
@@ -76,7 +77,7 @@ def recorder(log, name, inner=None):
     inner = inner or level(1)
 
     def step(system, key, obs, carry, params):
-        log.append((name, obs, system, params))
+        jax.debug.callback(lambda o, p: log.append((name, o, system, p)), obs, params, ordered=True)
         return inner(system, key, obs, carry, params)
 
     return step
@@ -274,7 +275,7 @@ def test_sequential_steps_a_driven_node_after_its_driver_whatever_its_place_in_t
     def tagged(name, step):
         def run_step(system, key, obs, carry, p):
             if obs is not None:
-                calls.append(name)
+                noted(calls, name)
             return step(system, key, obs, carry, p)
 
         return run_step
@@ -354,7 +355,7 @@ def test_a_driven_continuous_node_cannot_be_planned_and_a_custom_step_gets_it():
     def world(system, key, obs, carry, p):
         out, carry, p = sample()(system, key, obs, carry, p)
         if obs is not None:
-            seen.append(obs["world.c.v"])
+            logged(seen, obs["world.c.v"])
         return out, carry, p
 
     traj = run(system, params, 3, KEY, {"model.c": push, "world": world})
@@ -400,7 +401,7 @@ def test_a_driven_leaf_listed_first_steps_after_its_driver_under_every_order_tha
         def tagged(name, inner, calls=calls):
             def step(system, key, obs, carry, p):
                 if obs is not None:
-                    calls.append(name)
+                    noted(calls, name)
                 return inner(system, key, obs, carry, p)
 
             return step
@@ -488,7 +489,7 @@ def test_a_chain_of_driven_nodes_steps_in_driver_order_whatever_the_listing():
         def tagged(name, calls=calls):
             def step(system, key, obs, carry, p):
                 if obs is not None:
-                    calls.append(name)
+                    noted(calls, name)
                 return level(0)(system, key, obs, carry, p)
 
             return step
@@ -675,7 +676,7 @@ class Recording(runner._Plan):
         self.log = log
 
     def __call__(self, system, key, obs, carry, params):
-        self.log.append((obs, system, params))
+        jax.debug.callback(lambda o, p: self.log.append((o, system, p)), obs, params, ordered=True)
         return super().__call__(system, key, obs, carry, params)
 
 
@@ -728,7 +729,7 @@ def test_a_plan_step_gets_the_view_sliced_at_the_realised_level_and_a_custom_ste
     seen: list = []
 
     def custom(view, key, obs, carry, p):
-        seen.append((obs, view))
+        jax.debug.callback(lambda o: seen.append((o, view)), obs, ordered=True)
         return {}, carry, p
 
     custom_traj = run(
@@ -1131,10 +1132,11 @@ def test_async_reads_live_in_a_fresh_random_order_of_the_sources_each_round():
     seen = [int(o["B.see"]) for _, o, *_ in log if o is not None]
     emitted = traj["W"].emitted["see"].tolist()
     start = int(traj["W"].start["see"])
-    sweep = runner._sweep_generator(jax.random.split(KEY)[0], 2)
+    sweep = runner._sweep_key(jax.random.split(KEY)[0], 2)
     live = []
     for t in range(ticks):
-        order = [int(i) for i in sweep.permutation(2)]  # 0 is W, 1 is B
+        #  round t's listing of the sources, 0 is W, 1 is B (design batched-run.md R9)
+        order = [int(i) for i in jax.random.permutation(jax.random.fold_in(sweep, t), 2)]
         live.append(order.index(0) < order.index(1))
         want = emitted[t] if live[-1] else (start if t == 0 else emitted[t - 1])
         assert seen[t] == want, (t, order)

@@ -32,6 +32,7 @@ from collections.abc import Callable, Mapping
 from numbers import Integral
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
@@ -239,19 +240,21 @@ def env_step(env: Env, params: Any = None, *, actions: Mapping[str, int] | None 
                     f"env_step: in-port {_short(u)!r} sits at factor {at}, and the environment's "
                     f"action has {null.shape[0]} position(s); pass actions={{port: factor}}"
                 )
-            level = int(np.asarray(obs[u]))
+            level = jnp.asarray(obs[u], jnp.int32)  # traced inside run's compiled rounds
             if axes is not None and axes[at] < 2:
                 raise ValueError(
                     f"env_step: in-port {_short(u)!r} sits at factor {at}, which the "
                     "environment's transitions take no action on (one level on its action axis); "
                     "map it onto a controlled factor with actions={port: factor}"
                 )
-            if axes is not None and not 0 <= level < axes[at]:
+            concrete = not isinstance(level, jax.core.Tracer)
+            if concrete and axes is not None and not 0 <= int(level) < axes[at]:
                 raise ValueError(
-                    f"env_step: in-port {_short(u)!r} holds level {level}, and factor {at} of the "
-                    f"environment takes {axes[at]} action levels; drive it within [0, {axes[at]})"
+                    f"env_step: in-port {_short(u)!r} holds level {int(level)}, and factor {at} "
+                    f"of the environment takes {axes[at]} action levels; drive it within "
+                    f"[0, {axes[at]})"
                 )
-            action = action.at[at].set(jnp.asarray(level, null.dtype))
+            action = action.at[at].set(level.astype(null.dtype))
         return action
 
     def step(system, key, obs, carry, params_view):

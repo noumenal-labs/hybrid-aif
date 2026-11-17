@@ -253,7 +253,10 @@ def test_a_held_scheduler_with_a_fast_learner_is_the_recorded_run_bitwise(order)
 
     def mission(view, key, obs, carry, vparams):
         if obs is not None:
-            seen.append(vparams)
+            #  the rounds after the first are one compiled scan, so what the step is handed is
+            #  logged on the host by a callback (design batched-run.md R8)
+            field = vparams.parameters["agent.rover.field"].concentration
+            jax.debug.callback(lambda c: seen.append(np.asarray(c)), field, ordered=True)
         return slow(view, key, obs, carry, vparams)
 
     steps = {"agent.mission": mission, "agent.rover": _fast_rover(), "world": _gauge_step}
@@ -268,7 +271,7 @@ def test_a_held_scheduler_with_a_fast_learner_is_the_recorded_run_bitwise(order)
     )
     same(traj["agent.mission"].emitted["option"], "scheduler/options")
     same(
-        np.stack([np.asarray(s.parameters["agent.rover.field"].concentration) for s in seen]),
+        np.stack(seen),
         "scheduler/seen_fields",
     )
     same(traj.params.parameters["agent.rover.field"].concentration, "scheduler/final_field")
@@ -280,12 +283,14 @@ def test_a_held_scheduler_with_a_fast_learner_is_the_recorded_run_bitwise(order)
 
 
 def _replay(name, levels):
-    """The model's step: the recorded action of each round, no inference."""
+    """The model's step: the recorded action of each round, no inference (the round a traced
+    count in the carry, which indexes the recording as an array)."""
+    levels = jnp.asarray(levels, jnp.int32)
 
     def step(system, key, obs, carry, params):
         if obs is None:
             return {}, 0, params
-        return {name: jnp.asarray(levels[carry], jnp.int32)}, carry + 1, params
+        return {name: levels[carry]}, carry + 1, params
 
     return step
 

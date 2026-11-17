@@ -448,7 +448,8 @@ def test_env_step_is_the_wrapped_environment_bitwise_on_the_same_keys():
 
     def logged(view, key, obs, carry, view_params):
         out, new, back = inner(view, key, obs, carry, view_params)
-        calls.append((key, obs, carry, out, new))
+        #  logged on the host: the rounds after the first run in one compiled scan
+        jax.debug.callback(lambda *a: calls.append(a), key, obs, carry, out, new, ordered=True)
         return out, new, back
 
     run(system, params, 8, KEY, {"agent": plan(), "world": logged}, tick_order="sequential")
@@ -536,20 +537,22 @@ def host_step(sensor):
 
 
 @pytest.mark.parametrize("order", ORDERS)
-def test_a_black_box_step_may_be_host_python_with_side_effects_and_any_carry(order):
+def test_a_black_box_step_in_host_python_is_refused_naming_the_step(order):
+    """The rounds after the first run in one compiled scan (design batched-run.md R1, R8), so a
+    step is a traced function: a black box's step that reads a value on the host (here
+    ``int(np.asarray(...))`` of the command it is handed) is refused naming the step and the
+    remedy. A run of one round, on concrete values only, still runs it."""
     system, params = coupled()
+    with pytest.raises(
+        ValueError, match=r"the step of 'world' calls host-side code on a traced value"
+    ):
+        steps = {"agent": plan(), "world": host_step(_Sensor())}
+        run(system, params, 5, KEY, steps, tick_order=order)
     sensor = _Sensor()
-    rec = run(
-        system, params, 5, KEY, {"agent": plan(), "world": host_step(sensor)}, tick_order=order
-    )
-    world = rec["world"]
-    #  one call per round, in order, on concrete values
-    assert sensor.sent == [int(a) for a in rec["agent"].emitted["push"]]
-    assert world.carry == {"log": sensor.sent}  # a Python object, carried as it is
-    #  the NumPy and Python numbers it returned, converted and checked against the port's type
-    assert world.emitted["o"].dtype == jnp.int32
-    np.testing.assert_array_equal(world.emitted["o"], np.arange(1, 6) % 3)
-    assert int(world.start["o"]) == 0
+    steps = {"agent": plan(), "world": host_step(sensor)}
+    rec = run(system, params, 1, KEY, steps, tick_order=order)
+    assert sensor.sent == [int(rec["agent"].emitted["push"][0])]
+    assert rec["world"].emitted["o"].dtype == jnp.int32
 
 
 def test_a_host_step_returning_the_wrong_shape_or_type_is_refused_naming_the_port():
@@ -592,17 +595,20 @@ def test_a_host_step_returning_the_wrong_shape_or_type_is_refused_naming_the_por
 
 def test_a_box_out_port_value_is_normalised_to_one_dtype_across_rounds():
     """Any integer type on a level port is stored as int32, an integer vector on a float port as
-    the float dtype, one number on a width-1 float port as a vector; values of different Python
-    and NumPy types in different rounds stack."""
+    the float dtype, one number on a width-1 float port as a vector; the reset's value, round 0's
+    (concrete) and the compiled rounds' (traced) stack in one dtype."""
     system, params = coupled()
-    values = iter([np.uint8(1), 2, np.int64(0), np.int16(2), 1, 0])
 
     def mixed(system, key, obs, carry, params):
-        return {names_of(system)["o"]: next(values)}, carry, params
+        t = jnp.asarray(0) if carry is None else carry
+        if obs is None:
+            return {names_of(system)["o"]: np.uint8(1)}, t, params
+        return {names_of(system)["o"]: ((t + 2) % 3).astype(jnp.int16)}, t + 1, params
 
     rec = run(system, params, 5, KEY, {"agent": plan(), "world": mixed})
     assert rec["world"].emitted["o"].dtype == jnp.int32
-    np.testing.assert_array_equal(rec["world"].emitted["o"], [2, 0, 2, 1, 0])
+    np.testing.assert_array_equal(rec["world"].emitted["o"], [2, 0, 1, 2, 0])
+    assert int(rec["world"].start["o"]) == 1
     floats = couple(
         {
             "brain": black_box(outs={"force": (FLOAT, 1)}),
@@ -610,10 +616,12 @@ def test_a_box_out_port_value_is_normalised_to_one_dtype_across_rounds():
         },
         [Identify("brain.force", "body.force")],
     )
-    forces = iter([np.asarray([3]), 0.5, np.float64(2.0), jnp.asarray([1.5]), 4])
 
     def push(system, key, obs, carry, params):
-        return {names_of(system)["force"]: next(forces)}, carry, params
+        t = jnp.asarray(0) if carry is None else carry
+        if obs is None:
+            return {names_of(system)["force"]: np.asarray([3])}, t, params
+        return {names_of(system)["force"]: (t + 1) * 0.5}, t + 1, params  # one number
 
     def idle(system, key, obs, carry, params):
         return {}, carry, params
@@ -621,8 +629,9 @@ def test_a_box_out_port_value_is_normalised_to_one_dtype_across_rounds():
     rec = run(*floats, 4, KEY, {"brain": push, "body": idle})
     emitted = rec["brain"].emitted["force"]
     assert emitted.dtype == jnp.float32 and emitted.shape == (4, 1)
-    np.testing.assert_array_equal(emitted[:, 0], [0.5, 2.0, 1.5, 4.0])
+    np.testing.assert_array_equal(emitted[:, 0], [0.5, 1.0, 1.5, 2.0])
     assert rec["body"].received["force"].dtype == jnp.float32
+    np.testing.assert_array_equal(rec["brain"].start["force"], [3.0])
 
 
 # ------------------------------------------------------------------------------- fix pass

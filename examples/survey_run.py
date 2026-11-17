@@ -217,7 +217,7 @@ def field_record(field, strength):
     )
 
 
-def rover_plan(setting, steps, starts, pre, seconds):
+def rover_plan(setting, steps, starts, pre):
     """The rover's step for ``run``: the library's ``plan()`` with the gradient planner
     (``steps`` descent steps from ``starts`` starts, the best final plan acted on), the field
     learned each round at the rate ``field_lr`` (from the second round on), the round's
@@ -226,8 +226,8 @@ def rover_plan(setting, steps, starts, pre, seconds):
     round); the other starts are the library's spread points of the control box. The view's
     emissions (the cell the scheduler reads, two-tier only) are realised from the posterior.
     Under the fix ablation (the setting's ``fix`` false) the fix reaches the step and is handed
-    on as absent (``None``), so it is never read. ``seconds`` receives each round's wall time
-    (``timed``)."""
+    on as absent (``None``), so it is never read. The step runs inside ``run``'s compiled scan of
+    rounds, so it reads no clock; a run's wall time is taken around the ``run`` call."""
     step = plan(
         make_gradient_planner(steps=steps, starts=starts),
         learn={"lr": setting["field_lr"]},
@@ -237,7 +237,7 @@ def rover_plan(setting, steps, starts, pre, seconds):
     )
     if not setting.get("fix", True):
         step = unread(step, pre + "fix")
-    return timed(step, seconds)
+    return step
 
 
 def unread(step, slot):
@@ -313,7 +313,8 @@ def tick_rows(rec, rover, ticks, record, seconds, extra=None, recognise=None):
     """The per-tick records of a run, read from its ``Trajectory``: the world's true state at the
     start of the tick (its carry), the readings the rover was handed and the command it chose
     (the record of the stepped node ``rover``), the rover's record of the tick (``record`` of its
-    carry after the tick, ``rover_record``) and the tick's wall time (``seconds``). The camera
+    carry after the tick, ``rover_record``) and the tick's wall time (``seconds``, the mean tick of
+    the compiled scan of rounds, compile excluded: ``run_seconds``). The camera
     image is the one the rover was handed, or, when its model has no image, the one the world
     emitted for that round; ``recognise`` (an image to the recogniser's class probabilities) adds
     the recogniser's readout of it."""
@@ -342,7 +343,7 @@ def tick_rows(rec, rover, ticks, record, seconds, extra=None, recognise=None):
             fix=[float(c) for c in mind.received["fix"][t]],
             gauge=float(mind.received["gauge"][t][0]),
             img=image_rows(image),
-            seconds=seconds[t],
+            seconds=seconds,
             **record(mind.carries[t + 1]),
         )
         if recognise is not None:
@@ -434,7 +435,7 @@ def rover_of(setting, decoder, confusion=None, tiered=False):
 
 def timing(rec, node, setting, decoder, confusion, steps, starts, reps=TIMING_REPS):
     """The median wall time of the rover's two costly parts, measured apart from the run (a
-    compiled ``plan()`` round is timed whole, ``timed``): the belief update (``infer_states``,
+    whole run is timed around the ``run`` call): the belief update (``infer_states``,
     every reading, the camera's the dominant cost) and the plan (``infer_policies`` with the
     rover's gradient planner, ``steps`` descent steps from ``starts`` starts, the first the plan
     it acted on shifted one tick on), each compiled and called ``reps`` times after two warm-up
@@ -498,17 +499,17 @@ def run_setting(
     )
     world_step, readout = sensors(mode, encoder)
     start = setting.get("start_energy")
-    seconds = []
     rec = run(
         system,
         params,
         ticks,
         jax.random.PRNGKey(setting["seed"]),
-        steps={"rover": rover_plan(setting, steps, starts, "rover.", seconds), "world": world_step},
+        steps={"rover": rover_plan(setting, steps, starts, "rover."), "world": world_step},
         tick_order="sequential",
         carries=None if start is None else {"world": {"energy": start}},
         record_carries=True,
     )
+    seconds = run_seconds(rec, ticks)
     decoder = params.likelihood.get("rover.img")
 
     def record(carry):
@@ -606,22 +607,15 @@ def survey_system(decoder, setting, confusion=None):
     )
 
 
-def timed(step, seconds):
-    """``step`` with the wall time of each of its calls after the first (the reset) appended to
-    ``seconds``, its outputs waited for; ``functools.wraps`` carries the marks ``run`` reads off a
-    ``plan()`` step. The page's ``seconds`` of a tick or a decision is this time, the ``plan()``
-    call alone (inference, learning, planning, the push of the prior and the emissions);
-    building the page's record from the trace is not in it."""
-
-    @functools.wraps(step)
-    def wrapper(system, key, obs, carry, params):
-        t_start = time.time()
-        out = jax.block_until_ready(step(system, key, obs, carry, params))
-        if obs is not None:
-            seconds.append(time.time() - t_start)
-        return out
-
-    return wrapper
+def run_seconds(rec, ticks):
+    """The mean wall time of a tick of the run ``rec``, compile excluded: the execution of
+    ``run``'s compiled scan of rounds over the rounds it ran (``Trajectory.timing``, the program
+    compiled ahead of time and timed apart); a run of one round, which is not scanned, takes
+    that round's wall time. The rover's costly parts are timed apart from the run (``timing``)."""
+    timing = rec.timing
+    if timing["scanned"]:
+        return timing["scan"] / timing["scanned"]
+    return timing["compile"] + timing["scan"] if ticks else 0.0
 
 
 def decision_record(carry, option, reading, seconds, pre="agent.mission.", n_options=sm.N_OPTIONS):
@@ -630,7 +624,8 @@ def decision_record(carry, option, reading, seconds, pre="agent.mission.", n_opt
     their term trees, ``G`` and ``q_pi``, the best ``G`` and the probability of each first option,
     the posterior over the energy band and the visited cell (``carry.previous``), and the energy
     table the decision planned with (``energy_record``). ``reading`` is the cell modality's value
-    that round, ``None`` where it was absent; ``n_options`` the option control node's levels."""
+    that round, ``None`` where it was absent; ``n_options`` the option control node's levels;
+    ``seconds`` the run's mean tick time, compile excluded (``run_seconds``)."""
     q_pi, tree, sequences = carry.trace.q_pi, carry.trace.tree, np.asarray(carry.trace.policies)
     g = total(tree)
     records = [
@@ -698,16 +693,13 @@ def run_tiered(
     world_step, readout = sensors(camera_mode(setting), encoder)
     every = setting["slow_ticks"]
     start = setting.get("start_energy")
-    seconds = []
-    decide = plan(
+    mission = plan(
         trace=True,
         selection="deterministic",
         replace={"policy_len": setting["horizon"]},
         learn=ss.learn_rates("agent.mission."),
     )
-    mission = timed(decide, seconds)
-    rover_seconds = []
-    rover = rover_plan(setting, steps, starts, "agent.rover.", rover_seconds)
+    rover = rover_plan(setting, steps, starts, "agent.rover.")
     rec = run(
         system,
         params,
@@ -719,16 +711,17 @@ def run_tiered(
         carries=None if start is None else {"world": {"energy": start}},
         record_carries=True,
     )
+    seconds = run_seconds(rec, ticks)
     scheduler = rec["agent.mission"]
     options = scheduler.intended["option"]
     decided = [t for t in range(ticks) if bool(scheduler.decided[t])]
     decisions = {}
-    for t, secs in zip(decided, seconds, strict=True):
+    for t in decided:
         reading = int(scheduler.received["cell_obs"][t])
         present = bool(scheduler.present["cell_obs"][t])
         option = int(options[t])
         carry = scheduler.carries[t + 1]
-        decisions[t] = decision_record(carry, option, reading if present else None, secs)
+        decisions[t] = decision_record(carry, option, reading if present else None, seconds)
 
     def extra(t):
         return dict(option=int(options[t]), slow=decisions.get(t, dict(decision=False)))
@@ -740,7 +733,7 @@ def run_tiered(
     def record(carry):
         return rover_record(carry, setting, pre, decoder, horizon)
 
-    rows = tick_rows(rec, "agent.rover", ticks, record, rover_seconds, extra, recognise=readout)
+    rows = tick_rows(rec, "agent.rover", ticks, record, seconds, extra, recognise=readout)
     learned = rec.params.parameters["agent.mission.energy_table"]
     return dict(
         ticks=rows,
@@ -1123,7 +1116,8 @@ def report_text(settings, runs, marks=MARKS, mdl=None):
             f"- first tick on ice: {r['first_ice']}, "
             f"in the far rough patch: {r['first_far_rough']}",
             f"- final energy band: {sm.ENERGY_NAMES[r['final_band']]}",
-            f"- mean seconds per tick after the first: {r['mean_seconds']:.2f}",
+            f"- mean seconds per tick (the compiled rounds, compile excluded): "
+            f"{r['mean_seconds']:.2f}",
             f"- first ten chosen velocities: {r['first_velocities']}",
         ]
         slow = [t["slow"] for t in runs[s["id"]]["ticks"] if t.get("slow", {}).get("decision")]
@@ -1150,8 +1144,8 @@ def report_text(settings, runs, marks=MARKS, mdl=None):
                 f"{np.round(after['efe_by_option'], 2).tolist() if after else 'no such decision'}",
                 f"- options chosen (tick: option): {', '.join(f'{t}: {o}' for t, o in decisions)}",
                 f"- charge chosen at ticks: {charges if charges else 'never'}",
-                f"- mean seconds per slow decision: "
-                f"{np.mean([d['seconds'] for d in slow]):.2f} (the first includes compile)",
+                f"- mean seconds per tick at a slow decision (compile excluded): "
+                f"{np.mean([d['seconds'] for d in slow]):.2f}",
             ]
         lines.append("")
     if mdl is not None:
@@ -1431,10 +1425,9 @@ def main():
         result["seconds"] = elapsed
         part = out_dir / f"part_{s['id']}{args.tag}.json"
         part.write_text(json.dumps(dict(runs={s["id"]: result}, settings={s["id"]: s})))
-        secs = sorted(r["seconds"] for r in result["ticks"])
         print(
-            f"{s['id']}: {elapsed:.1f}s ({elapsed / args.ticks:.2f}s/tick; median tick "
-            f"{secs[len(secs) // 2]:.2f}s, max {secs[-1]:.2f}s) final coverage "
+            f"{s['id']}: {elapsed:.1f}s ({elapsed / args.ticks:.2f}s/tick; the compiled "
+            f"rounds {result['ticks'][0]['seconds']:.2f}s/tick) final coverage "
             f"{result['ticks'][-1]['coverage']:.3f}",
             flush=True,
         )

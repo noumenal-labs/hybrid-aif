@@ -27,6 +27,7 @@ from hybrid_aif.composition import (
     with_mirror,
 )
 from hybrid_aif.system.mirror import mirror
+from tests.host_log import logged, noted
 from tests.test_clock_parity import _bump, _fast_rover, _gauge_step, _robots, cm, scheduler_system
 
 KEY = jax.random.PRNGKey(1)
@@ -34,11 +35,13 @@ TICKS = 20
 
 
 def counted(step):
-    """``step`` that records the keys it is called with, and whether the call was a reset."""
+    """``step`` that records the keys it is called with, and whether the call was a reset (on
+    the host, each time it runs: ``tests/host_log.py``)."""
     calls = []
 
     def wrapped(system, key, obs, carry, params):
-        calls.append((key, obs is None))
+        reset = obs is None
+        jax.debug.callback(lambda k: calls.append((jnp.asarray(k), reset)), key, ordered=True)
         return step(system, key, obs, carry, params)
 
     wrapped.sliced = getattr(step, "sliced", False)
@@ -200,7 +203,7 @@ def test_a_held_node_is_not_written_back_and_its_driven_nodes_keep_their_level()
     def mission(view, key, obs, carry, vparams):
         if obs is None:
             return inner(view, key, obs, carry, vparams)
-        seen.append(vparams)
+        logged(seen, vparams)
         out, carry, _ = inner(view, key, obs, carry, vparams)
         return out, carry, _bump(view, vparams)  # a learner, every round it is called
 
@@ -268,7 +271,7 @@ def _counting(name, calls):
         if obs is None:
             return {}, 0, params
         t = carry + 1
-        calls.append(name)
+        noted(calls, name)
         out = {a: jnp.asarray(t % 3, jnp.int32) for a in system.names.actions if a}
         out.update({e: jnp.asarray(t % 3, jnp.int32) for e, _ in system.emissions})
         return out, t, params
@@ -348,7 +351,7 @@ def _counted_plan(**kwargs):
 
     def step(system, key, obs, carry, params):
         if obs is not None:
-            calls.append(1)
+            noted(calls, 1)
         return inner(system, key, obs, carry, params)
 
     step.sliced = True

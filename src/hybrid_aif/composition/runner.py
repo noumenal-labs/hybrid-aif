@@ -41,8 +41,9 @@ realising its action nodes as it chooses; each driven node steps as soon as the 
 drivers has realised, before the sweep returns to nodes made ready earlier (a chain follows its
 source, a join waits for its last driver and steps there, nodes made ready by the same realisation
 keep listing order), so a driven node's own place in the listing does not matter. ``"async"``:
-sequential with a fresh random listing of the sources each round (reproducible from the run key,
-host generator seeded by ``fold_in(key, N)``), one total order per round, every node reading what
+sequential with a fresh random listing of the sources each round (reproducible from the run key:
+``jax.random.permutation(fold_in(fold_in(key, N), t), sources)`` at round ``t``), one total
+order per round, every node reading what
 stands at its turn and each driven node placed by the same derived rule; there is no boundary
 read. Sequential is a systematic scan, async a random scan,
 simultaneous a synchronous update. A cycle of action-to-control identifications is refused.
@@ -82,14 +83,33 @@ nodes excluded) from its kernel's column at the intended level with key ``i`` of
 ``split(fold_in(k, ACTUATOR_TAG), A)``. An emission is realised with the owner's step key folded
 by ``EMIT_TAG``.
 
+**The compiled round.** A run is the structure pass, the reset, round 0 and one compiled
+``lax.scan`` of the rounds after it. The structure pass reads structure, not values, on the host
+before any step is called: the antichain, the order (under async every distinct derived order),
+the clock table (the rounds an option lasts at every level of each durations table, each
+validated), and the refusals above. The reset and round 0 run on concrete values (round 0 is the
+round body called on them, where a variable may still have no value and a step's carry takes
+its form); every round after it is the same body traced once and scanned, so a step is a traced
+function: its outputs JAX arrays of the shapes of round 0, its carry and its params of the
+structure it was handed, and nothing host-side (``np.asarray``, ``float()``, a Python branch on a
+value) on what it is handed, which is refused naming the step. The view of a sliced step is
+taken every round with its level a traced index (one System serves every level); a clocked
+node's decide-or-hold is a ``lax.cond``, its count an int32 array; write-backs are applied by
+arithmetic on the values. A check of a value that fails inside the scan cannot raise: it is
+recorded in ``Trajectory.faults`` (a write-back that was not applied, a level out of range, a
+step that changed its params outside its variables), where round 0 refuses it.
+
 Design: docs/design/engine-consolidation.md; nesting-and-coupling.md N3, N4, N5; control-states.md
-C13.
+C13; batched-run.md R1–R9 (the compiled round).
 """
 
 import dataclasses
 import fnmatch
+import functools
+import itertools
 import math
 import numbers
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, NamedTuple
 
@@ -105,10 +125,9 @@ from hybrid_aif.composition.merge import (
     MixtureRefusal,
     _inputs_of,
     _subsystem_meta,
+    _write_back,
     driven_nodes,
-    retake,
     subsystem,
-    write_back,
 )
 from hybrid_aif.controls import FLOAT, LEVEL, ControlStep
 from hybrid_aif.distributions import Categorical, ConditionalDirichlet, Dirichlet
@@ -348,14 +367,17 @@ class _Plan:
         return held[1]
 
     def _enumerated(self, system: System, params: SystemParams):
-        """The enumerated policy set of the view, computed once per view (``None`` unless the
-        plan is over an enumerated set)."""
+        """The enumerated policy set of the view, computed once per view on concrete params
+        (``None`` unless the plan is over an enumerated set); inside ``run``'s compiled round it
+        is computed on the trace and not kept, so no traced value outlives its trace."""
         held = self._policies.get(id(system))
         if held is None or held[0] is not system:
             policies = None
             if self.planner is None and system.planner == "enumeration":
                 kinds = system._space(system._params_in(params, "plan")).kinds
                 policies = None if FLOAT in kinds else system.policies(params)
+            if isinstance(policies, jax.core.Tracer):
+                return policies
             held = (system, policies)
             self._policies[id(system)] = held
         return held[1]
@@ -546,6 +568,20 @@ class Trajectory(NamedTuple):
     #: A bool per round, whether the node stepped: ``False`` on a round that a node declaring
     #: durations spent inside its option, ``True`` every round of any other node.
     decided: Any
+    #: At the root, the checks of values that failed inside the compiled rounds, each a bool per
+    #: round (``ticks`` entries) keyed by what failed: a parameter variable whose write-back was
+    #: not applied (a concentration that is not positive, two writers of a form that is not
+    #: counts; the variable kept its round-start value), an out-port given a level out of range,
+    #: or ``"<node>:params"`` for a step that changed its params outside its parameter variables
+    #: and its own tables. Round 0 runs on concrete values, where each of these is refused
+    #: instead. Empty when nothing failed to be checked; ``None`` below the root.
+    faults: Any = None
+    #: At the root, the host's wall time of the run's parts, in seconds: ``compile`` (tracing and
+    #: compiling the scan of rounds), ``scan`` (executing it, compile excluded), with the rounds
+    #: it ran (``scanned``) and the rounds run on concrete values before it (``concrete``, round 0
+    #: and any while the state settled, their steps' own compiles included). ``None`` below the
+    #: root.
+    timing: Any = None
 
     def __getitem__(self, path):
         if not isinstance(path, str):
@@ -579,13 +615,6 @@ def _round_keys(key: Array, count: int) -> list[Array]:
     """The keys of one round for ``count`` stepped nodes: node ``j`` steps with key ``j`` and
     realises with key ``count + j``; key ``2 * count`` realises phase one under simultaneous."""
     return list(jax.random.split(key, 2 * count + 1))
-
-
-def _sweep_generator(key: Array, count: int) -> np.random.Generator:
-    """The host generator the async order draws its permutations from, seeded by the run key
-    (folded by the node count, so the per-round key stream is untouched)."""
-    seed = jax.random.key_data(jax.random.fold_in(key, count))
-    return np.random.default_rng(np.asarray(seed, np.uint32).ravel())
 
 
 @dataclasses.dataclass
@@ -850,48 +879,6 @@ def _check_timing(
 # ---------------------------------------------------------------------------- the views
 
 
-class _Views:
-    """The view of each stepped node, taken from the parameter home: built once per set of input
-    levels and refreshed from the home when it changes, so equal Systems share one compiled
-    program."""
-
-    def __init__(self, system: System, steps: Mapping[str, Callable]):
-        self.system = system
-        self._config = {
-            name: {k: v for k, v in getattr(step, "replace", {}).items() if k in _JOINT_CONFIG}
-            for name, step in steps.items()
-        }
-        self._cache: dict[tuple, tuple] = {}
-
-    def clear(self) -> None:
-        """Forget every view, so the next is built from the home as it now stands."""
-        self._cache.clear()
-
-    def get(self, node: _Node, home: SystemParams, levels: tuple):
-        held = (node.name, tuple((v, _hashable(lv)) for v, lv in levels))
-        entry = self._cache.get(held)
-        if entry is None:
-            inputs = {v: lv for v, lv in levels} if levels else None
-            if node.joint:
-                view, vparams = joint_planner(
-                    self.system, home, node.name, inputs=inputs, **self._config[node.name]
-                )
-            else:
-                view, vparams = subsystem(self.system, home, node.name, inputs=inputs)
-        elif entry[0] is home:
-            return entry[1], entry[2]
-        else:
-            view = entry[1]
-            vparams = retake(self.system, view, entry[2], home)
-        self._cache[held] = (home, view, vparams)
-        return view, vparams
-
-
-def _hashable(level):
-    """A level (an ``int``, ``None`` or a probability vector) as a dictionary key."""
-    return tuple(np.asarray(level).tolist()) if isinstance(level, Array) else level
-
-
 _JOINT_CONFIG = (
     "policy_len",
     "planner",
@@ -907,6 +894,59 @@ _JOINT_CONFIG = (
 )
 
 
+def _joint_config(step: Callable) -> dict[str, Any]:
+    """The joint view's configuration a step's ``replace`` gives (``plan(replace=...)``)."""
+    return {k: v for k, v in getattr(step, "replace", {}).items() if k in _JOINT_CONFIG}
+
+
+def _take_view(system: System, node: "_Node", home: SystemParams, levels: tuple):
+    """The view of a stepped node taken from ``home``: sliced at ``levels`` (pairs of a variable
+    and its level, an ``int``, a traced integer scalar, a probability vector, or ``None`` for the
+    uniform average) for a step marked ``sliced``, unsliced otherwise.
+
+    A view is taken every turn from the home as it stands. Inside the scanned round that is a
+    cost of the trace alone: the view's System is the same for every level (its tables differ
+    only by the gathers at the level, a traced index), so one System serves every level and no
+    view is cached (design batched-run.md R4)."""
+    inputs = dict(levels) if levels else None
+    if node.joint:
+        return joint_planner(system, home, node.name, inputs=inputs, **_joint_config(node.step))
+    return subsystem(system, home, node.name, inputs=inputs)
+
+
+def _reset_view(system: System, node: "_Node", home: SystemParams):
+    """The view of a node's reset call: averaged uniformly over its driven inputs, or, where
+    ``subsystem`` refuses that average with a :class:`MixtureRefusal` (a Gaussian target or a
+    linear-Gaussian transition conditional on a driven node would be a mixture), sliced at the
+    first level of each input. A reset call reads no table, so the level is immaterial."""
+    try:
+        return _take_view(system, node, home, _uniform(node))
+    except MixtureRefusal:
+        levels = _uniform(node)
+        if not levels:
+            raise
+        return _take_view(system, node, home, tuple((v, 0) for v, _ in levels))
+
+
+def _uniform(node: "_Node") -> tuple:
+    """The input levels of a node's first view (nothing realised yet: each averaged uniformly)."""
+    if not getattr(node.step, "sliced", False):
+        return ()
+    return tuple((v, None) for v in node.inputs)
+
+
+def _level_of(value) -> "int | Array | None":
+    """The input a sliced view takes for a variable's value: an ``int`` for a concrete level, the
+    traced integer scalar itself inside the scanned round, the vector itself otherwise, ``None``
+    before the variable has a value."""
+    if value is None:
+        return None
+    array = jnp.asarray(value)
+    if array.ndim == 0 and jnp.issubdtype(array.dtype, jnp.integer):
+        return array if isinstance(array, jax.core.Tracer) else int(array)
+    return array
+
+
 def _null(kind_size: tuple[str, int]) -> Array:
     kind, size = kind_size
     if kind == LEVEL:
@@ -914,12 +954,18 @@ def _null(kind_size: tuple[str, int]) -> Array:
     return jnp.zeros((size,), jnp.float32)
 
 
-class _Held(NamedTuple):
-    """A clocked node's option in force: the rounds left to hold after this one and the intended
-    action it chose."""
+# ---------------------------------------------------------------------------- the clocks
 
-    remaining: int
-    action: Mapping[str, Array]
+
+class _Clock(NamedTuple):
+    """A clocked node's hold schedule, read and validated in the structure pass: the action node
+    whose intended level selects the option, the rounds an option lasts at each of its levels,
+    and, where every level lasts the same number of rounds, that number (the schedule is then a
+    function of the round alone: the node decides on the rounds that are multiples of it)."""
+
+    action: str
+    rounds: tuple[int, ...]
+    lockstep: int | None
 
 
 def _check_clocks(
@@ -959,13 +1005,470 @@ def _check_clocks(
     return {n: _rounds_per_unit(clocks.get(n, 1.0), f"run: clocks[{n!r}]") for n in clocked}
 
 
-def _chosen_duration(view: System, vparams: SystemParams, chosen: Mapping[str, Array]) -> float:
-    """The duration of the option ``chosen``: the entry of ``params.durations`` at the intended
-    level of the action node of the control node that carries them, read directly so that a view
-    with driven control nodes (a custom step's is unsliced) needs no slicing."""
-    ((node, table),) = view._durations(view._params_in(vparams, "run"), "run").items()
-    action = view.action_names[view._table.control_names.index(node)]
-    return float(jnp.asarray(table)[jnp.asarray(chosen[action], jnp.int32)])
+def _clock_of(system: System, node: "_Node", home: SystemParams, scale: float) -> _Clock:
+    """The hold schedule of a clocked node: the duration of each level of the control node that
+    carries ``params.durations`` (read off the node's reset view, as its every view declares
+    it), times ``scale`` rounds per unit, each a whole number of rounds of at least one, refused
+    otherwise with ``hold``'s arithmetic and sentences (design batched-run.md R2, R5)."""
+    view, vparams = _reset_view(system, node, home)
+    ((control, table),) = view._durations(view._params_in(vparams, "run"), "run").items()
+    action = view.action_names[view._table.control_names.index(control)]
+    what = f"run: the duration of control node {control!r} of {node.name!r}"
+    clock = f"its clock of {scale} rounds per unit"
+    rounds = tuple(
+        _option_rounds(float(unit), scale, what, clock, level=level)
+        for level, unit in enumerate(np.asarray(table).tolist())
+    )
+    return _Clock(action, rounds, rounds[0] if len(set(rounds)) == 1 else None)
+
+
+def _declared_durations(params: SystemParams, name: str) -> dict:
+    """The durations a view of the stepped node ``name`` declares, keyed by control node, read
+    from the home with no view built (a view at no realised level may not exist): with
+    ``subsystem``'s precedence, the System's own ``params.durations`` where it holds any (its
+    entries on nodes at or beneath ``name``), else the ``parts`` of the leaves at or beneath it."""
+
+    def beneath(key: str) -> bool:
+        return key == name or key.startswith(f"{name}{SEPARATOR}")
+
+    if params.durations:
+        return {node: d for node, d in params.durations.items() if beneath(node)}
+    out: dict = {}
+    for leaf, part in (params.parts or {}).items():
+        if beneath(leaf):
+            out.update(part.durations or {})
+    return out
+
+
+# ---------------------------------------------------------------------------- the round
+
+
+class _State(NamedTuple):
+    """What a round hands the next: the run key, the value of every variable (``None`` before it
+    has one, which only the reset and round 0 can see), each stepped node's carry, the parameter
+    home, each clocked node's option in force (the rounds left to hold after this one, an int32
+    array, and the intended action it chose), and the key the async order is drawn from."""
+
+    key: Array
+    values: dict
+    carries: dict
+    home: SystemParams
+    held: dict
+    sweep: Array
+
+
+def _traced(x) -> bool:
+    return isinstance(x, jax.core.Tracer)
+
+
+def _select(flag, new, old):
+    """``new`` where ``flag`` holds, else ``old``, leaf by leaf; a concrete ``flag`` picks one
+    side in Python, so a concrete round computes nothing it discards."""
+    if not _traced(flag):
+        return new if bool(flag) else old
+    return jax.tree_util.tree_map(lambda a, b: jnp.where(flag, a, b), new, old)
+
+
+class _Unsettled(ValueError):
+    """A value of the round's state whose shape or structure changed between rounds: the state
+    has not settled (a mixture belief that grows to its cap, a carry filled on its first round),
+    so the round is run on concrete values once more before the scan is traced again; after
+    :data:`_SETTLE` such rounds it is refused with this sentence."""
+
+
+#: The rounds after round 0 that may run on concrete values while the state settles.
+_SETTLE = 3
+
+
+def _like(value, reference, what: str):
+    """``value`` in the dtype of ``reference`` (the value it replaces in the scan's state), which
+    it must match in shape: a port, a carry and the home keep their structure from round to
+    round, since they are the state of the scan over rounds (design batched-run.md R3, R7)."""
+    if reference is None or not hasattr(reference, "dtype"):
+        return value
+    array = jnp.asarray(value)
+    if array.shape != jnp.shape(reference):
+        raise _Unsettled(
+            f"run: {what} has shape {tuple(array.shape)} this round and "
+            f"{tuple(jnp.shape(reference))} the round before; a value keeps its shape from round "
+            "to round (each round is one step of a scan), so return a value of the same shape "
+            "every round"
+        )
+    if jax.dtypes.issubdtype(array.dtype, jax.dtypes.prng_key):
+        return array
+    return jax.lax.convert_element_type(array, jnp.result_type(reference))
+
+
+def _like_tree(tree, reference, what: str):
+    """``tree`` with each array leaf in the dtype of ``reference``'s (see :func:`_like`), the two
+    of one structure."""
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    ref_leaves, ref_def = jax.tree_util.tree_flatten(reference)
+    if treedef != ref_def:
+        raise _Unsettled(
+            f"run: {what} changed structure between rounds ({ref_def} to {treedef}); each round "
+            "is one step of a scan, whose state keeps one structure: return a carry of the "
+            "structure it was handed (fields filled from the first round on), and the params "
+            "handed in or learned ones of the same structure"
+        )
+    paths = [jax.tree_util.keystr(p) for p, _ in jax.tree_util.tree_flatten_with_path(tree)[0]]
+    return treedef.unflatten(
+        [
+            _like(x, r, f"{what} at {path}" if path else what)
+            if hasattr(r, "dtype") and hasattr(x, "dtype")
+            else x
+            for x, r, path in zip(leaves, ref_leaves, paths, strict=True)
+        ]
+    )
+
+
+def _strong(tree):
+    """``tree`` with Python and NumPy numbers made JAX arrays and every weakly typed array made
+    strongly typed: the scan's state starts in the dtypes its body returns."""
+
+    def leaf(x):
+        if isinstance(x, bool | int | float | complex | np.ndarray | np.generic):
+            x = jnp.asarray(x)
+        if isinstance(x, Array) and not jax.dtypes.issubdtype(x.dtype, jax.dtypes.prng_key):
+            return jnp.asarray(x, x.dtype)
+        return x
+
+    return jax.tree_util.tree_map(leaf, tree)
+
+
+_HOST_ERRORS = (
+    jax.errors.ConcretizationTypeError,
+    jax.errors.TracerArrayConversionError,
+    jax.errors.TracerBoolConversionError,
+    jax.errors.TracerIntegerConversionError,
+)
+
+
+class _Round:
+    """One round's working values: the variables, the carries and the home as they stand, the
+    values at the round's boundary, the write-backs held for it, each node's record of the round
+    and the faults it raised."""
+
+    def __init__(self, state: _State, t):
+        self.values = dict(state.values)
+        self.boundary = dict(state.values)
+        self.carries = dict(state.carries)
+        self.home = state.home
+        self.round_home = state.home
+        self.held = dict(state.held)
+        self.t = t
+        self.pending: list = []
+        self.received: dict = {}
+        self.intended: dict = {}
+        self.decided: dict = {}
+        self.faults: dict = {}
+
+    def flag(self, bad, label: str, sentence) -> None:
+        """A check of a value: on a concrete value (the reset and round 0) a failure is refused
+        with ``sentence``; on a traced one (the scanned rounds) it is recorded under ``label``
+        in ``Trajectory.faults`` and the round goes on (design batched-run.md R6, R7)."""
+        _flagged(self.faults, bad, label, sentence)
+
+
+def _flagged(faults: dict | None, bad, label: str, sentence) -> None:
+    """``_Round.flag`` over a faults mapping; ``None`` refuses a traced failure too."""
+    if not _traced(bad):
+        if bool(bad):
+            raise ValueError(sentence() if callable(sentence) else sentence)
+        return
+    if faults is None:
+        raise ValueError(sentence() if callable(sentence) else sentence)
+    faults[label] = faults[label] | bad if label in faults else jnp.asarray(bad)
+
+
+class _Engine:
+    """The round of ``run``: a function ``round(state, t) -> (state, record)`` of the structure
+    pass's static facts (the stepped nodes, the order, the clocks, the action nodes and their
+    kernels), called on concrete values for round 0 and scanned over the rounds after it."""
+
+    def __init__(self, system, nodes, second, derive, tick_order, kernels, types, clocks):
+        self.system = system
+        self.nodes = nodes
+        self.first = [n for n in nodes if not n.phase_two]
+        self.second = second
+        self.derive = derive
+        self.tick_order = tick_order
+        self.count = len(nodes)
+        self.action_nodes = [a for a in system.action_names if a is not None]
+        self.index = {a: i for i, a in enumerate(self.action_nodes)}
+        self.kernels = kernels
+        self.types = types
+        self.clocks = clocks
+        self.sequential = list(derive(self.first))
+        #: whether any turn traced so far wrote back (a fact of the trace, read after the run:
+        #: a run in which no step wrote back returns the starting home itself)
+        self.wrote = False
+        self.orders, self.permutations, self.order_of = self._async_orders()
+
+    def _async_orders(self):
+        """Under ``"async"``: every distinct derived order of a permutation of the sources, the
+        permutations, and the index of each permutation's derived order."""
+        if self.tick_order != "async":
+            return [], None, None
+        orders: list[list[_Node]] = []
+        seen: dict[tuple, int] = {}
+        permutations, order_of = [], []
+        for perm in itertools.permutations(range(len(self.first))):
+            derived = self.derive([self.first[i] for i in perm])
+            names = tuple(n.name for n in derived)
+            if names not in seen:
+                seen[names] = len(orders)
+                orders.append(derived)
+            permutations.append(perm)
+            order_of.append(seen[names])
+        return orders, np.asarray(permutations, np.int32), np.asarray(order_of, np.int32)
+
+    # --------------------------------------------------------------------- reads
+
+    def stands(self, node: _Node, variable: str) -> bool:
+        """Whether ``node`` reads ``variable`` as it stands now rather than at the round's
+        boundary. Under ``"sequential"`` and ``"async"`` every read stands; under
+        ``"simultaneous"`` only a control node driven by an action node does, reading the value
+        realised this round."""
+        return self.tick_order != "simultaneous" or (
+            variable in self.index and variable in node.driven.values()
+        )
+
+    def read(self, node: _Node, source: Mapping[str, Any], at_boundary: Mapping[str, Any]) -> dict:
+        return {
+            slot: (source if self.stands(node, variable) else at_boundary).get(variable)
+            for slot, variable in node.reads.items()
+        }
+
+    # --------------------------------------------------------------------- the round
+
+    def round(self, state: _State, t):
+        """Round ``t``: ``(state, record)``. ``t`` is a Python int on round 0, a traced one in
+        the scan."""
+        key, k_tick = jax.random.split(state.key)
+        keys = _round_keys(k_tick, self.count)
+        state = state._replace(key=key)
+        if self.tick_order == "simultaneous":
+            return self._sweep(state, keys, t, None)
+        if self.tick_order == "sequential":
+            return self._sweep(state, keys, t, self.sequential)
+        perm = jax.random.permutation(jax.random.fold_in(state.sweep, t), len(self.first))
+        if not _traced(perm):
+            match = np.all(self.permutations == np.asarray(perm), axis=1)
+            return self._sweep(state, keys, t, self.orders[int(self.order_of[np.argmax(match)])])
+        match = jnp.all(jnp.asarray(self.permutations) == perm, axis=1)
+        which = jnp.asarray(self.order_of)[jnp.argmax(match)]
+        branches = [functools.partial(self._sweep, order=order) for order in self.orders]
+        if len(branches) == 1:
+            return branches[0](state, keys, t)
+        return jax.lax.switch(which, branches, state, keys, t)
+
+    def _sweep(self, state: _State, keys, t, order):
+        """One round under ``order`` (``None``: simultaneous)."""
+        r = _Round(state, t)
+        count = self.count
+        if order is None:
+            chosen: dict[str, Array] = {}
+            flags: dict[str, Any] = {}
+            for node in self.first:
+                picked, decided = self._decide(r, node, keys[node.index])
+                chosen.update(picked)
+                flags.update(dict.fromkeys(picked, decided))
+            members = [a for n in self.first for a in n.chosen]
+            self._realise(r, keys[2 * count], chosen, flags, members)
+            for node in self.second:
+                picked, decided = self._decide(r, node, keys[node.index])
+                self._realise(
+                    r, keys[count + node.index], picked, dict.fromkeys(picked, decided), node.chosen
+                )
+            if r.pending:
+                r.home = _at_the_boundary(self.system, r.round_home, r.pending, t, r.flag)
+        else:
+            for node in order:
+                picked, decided = self._decide(r, node, keys[node.index])
+                self._realise(
+                    r, keys[count + node.index], picked, dict.fromkeys(picked, decided), node.chosen
+                )
+        record = dict(
+            received=r.received,
+            intended=r.intended,
+            decided=r.decided,
+            emitted={n.name: {v: r.values[v] for v in n.outs} for n in self.nodes},
+            carries=dict(r.carries),
+            faults=r.faults,
+        )
+        return _State(state.key, r.values, r.carries, r.home, r.held, state.sweep), record
+
+    def _realise(self, r: _Round, k, chosen, flags, members) -> None:
+        """Realise the intended action nodes ``chosen`` of ``members`` from their kernels with
+        key ``k``; an action node whose node held (its flag false) keeps its realised value."""
+        draws = [
+            (self.index[a], self.kernels[a], chosen[a])
+            for a in members
+            if a in self.kernels and a in chosen
+        ]
+        drawn = _actuate(k, len(self.action_nodes), draws)
+        for a in members:
+            if a in chosen:
+                new = drawn.get(self.index[a], chosen[a])
+                r.values[a] = (
+                    _select(flags[a], new, r.values[a]) if r.values[a] is not None else new
+                )
+
+    def _decide(self, r: _Round, node: _Node, k):
+        """``node``'s turn: stepped on what it reads, or, a clocked node inside its option,
+        holding (its out-ports keep their values, its count goes one round down); its return
+        checked, its emissions stored and its write-back applied (live) or held for the boundary
+        (simultaneous). Returns the intended action nodes and whether the node decided."""
+        simultaneous = self.tick_order == "simultaneous"
+        seen = self.read(node, r.values, r.boundary)
+        r.received[node.name] = seen
+        base = r.round_home if simultaneous else r.home
+        levels: tuple = ()
+        if getattr(node.step, "sliced", False):
+            levels = tuple(
+                (v, _level_of((r.values if self.stands(node, v) else r.boundary).get(v)))
+                for v in node.inputs
+            )
+        view, vparams = _take_view(self.system, node, base, levels)
+        cut = {s for s, v in node.driven.items() if v in {w for w, _ in levels}}
+        obs = {s: x for s, x in seen.items() if s not in cut}
+        carry = r.carries[node.name]
+        standing = {v: r.values[v] for v in node.outs}
+        identity: dict[str, bool] = {}
+
+        def act(k, obs, carry, vparams):
+            out, stepped, learned = self._call(node, view, k, obs, carry, vparams)
+            if not isinstance(learned, SystemParams):
+                raise ValueError(
+                    f"run: the step of {node.name!r} returned {type(learned).__name__} as its "
+                    "params; a step returns the SystemParams it was given, or learned ones"
+                )
+            out = _check_out(node, out, self.types, self.system, False, standing)
+            identity["params"] = learned is vparams
+            if _traced(k):
+                stepped = _like_tree(_strong(stepped), carry, f"the carry of {node.name!r}")
+                if learned is not vparams:
+                    learned = _like_tree(learned, vparams, f"the params of {node.name!r}")
+            return out, stepped, learned
+
+        clock = self.clocks.get(node.name)
+        decided = True
+        if clock is None:
+            out, stepped, learned = act(k, obs, carry, vparams)
+        else:
+            remaining, action = r.held[node.name]
+            decided = (r.t % clock.lockstep == 0) if clock.lockstep else (remaining == 0)
+            if not _traced(decided):
+                decided = bool(decided)
+
+            def hold(k, obs, carry, vparams):
+                return {**{e: standing[e] for e in node.emissions}, **action}, carry, vparams
+
+            if decided is True:
+                out, stepped, learned = act(k, obs, carry, vparams)
+            elif decided is False:
+                out, stepped, learned = hold(k, obs, carry, vparams)
+            else:
+                out, stepped, learned = jax.lax.cond(decided, act, hold, k, obs, carry, vparams)
+                if identity.get("params"):
+                    learned = vparams  # both branches hand back the params they were given
+            chosen = {a: out[a] for a in node.chosen}
+            level = jnp.asarray(chosen[clock.action], jnp.int32)
+            rounds = jnp.asarray(clock.rounds, jnp.int32)[level]
+            r.held[node.name] = (
+                _select(decided, rounds - 1, remaining - 1).astype(jnp.int32),
+                _select(decided, chosen, action),
+            )
+        _check_ranges(node, out, self.types, self.system, r.flag)
+        r.carries[node.name] = stepped
+        for e in node.emissions:
+            r.values[e] = out[e]
+        chosen = {a: out[a] for a in node.chosen}
+        r.intended[node.name] = chosen
+        r.decided[node.name] = decided
+        if learned is not vparams:
+            self._write(r, node, view, vparams, learned, levels, base)
+        return chosen, decided
+
+    def _call(self, node: _Node, view, k, obs, carry, vparams):
+        """The step called; inside the scan a step that calls host-side code on a traced value
+        is refused naming it (design batched-run.md R8)."""
+        try:
+            return node.step(view, k, obs, carry, vparams)
+        except _HOST_ERRORS as error:
+            if not _traced(k):
+                raise
+            raise ValueError(
+                f"run: the step of {node.name!r} calls host-side code on a traced value "
+                f"({type(error).__name__}); run steps every round after the first inside one "
+                "compiled scan, so a step is a traced function whose outputs are JAX arrays: "
+                "write it with jax.numpy and lax control flow (no np.asarray, float(), int(), "
+                "bool() or a Python branch on a value), and keep host-side work such as timing "
+                "or logging outside run (record what a step sees in its carry, "
+                "record_carries=True)"
+            ) from error
+
+    def _write(self, r: _Round, node, view, vparams, learned, levels, base) -> None:
+        """A learner's write-back: its own learned tables and its parameter variables, applied to
+        the home now (sequential, async) or held for the boundary (simultaneous)."""
+        self.wrote = True
+        learned, written = _own_slots(view, node, vparams, learned, levels, base, r.flag)
+        _check_parameters_only(view, node.name, vparams, learned, r.flag)
+        new = _write_back(self.system, base, node.name, vparams, learned, r.flag)
+        if self.tick_order == "simultaneous":
+            r.pending.append((node.name, new, written))
+        else:
+            r.home = new if not written else dataclasses.replace(new, **written(new))
+
+
+def _scan_program(engine: _Engine, static, record_carries: bool):
+    """The compiled scan of the rounds after round 0 over the array part of the state (its other
+    leaves, ``static``, the same every round): ``program(dynamic, rounds) -> (dynamic,
+    records)``, ``rounds`` the indices of the rounds it runs."""
+
+    def body(dynamic, t):
+        state = eqx.combine(dynamic, static)
+        state, record = engine.round(state, t)
+        out, rest = eqx.partition(state, eqx.is_array)
+        _check_static(rest, static)
+        out = _like_tree(out, dynamic, "the round's state")
+        if not record_carries:
+            record = {**record, "carries": None}
+        else:
+            record = {**record, "carries": eqx.filter(record["carries"], eqx.is_array)}
+        record = {
+            **record,
+            "decided": {k: jnp.asarray(v) for k, v in record["decided"].items()},
+        }
+        return out, record
+
+    return jax.jit(lambda dynamic, rounds: jax.lax.scan(body, dynamic, rounds))
+
+
+def _same_static(a, b) -> bool:
+    da, db = jax.tree_util.tree_flatten(a), jax.tree_util.tree_flatten(b)
+    return da[1] == db[1] and all(x is y or x == y for x, y in zip(da[0], db[0], strict=True))
+
+
+def _check_static(rest, static) -> None:
+    """Refuse a round whose state changed in a leaf that is no array (a step's carry holding a
+    Python value that changed, or that became an array)."""
+    for name in static.carries:
+        a, b = static.carries[name], rest.carries[name]
+        if not _same_static(a, b):
+            raise _Unsettled(
+                f"run: the carry of {name!r} changed a value that is not an array between rounds "
+                f"({a!r} to {b!r}); each round is one step of a scan, whose state is arrays: "
+                "hold a count or a flag in the carry as a JAX array (jnp.asarray(0)), and keep "
+                "every other value of the carry the same from round to round"
+            )
+    if not _same_static(rest, static):
+        raise _Unsettled(
+            "run: the round changed a value of its state that is not an array (the parameter "
+            "home's or a held option's); a step returns the params it was given or learned ones "
+            "of the same form"
+        )
 
 
 # ---------------------------------------------------------------------------------- run
@@ -982,7 +1485,8 @@ def _run(
     carries: Mapping[str, Any] | None = None,
     record_carries: bool = False,
 ) -> Trajectory:
-    """:func:`~hybrid_aif.composition.runner.run`, the engine."""
+    """:func:`~hybrid_aif.composition.runner.run`, the engine: the structure pass, the reset,
+    round 0 on concrete values, and the compiled scan of the rounds after it."""
     _check_order(tick_order)
     if not isinstance(system, System):
         raise TypeError(f"run: the first argument is a {type(system).__name__}, not a System")
@@ -990,7 +1494,9 @@ def _run(
         raise TypeError(f"run: params is a {type(params).__name__}, not SystemParams")
     if isinstance(ticks, bool) or not isinstance(ticks, int | np.integer) or ticks < 0:
         raise ValueError(f"run: ticks={ticks!r} is not a non-negative integer")
+    ticks = int(ticks)
     system._params_in(params, "run")
+    # ---- the structure pass: everything that reads structure, not values (R2)
     nodes = _structure(system, params, steps)
     names = {n.name for n in nodes}
     unknown = sorted(set(carries or {}) - names)
@@ -1010,14 +1516,10 @@ def _run(
                     f"{floats[0]!r} is driven by a continuous variable; a planner holds a driven "
                     "input at one level, so give the node a custom step"
                 )
-    first = [n for n in nodes if not n.phase_two]
     count = len(nodes)
-    action_nodes = [a for a in system.action_names if a is not None]
-    index = {a: i for i, a in enumerate(action_nodes)}
     kernels = system._actuator(params, "run")
     ports = system.ports(params)
     types = dict(ports.outs)
-    views = _Views(system, steps)
     declared_by = {n.name: _declared_durations(params, n.name) for n in nodes}
     clocked = {name for name, declared in declared_by.items() if declared}
     scales = _check_clocks(clocks, names, clocked, system._black_boxes)
@@ -1043,174 +1545,118 @@ def _run(
                     "the duration is read off the intended level; give the node an identity "
                     "actuator, or drop its durations"
                 )
-
+    schedule = {
+        n.name: _clock_of(system, n, params, scales[n.name]) for n in nodes if n.name in clocked
+    }
     if tick_order == "simultaneous":
-        _check_shared_learning(nodes, views, params)
+        _check_shared_learning(system, nodes, params)
+    engine = _Engine(system, nodes, second, derive, tick_order, kernels, types, schedule)
 
+    # ---- the reset (section 4.4), on concrete values
     values: dict[str, Array | None] = {v: None for n in nodes for v in n.outs}
-    live_carry = {n.name: (carries or {}).get(n.name) for n in nodes}
-    home = params
+    live = {n.name: (carries or {}).get(n.name) for n in nodes}
     key, k_reset = jax.random.split(key)
-    # ---- the reset calls
     for node, k in zip(nodes, _reset_keys(k_reset, count), strict=True):
-        view, vparams = _reset_view(views, node, home)
-        out, live_carry[node.name], _ = node.step(view, k, None, live_carry[node.name], vparams)
+        view, vparams = _reset_view(system, node, params)
+        out, live[node.name], _ = node.step(view, k, None, live[node.name], vparams)
         out = _check_out(node, out, types, system, reset=True)
         values.update(out)
     start = {n.name: {v: values[v] for v in n.outs if values[v] is not None} for n in nodes}
-    sweep = _sweep_generator(key, count)
+    held = {
+        n.name: (jnp.zeros((), jnp.int32), {a: _null(types[a]) for a in n.chosen})
+        for n in nodes
+        if n.name in schedule
+    }
+    state = _State(key, values, live, params, held, _sweep_key(key, count))
+    reset_carries = dict(live)
 
-    received = {n.name: [] for n in nodes}
-    emitted = {n.name: [] for n in nodes}
-    intended = {n.name: [] for n in nodes}
-    decided = {n.name: [] for n in nodes}
-    held: dict[str, _Held] = {}
-    carry_log = {n.name: [live_carry[n.name]] for n in nodes}
-
-    def stands(node: _Node, variable: str) -> bool:
-        """Whether ``node`` reads ``variable`` as it stands now rather than at the round's
-        boundary. Under ``"sequential"`` and ``"async"`` every read stands; under
-        ``"simultaneous"`` only a control node driven by an action node does, reading the value
-        realised this round."""
-        return tick_order != "simultaneous" or (
-            variable in index and variable in node.driven.values()
-        )
-
-    def read(node: _Node, source: Mapping[str, Any], at_boundary: Mapping[str, Any]) -> dict:
-        return {
-            slot: (source if stands(node, variable) else at_boundary).get(variable)
-            for slot, variable in node.reads.items()
-        }
-
-    def realise(k: Array, chosen: Mapping[str, Array], members: Sequence[str]) -> None:
-        draws = [(index[a], kernels[a], chosen[a]) for a in members if a in kernels and a in chosen]
-        drawn = _actuate(k, len(action_nodes), draws)
-        for a in members:
-            if a in chosen:
-                values[a] = drawn.get(index[a], chosen[a])
-
-    def turn(node: _Node, k: Array, at_boundary: Mapping[str, Any]) -> dict[str, Array]:
-        """``node`` stepped on what it reads, its return checked, its emissions stored; the
-        action nodes it chose (intended) are returned, to be realised by the caller. Under
-        ``"simultaneous"`` the view is taken from the home as the round began and a write-back is
-        held for the round's boundary; otherwise both are live."""
-        nonlocal home
-        base = round_home if tick_order == "simultaneous" else home
-        seen = read(node, values, at_boundary)
-        wanted = ()
-        if getattr(node.step, "sliced", False):
-            wanted = tuple(
-                (v, _level_of((values if stands(node, v) else at_boundary).get(v)))
-                for v in node.inputs
-            )
-        view, vparams = views.get(node, base, wanted)
-        sliced = {s for s, v in node.driven.items() if v in {w for w, _ in wanted}}
-        obs = {s: x for s, x in seen.items() if s not in sliced}
-        out, live_carry[node.name], learned = node.step(
-            view, k, obs, live_carry[node.name], vparams
-        )
-        if learned is not vparams:
-            if not isinstance(learned, SystemParams):
-                raise ValueError(
-                    f"run: the step of {node.name!r} returned {type(learned).__name__} as its "
-                    "params; a step returns the SystemParams it was given, or learned ones"
-                )
-            learned, written = _own_slots(view, node, vparams, learned, wanted, base)
-            _check_parameters_only(view, node.name, vparams, learned)
-            new = write_back(system, base, node.name, vparams, learned)
-            if tick_order == "simultaneous":
-                pending.append((node.name, new, written))
+    # ---- round 0 on concrete values, then the scan of the rounds after it (R1); while the
+    # state's shapes still change (a mixture belief growing to its cap) a round runs on concrete
+    # values again, at most _SETTLE of them
+    heads: list = []
+    rest = None
+    timing = {"compile": 0.0, "scan": 0.0, "scanned": 0, "concrete": 0}
+    t = 0
+    while t < ticks:
+        if t:
+            dynamic, static = eqx.partition(state, eqx.is_array)
+            program = _scan_program(engine, static, record_carries)
+            rounds = jnp.arange(t, ticks, dtype=jnp.int32)
+            try:
+                begun = time.perf_counter()
+                compiled = program.lower(dynamic, rounds).compile()
+                timing["compile"] = time.perf_counter() - begun
+            except _Unsettled:
+                if t > _SETTLE:
+                    raise
             else:
-                home = new if not written else dataclasses.replace(new, **written(new))
-                if written:
-                    views.clear()
-        received[node.name].append(seen)
-        out = _check_out(node, out, types, system, reset=False)
-        for e in node.emissions:
-            values[e] = out[e]
-        chosen = {a: out[a] for a in node.chosen}
-        intended[node.name].append(chosen)
-        if node.name in clocked:
-            rounds = _option_rounds(
-                _chosen_duration(view, vparams, chosen),
-                scales[node.name],
-                f"run: the duration of control node {_durations_node(view, vparams)!r} "
-                f"of {node.name!r}",
-                f"its clock of {scales[node.name]} rounds per unit",
-            )
-            held[node.name] = _Held(rounds - 1, chosen)
-        return chosen
-
-    def decide(node: _Node, k: Array, at_boundary: Mapping[str, Any]) -> dict[str, Array]:
-        """``turn``, except that a clocked node inside its option steps nothing: it keeps the
-        action it holds (its action nodes stand realised), and counts one round down."""
-        state = held.get(node.name)
-        if state is not None and state.remaining > 0:
-            held[node.name] = state._replace(remaining=state.remaining - 1)
-            received[node.name].append(read(node, values, at_boundary))
-            intended[node.name].append(state.action)
-            decided[node.name].append(False)
-            return {}
-        decided[node.name].append(True)
-        return turn(node, k, at_boundary)
-
-    round_home = home
-    pending: list = []
-    for round_ in range(ticks):
-        key, k_tick = jax.random.split(key)
-        keys = _round_keys(k_tick, count)
-        boundary = dict(values)
-        round_home = home
-        pending.clear()
-        if tick_order == "simultaneous":
-            chosen: dict[str, Array] = {}
-            for node in first:
-                chosen.update(decide(node, keys[node.index], boundary))
-            realise(keys[2 * count], chosen, [a for n in first for a in n.chosen])
-        else:
-            sources = (
-                [first[int(i)] for i in sweep.permutation(len(first))]
-                if tick_order == "async"
-                else first
-            )
-            for node in derive(sources):
-                realise(
-                    keys[count + node.index], decide(node, keys[node.index], boundary), node.chosen
-                )
-        if tick_order == "simultaneous":
-            for node in second:
-                realise(
-                    keys[count + node.index], decide(node, keys[node.index], boundary), node.chosen
-                )
-            if pending:
-                home = _at_the_boundary(system, round_home, pending, round_)
-                if any(written for _, _, written in pending):
-                    views.clear()
-        for node in nodes:
-            emitted[node.name].append({v: values[v] for v in node.outs})
-            carry_log[node.name].append(live_carry[node.name])
-
-    final = {n.name: read(n, values, values) for n in nodes}
+                begun = time.perf_counter()
+                dynamic, rest = jax.block_until_ready(compiled(dynamic, rounds))
+                timing.update(scan=time.perf_counter() - begun, scanned=ticks - t)
+                state = eqx.combine(dynamic, static)
+                break
+        state, row = engine.round(state, t)
+        heads.append(row)
+        state = _strong(state)
+        t += 1
+    timing["concrete"] = len(heads)
+    if not engine.wrote:
+        state = state._replace(home=params)  # no step wrote back: the home is the one handed in
+    final = {n.name: engine.read(n, state.values, state.values) for n in nodes}
     return _assemble_record(
         system,
         params,
-        home,
+        state,
         nodes,
         ticks,
         types,
         ports,
         start,
-        received,
+        reset_carries,
+        heads,
+        rest,
         final,
-        emitted,
-        intended,
-        carry_log if record_carries else None,
-        live_carry,
-        decided,
-    )
+        record_carries,
+    )._replace(timing=timing)
 
 
-def _own_slots(view, node, given, learned, wanted, home):
+def _sweep_key(key: Array, count: int) -> Array:
+    """The key the async order is drawn from: the run key folded by the node count (so the
+    per-round key stream is untouched); round ``t`` permutes the sources with
+    ``jax.random.permutation(fold_in(sweep, t), sources)``."""
+    return jax.random.fold_in(key, count)
+
+
+# --------------------------------------------------------------------------- write-backs
+
+
+def _unchanged(a, b):
+    """Whether two trees hold the same values: ``True`` where every leaf is the same object or
+    equal on concrete values, ``False`` where the structure or a concrete leaf differs, else a
+    traced flag."""
+    la, ta = jax.tree_util.tree_flatten(a)
+    lb, tb = jax.tree_util.tree_flatten(b)
+    if ta != tb or len(la) != len(lb):
+        return False
+    flags = []
+    for x, y in zip(la, lb, strict=True):
+        if x is y:
+            continue
+        try:
+            same = jnp.array_equal(x, y, equal_nan=True)
+        except TypeError:
+            same = x == y
+        if not _traced(same):
+            if not bool(same):
+                return False
+            continue
+        flags.append(same)
+    if not flags:
+        return True
+    return functools.reduce(jnp.logical_and, flags)
+
+
+def _own_slots(view, node, given, learned, wanted, home, flag=None):
     """The tables a view learned that are its own, split off for the home.
 
     Returns ``(learned', write)``: ``learned'`` is ``learned`` with each own table (a likelihood,
@@ -1218,7 +1664,8 @@ def _own_slots(view, node, given, learned, wanted, home):
     what remains differing is the parameter variables, and ``write`` maps the home to the fields
     that hold the learned tables under their namespaced keys, or is ``None`` when none changed. A
     learned table whose shape differs from the home's (the view was sliced at a driven variable)
-    is refused, naming the table and the variable."""
+    is refused, naming the table and the variable; inside the scanned round (traced values) the
+    refusal is handed to ``flag`` and the table is not written."""
     filled = {(slot, i) for slot, i, _ in given.references}
     changed: dict[str, dict[str, Any]] = {}
     keep = {}
@@ -1229,41 +1676,45 @@ def _own_slots(view, node, given, learned, wanted, home):
     ):
         before, after = getattr(given, field), getattr(learned, field)
         pairs = {}
+        restore = False
         for i, name in enumerate(names):
             if (field, i) in filled:
                 continue
-            if _same_tree(before[name], after[name]):
+            same = _unchanged(before[name], after[name])
+            if same is True:
                 continue
             home_entry = getattr(home, field)[name]
             if not _same_shape(home_entry, before[name]):
                 sliced = [v for v, level in wanted] or ["a driven variable"]
-                raise ValueError(
+                _flagged_or_raise(
+                    flag,
+                    jnp.logical_not(same) if _traced(same) else True,
+                    f"{node.name}:{field}[{name}]",
                     f"run: the step of {node.name!r} learned {field}[{name!r}], whose shape "
                     f"differs from the home's because the view is sliced at {sliced}; learn it "
-                    "through a declared parameter variable, or leave that slot out of learn"
+                    "through a declared parameter variable, or leave that slot out of learn",
                 )
+                restore = True
+                continue
             pairs[name] = after[name]
+        if pairs or restore:
+            keep[field] = {
+                **after,
+                **{n: before[n] for n in pairs},
+                **{n: before[n] for n in before if restore and n not in pairs},
+            }
         if pairs:
             changed[field] = pairs
-            keep[field] = {**after, **{n: before[n] for n in pairs}}
-    if not changed:
+    if not keep:
         return learned, None
     restored = dataclasses.replace(learned, **keep)
+    if not changed:
+        return restored, None
 
     def write(home):
         return {field: {**getattr(home, field), **pairs} for field, pairs in changed.items()}
 
     return restored, write
-
-
-def _same_tree(a, b) -> bool:
-    la, ta = jax.tree_util.tree_flatten(a)
-    lb, tb = jax.tree_util.tree_flatten(b)
-    if ta != tb or len(la) != len(lb):
-        return False
-    return all(
-        x is y or bool(jnp.array_equal(x, y, equal_nan=True)) for x, y in zip(la, lb, strict=True)
-    )
 
 
 def _same_shape(a, b) -> bool:
@@ -1275,15 +1726,6 @@ def _same_shape(a, b) -> bool:
 def _kind(system: System, params: SystemParams, control: str) -> str:
     names = system._names(system._params_in(params, "run"))
     return names.kind(names.controls.index(control))
-
-
-def _level_of(value) -> "int | Array | None":
-    """The input a sliced view takes for a variable's value: an ``int`` for a level, the vector
-    itself otherwise, ``None`` before the variable has a value."""
-    if value is None:
-        return None
-    array = jnp.asarray(value)
-    return int(array) if array.ndim == 0 and jnp.issubdtype(array.dtype, jnp.integer) else array
 
 
 def _learned_variables(step: Callable, variables) -> set[str]:
@@ -1316,13 +1758,13 @@ def _conjugate(declaration) -> bool:
     return isinstance(declaration, Dirichlet | ConditionalDirichlet)
 
 
-def _check_shared_learning(nodes: list[_Node], views: _Views, home: SystemParams) -> None:
+def _check_shared_learning(system: System, nodes: list[_Node], home: SystemParams) -> None:
     """Under ``"simultaneous"``: refuse, before the first round, two ``plan()`` steps whose
     ``learn`` both reach one parameter variable whose form is not conjugate counts
     (``_at_the_boundary`` could not combine their write-backs). Other steps are checked there."""
     learners: dict[str, list[str]] = {}
     for node in nodes:
-        variables = _reset_view(views, node, home)[1].parameters
+        variables = _reset_view(system, node, home)[1].parameters
         for variable in _learned_variables(node.step, variables):
             learners.setdefault(variable, []).append(node.name)
     for variable, names in learners.items():
@@ -1339,45 +1781,29 @@ def _check_shared_learning(nodes: list[_Node], views: _Views, home: SystemParams
 
 
 def _at_the_boundary(
-    system: System, start: SystemParams, pending: list, round_: int
+    system: System, start: SystemParams, pending: list, round_, flag=None
 ) -> SystemParams:
     """The home after a ``"simultaneous"`` round: ``start`` (the home as the round began) with
     every write-back of the round applied. A variable one node wrote takes its value; one that
     several wrote takes the start's concentration plus the sum of their deltas, the posterior
     given every node's data (Dirichlet counts only, refused for any other form, and refused, as
     ``write_back`` refuses one write-back, where the sum is not positive); each node's own learned
-    tables are written under their names."""
+    tables are written under their names.
+
+    Which nodes wrote a variable is read off its values. On concrete values (round 0) a refusal
+    raises; inside the scanned round each refusal is handed to ``flag`` (a recorded fault) and the
+    variable keeps its round-start value (design batched-run.md R6)."""
     held = system._params_in(start, "run")
     homes = dict(held.parameters)
-    writers: dict[str, list[tuple[str, Any]]] = {}
+    writers: dict[str, list[tuple[str, Any, Any]]] = {}
     for name, new, _ in pending:
         for variable, declaration in system._params_in(new, "run").parameters.items():
-            if not _same_tree(declaration, homes[variable]):
-                writers.setdefault(variable, []).append((name, declaration))
+            same = _unchanged(declaration, homes[variable])
+            if same is not True:
+                wrote = jnp.logical_not(same) if _traced(same) else True
+                writers.setdefault(variable, []).append((name, declaration, wrote))
     for variable, entries in writers.items():
-        if len(entries) == 1:
-            homes[variable] = entries[0][1]
-            continue
-        begun = homes[variable]
-        names = [name for name, _ in entries]
-        if not _conjugate(begun):
-            raise ValueError(
-                f"run: parameter variable {variable!r} ({type(begun).__name__}) was written back "
-                f"by both {names[0]!r} and {names[1]!r} in round {round_} under "
-                '"simultaneous", where every write-back of a round lands at its boundary and two '
-                "write-backs of one variable combine only as counts (Dirichlet concentrations, "
-                'their deltas summed); run them under "sequential" or "async", or let one node '
-                "learn it"
-            )
-        total = begun.concentration + sum(d.concentration - begun.concentration for _, d in entries)
-        if not bool(jnp.all(total > 0.0)):
-            raise ValueError(
-                f"write_back: parameter variable {variable!r} has a concentration that is not "
-                f"positive after the views of {names} learned, their deltas summed at the "
-                f"boundary of round {round_} (a decay or rate that overshoots the anchor); it is "
-                "not a Dirichlet and is not written"
-            )
-        homes[variable] = eqx.tree_at(lambda d: d.concentration, begun, total)
+        homes[variable] = _combined(variable, homes[variable], entries, round_, flag)
     out = dataclasses.replace(held, parameters=homes)
     for slot, i, variable in held.references:
         container = list(getattr(out, slot))
@@ -1390,51 +1816,75 @@ def _at_the_boundary(
     return out
 
 
-def _declared_durations(params: SystemParams, name: str) -> dict:
-    """The durations a view of the stepped node ``name`` declares, keyed by control node, read
-    from the home with no view built (a view at no realised level may not exist): with
-    ``subsystem``'s precedence, the System's own ``params.durations`` where it holds any (its
-    entries on nodes at or beneath ``name``), else the ``parts`` of the leaves at or beneath it."""
+def _combined(variable: str, begun, entries: list, round_, flag):
+    """One variable after the boundary: ``entries`` its writers ``(node, declaration, wrote)``,
+    ``wrote`` a concrete ``True`` or a traced flag."""
+    names = [name for name, _, _ in entries]
+    sentence_two = (
+        f"run: parameter variable {variable!r} ({type(begun).__name__}) was written back "
+        f"by both {names[0]!r} and {names[-1]!r} in round {round_} under "
+        '"simultaneous", where every write-back of a round lands at its boundary and two '
+        "write-backs of one variable combine only as counts (Dirichlet concentrations, "
+        'their deltas summed); run them under "sequential" or "async", or let one node '
+        "learn it"
+    )
+    sentence_sum = (
+        f"write_back: parameter variable {variable!r} has a concentration that is not "
+        f"positive after the views of {names} learned, their deltas summed at the "
+        f"boundary of round {round_} (a decay or rate that overshoots the anchor); it is "
+        "not a Dirichlet and is not written"
+    )
+    traced = any(_traced(w) for _, _, w in entries)
+    if not traced:
+        if len(entries) == 1:
+            return entries[0][1]
+        if not _conjugate(begun):
+            raise ValueError(sentence_two)
+        total = begun.concentration + sum(
+            d.concentration - begun.concentration for _, d, _ in entries
+        )
+        if not bool(jnp.all(total > 0.0)):
+            raise ValueError(sentence_sum)
+        return eqx.tree_at(lambda d: d.concentration, begun, total)
+    wrote = [jnp.asarray(w) for _, _, w in entries]
+    n = sum(w.astype(jnp.int32) for w in wrote)
+    single = begun
+    for (_, declaration, _), w in zip(entries, wrote, strict=True):
+        single = _select(w, declaration, single)
+    if len(entries) == 1:
+        return single
+    if not _conjugate(begun):
+        _flagged_or_raise(flag, n > 1, variable, sentence_two)
+        return _select(n > 1, begun, single)
+    total = begun.concentration + sum(
+        jnp.where(w, d.concentration - begun.concentration, 0.0)
+        for (_, d, _), w in zip(entries, wrote, strict=True)
+    )
+    positive = jnp.all(total > 0.0)
+    _flagged_or_raise(flag, (n > 1) & ~positive, variable, sentence_sum)
+    summed = eqx.tree_at(lambda d: d.concentration, begun, total)
+    return _select(n > 1, _select(positive, summed, begun), single)
 
-    def beneath(key: str) -> bool:
-        return key == name or key.startswith(f"{name}{SEPARATOR}")
 
-    if params.durations:
-        return {node: d for node, d in params.durations.items() if beneath(node)}
-    out: dict = {}
-    for leaf, part in (params.parts or {}).items():
-        if beneath(leaf):
-            out.update(part.durations or {})
-    return out
+def _flagged_or_raise(flag, bad, label: str, sentence: str) -> None:
+    if flag is None:
+        _flagged(None, bad, label, sentence)
+    else:
+        flag(bad, label, sentence)
 
 
-def _reset_view(views: _Views, node: _Node, home: SystemParams):
-    """The view of a node's reset call: averaged uniformly over its driven inputs, or, where
-    ``subsystem`` refuses that average with a :class:`MixtureRefusal` (a Gaussian target or a
-    linear-Gaussian transition conditional on a driven node would be a mixture), sliced at the
-    first level of each input. A reset call reads no table, so the level
-    is immaterial."""
-    try:
-        return views.get(node, home, _uniform(node))
-    except MixtureRefusal:
-        levels = _uniform(node)
-        if not levels:
-            raise
-        return views.get(node, home, tuple((v, 0) for v, _ in levels))
-
-
-def _uniform(node: _Node) -> tuple:
-    """The input levels of a node's first view (nothing realised yet: each averaged uniformly)."""
-    if not getattr(node.step, "sliced", False):
-        return ()
-    return tuple((v, None) for v in node.inputs)
+# ------------------------------------------------------------------------- the outputs
 
 
 def _check_out(
-    node: _Node, out: Mapping[str, Array], types, system: System, reset: bool
+    node: _Node, out: Mapping[str, Array], types, system: System, reset: bool, standing=None
 ) -> dict[str, Array]:
     """A step's return checked: a mapping keyed by out-ports of the node, each action node one
-    level (or a float vector of its width), every emission present from the first round."""
+    level (or a float vector of its width), every emission present from the first round. Shapes
+    and dtypes are checked as the step returns them (inside the scan, once, on the trace); a
+    level's range is checked here on a concrete value and by :func:`_check_ranges` on a traced
+    one. ``standing`` holds the values the ports hold, whose shapes and dtypes the round's values
+    keep (the scan's state)."""
     if not isinstance(out, Mapping):
         raise TypeError(
             f"run: the step of {node.name!r} returned a {type(out).__name__}; a step returns a "
@@ -1468,123 +1918,181 @@ def _check_out(
             )
     checked = {}
     for k, value in out.items():
-        kind, size = types[k]
-        if k in node.emissions and dict(system.emissions)[k].kernel == BLACK_BOX:
-            checked[k] = _box_value(node.name, k, value, kind, size)
-            continue
-        level = jnp.asarray(value)
-        if k in node.emissions:
-            soft = dict(system.emissions)[k].realise == "stats"
-            floating = jnp.issubdtype(level.dtype, jnp.floating)
-            if kind == LEVEL and floating and level.shape == (size,):
-                pass  # a probability vector over the port's levels
-            elif kind == LEVEL and not (
-                level.shape == () and jnp.issubdtype(level.dtype, jnp.integer)
-            ):
-                raise ValueError(
-                    f"run: the step of {node.name!r} returned {k!r} of dtype {level.dtype} and "
-                    f"shape {tuple(level.shape)}; the port has {size} levels, so emit one integer "
-                    f"level, or a probability vector of shape ({size},)"
-                )
-            elif kind == LEVEL and not 0 <= int(level) < size:
-                raise ValueError(
-                    f"run: the step of {node.name!r} returned {k!r} = {int(level)}; the port has "
-                    f"{size} levels, so emit a level in [0, {size})"
-                )
-            elif kind == FLOAT and not soft and level.shape != (size,):
-                raise ValueError(
-                    f"run: the step of {node.name!r} returned {k!r} of shape "
-                    f"{tuple(level.shape)}; the port is a float vector of width {size}, shape "
-                    f"({size},)"
-                )
-            checked[k] = level
-            continue
-        if kind == FLOAT:
-            if level.shape != (size,) or not jnp.issubdtype(level.dtype, jnp.floating):
-                raise ValueError(
-                    f"run: the step of {node.name!r} returned {k!r} of dtype {level.dtype} and "
-                    f"shape {tuple(level.shape)}; a continuous action node takes a float vector "
-                    f"of its width, shape ({size},)"
-                )
-            checked[k] = level
-            continue
-        if level.shape != () or not jnp.issubdtype(level.dtype, jnp.integer):
-            raise ValueError(
-                f"run: the step of {node.name!r} returned {k!r} of dtype {level.dtype} and shape "
-                f"{tuple(level.shape)}; an action node takes one integer level, shape ()"
+        checked[k] = _checked_value(node, k, value, types, system)
+        if standing is not None and standing.get(k) is not None:
+            checked[k] = _like(
+                checked[k], standing[k], f"{k!r}, returned by the step of {node.name!r}"
             )
-        if not 0 <= int(level) < size:
-            raise ValueError(
-                f"run: the step of {node.name!r} returned {k!r} = {int(level)}; the action node "
-                f"has {size} levels, so return a level in [0, {size})"
-            )
-        checked[k] = level.astype(jnp.int32)
     return checked
 
 
+def _checked_value(node: _Node, k: str, value, types, system: System) -> Array:
+    kind, size = types[k]
+    if k in node.emissions and dict(system.emissions)[k].kernel == BLACK_BOX:
+        return _box_value(node.name, k, value, kind, size)
+    if not isinstance(value, Array | np.ndarray | np.generic | numbers.Number):
+        raise TypeError(
+            f"run: the step of {node.name!r} returned {k!r} as a {type(value).__name__}; a step "
+            "returns JAX arrays (a level, or a vector of the port's width)"
+        )
+    level = jnp.asarray(value)
+    if k in node.emissions:
+        soft = dict(system.emissions)[k].realise == "stats"
+        floating = jnp.issubdtype(level.dtype, jnp.floating)
+        if kind == LEVEL and floating and level.shape == (size,):
+            return level  # a probability vector over the port's levels
+        if kind == LEVEL and not (level.shape == () and jnp.issubdtype(level.dtype, jnp.integer)):
+            raise ValueError(
+                f"run: the step of {node.name!r} returned {k!r} of dtype {level.dtype} and "
+                f"shape {tuple(level.shape)}; the port has {size} levels, so emit one integer "
+                f"level, or a probability vector of shape ({size},)"
+            )
+        if kind == LEVEL and not _traced(level) and not 0 <= int(level) < size:
+            raise ValueError(
+                f"run: the step of {node.name!r} returned {k!r} = {int(level)}; the port has "
+                f"{size} levels, so emit a level in [0, {size})"
+            )
+        if kind == FLOAT and not soft and level.shape != (size,):
+            raise ValueError(
+                f"run: the step of {node.name!r} returned {k!r} of shape "
+                f"{tuple(level.shape)}; the port is a float vector of width {size}, shape "
+                f"({size},)"
+            )
+        return level
+    if kind == FLOAT:
+        if level.shape != (size,) or not jnp.issubdtype(level.dtype, jnp.floating):
+            raise ValueError(
+                f"run: the step of {node.name!r} returned {k!r} of dtype {level.dtype} and "
+                f"shape {tuple(level.shape)}; a continuous action node takes a float vector "
+                f"of its width, shape ({size},)"
+            )
+        return level
+    if level.shape != () or not jnp.issubdtype(level.dtype, jnp.integer):
+        raise ValueError(
+            f"run: the step of {node.name!r} returned {k!r} of dtype {level.dtype} and shape "
+            f"{tuple(level.shape)}; an action node takes one integer level, shape ()"
+        )
+    if not _traced(level) and not 0 <= int(level) < size:
+        raise ValueError(
+            f"run: the step of {node.name!r} returned {k!r} = {int(level)}; the action node "
+            f"has {size} levels, so return a level in [0, {size})"
+        )
+    return level.astype(jnp.int32)
+
+
+def _check_ranges(node: _Node, out: Mapping[str, Array], types, system: System, flag) -> None:
+    """The range of each traced level a step returned, a recorded fault where it is out of
+    range (a level of a concrete round was refused by :func:`_check_out`); design batched-run.md
+    R7."""
+    for k, value in out.items():
+        kind, size = types[k]
+        if kind != LEVEL or not _traced(value) or jnp.shape(value) != ():
+            continue
+        bad = (value < 0) | (value >= size)
+        flag(bad, k, f"run: the step of {node.name!r} returned {k!r} out of [0, {size})")
+
+
 def _box_value(name: str, port: str, value, kind: str, size: int) -> Array:
-    """A black box's out-port value checked against the port's declared type on the host and
-    stored in one dtype: a level port takes one integer level in range (any integer type, stored
-    as int32), a float port a vector of its width (an integer one converted, a scalar taken for
-    width 1, stored in the library's float dtype). Anything else is refused naming the port."""
-    arr = np.asarray(value)
-    got = f"{arr.dtype} of shape {tuple(arr.shape)}"
+    """A black box's out-port value checked against the port's declared type and stored in one
+    dtype: a level port takes one integer level in range (any integer type, stored as int32), a
+    float port a vector of its width (an integer one converted, a scalar taken for width 1, stored
+    in the library's float dtype). Anything else is refused naming the port. Shapes and dtypes are
+    checked on the trace; a level's range on a concrete value (a traced one by
+    :func:`_check_ranges`)."""
+    if not isinstance(value, Array | np.ndarray | np.generic | numbers.Number):
+        raise ValueError(
+            f"run: the step of {name!r} returned {port!r} as a {type(value).__name__}; the port is "
+            "a black box's out-port, so return a JAX array (a level, or a vector of the port's "
+            "width)"
+        )
+    dtype = value.dtype if hasattr(value, "dtype") else np.asarray(value).dtype
+    got = f"{dtype} of shape {tuple(np.shape(value))}"
+    numeric = np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.floating)
+    if not numeric:
+        what = (
+            f"out-port of {size} levels, so return one integer level in [0, {size})"
+            if kind == LEVEL
+            else f"float out-port of width {size}, so return a vector of shape ({size},) of numbers"
+        )
+        raise ValueError(
+            f"run: the step of {name!r} returned {port!r} as {got}; the port is a black box's "
+            + what
+        )
+    arr = jnp.asarray(value)
     if kind == LEVEL:
-        ok = arr.shape == () and np.issubdtype(arr.dtype, np.integer)
+        ok = arr.shape == () and jnp.issubdtype(arr.dtype, jnp.integer)
         if not ok:
             raise ValueError(
                 f"run: the step of {name!r} returned {port!r} as {got}; the port is a black box's "
                 f"out-port of {size} levels, so return one integer level in [0, {size})"
             )
-        if not 0 <= int(arr) < size:
+        if not _traced(arr) and not 0 <= int(arr) < size:
             raise ValueError(
                 f"run: the step of {name!r} returned {port!r} = {int(arr)}; the port is a black "
                 f"box's out-port of {size} levels, so return one integer level in [0, {size})"
             )
-        return jnp.asarray(int(arr), jnp.int32)
-    numeric = np.issubdtype(arr.dtype, np.integer) or np.issubdtype(arr.dtype, np.floating)
-    if numeric and arr.shape == () and size == 1:
+        return arr.astype(jnp.int32)
+    if arr.shape == () and size == 1:
         arr = arr.reshape(1)
-    if not numeric or arr.shape != (size,):
+    if arr.shape != (size,):
         raise ValueError(
             f"run: the step of {name!r} returned {port!r} as {got}; the port is a black box's "
             f"float out-port of width {size}, so return a vector of shape ({size},) of numbers"
             + (" (or one number)" if size == 1 else "")
         )
-    return jnp.asarray(arr, jnp.result_type(float))
+    return arr.astype(jnp.result_type(float))
 
 
 # ----------------------------------------------------------------------- the trajectory
 
 
-def _stack(values: list, null: Array) -> tuple[Array, Array | None]:
-    """``values`` (arrays or ``None``) stacked, absent ones as zeros of the first present shape;
-    with the flags of which were present."""
-    present = jnp.asarray([v is not None for v in values], dtype=bool)
-    like = next((v for v in values if v is not None), null)
-    filled = [jnp.zeros_like(like) if v is None else jnp.asarray(v) for v in values]
-    stacked = (
-        jnp.stack(filled) if filled else jnp.zeros((0, *jnp.shape(like)), jnp.asarray(like).dtype)
-    )
-    return stacked, present
+def _series(head: list, body, tail: list, null: Array) -> tuple[Array, Array]:
+    """A record over rounds: the values of ``head`` (arrays or ``None``), the rows of ``body`` (an
+    array stacked over the scanned rounds, or ``None``) and the values of ``tail``, absent ones as
+    zeros of the first present shape; with the flags of which were present."""
+    rows = 0 if body is None else body.shape[0]
+    like = next((v for v in head if v is not None), None)
+    if like is None and rows:
+        like = jnp.zeros(body.shape[1:], body.dtype)
+    if like is None:
+        like = next((v for v in tail if v is not None), null)
+    like = jnp.asarray(like)
+    parts, present = [], []
+    for v in head:
+        parts.append((jnp.zeros_like(like) if v is None else jnp.asarray(v))[None])
+        present.append(v is not None)
+    if rows:
+        parts.append(body)
+        present.extend([True] * rows)
+    for v in tail:
+        parts.append((jnp.zeros_like(like) if v is None else jnp.asarray(v))[None])
+        present.append(v is not None)
+    stacked = jnp.concatenate(parts) if parts else jnp.zeros((0, *like.shape), like.dtype)
+    return stacked, jnp.asarray(present, dtype=bool)
+
+
+def _unstacked(stacked, static, rows: int) -> list:
+    """The ``rows`` entries of a tree stacked over rounds, each recombined with ``static`` (the
+    leaves that are no arrays)."""
+    leaves, treedef = jax.tree_util.tree_flatten(stacked)
+    columns = [list(jnp.unstack(leaf)) if rows else [] for leaf in leaves]
+    return [eqx.combine(treedef.unflatten([c[t] for c in columns]), static) for t in range(rows)]
 
 
 def _assemble_record(
     system,
     params,
-    home,
+    state,
     nodes,
     ticks,
     types,
     ports,
     start,
-    received,
+    reset_carries,
+    heads,
+    rest,
     final,
-    emitted,
-    intended,
-    carry_log,
-    live_carry,
-    decided,
+    record_carries,
 ) -> Trajectory:
     table = dict(system.subsystems)
     order = list(table)
@@ -1596,18 +2104,48 @@ def _assemble_record(
         t = modality_types.get(slot) or control_types.get(slot) or types[node.reads[slot]]
         return _null(t)
 
+    def body(field: str, name: str, key: str):
+        return None if rest is None else rest[field][name][key]
+
     for node in nodes:
-        r_rounds = received[node.name] + [final[node.name]]
         rec: dict[str, Array] = {}
         pres: dict[str, Array] = {}
         for slot in node.reads:
-            rec[slot], pres[slot] = _stack([held[slot] for held in r_rounds], slot_null(node, slot))
+            rec[slot], pres[slot] = _series(
+                [h["received"][node.name][slot] for h in heads],
+                body("received", node.name, slot),
+                [final[node.name][slot]],
+                slot_null(node, slot),
+            )
         em: dict[str, Array] = {}
         for v in node.outs:
-            em[v], _ = _stack([held[v] for held in emitted[node.name]], _null(types[v]))
+            em[v], _ = _series(
+                [h["emitted"][node.name][v] for h in heads],
+                body("emitted", node.name, v),
+                [],
+                _null(types[v]),
+            )
         it: dict[str, Array] = {}
         for a in node.chosen:
-            it[a], _ = _stack([held[a] for held in intended[node.name]], _null(types[a]))
+            it[a], _ = _series(
+                [h["intended"][node.name][a] for h in heads],
+                body("intended", node.name, a),
+                [],
+                _null(types[a]),
+            )
+        decided, _ = _series(
+            [jnp.asarray(h["decided"][node.name]) for h in heads],
+            None if rest is None else rest["decided"][node.name],
+            [],
+            jnp.zeros((), bool),
+        )
+        log = None
+        if record_carries:
+            log = [reset_carries[node.name], *(h["carries"][node.name] for h in heads)]
+            if rest is not None:
+                static = eqx.filter(state.carries[node.name], eqx.is_array, inverse=True)
+                log.extend(_unstacked(rest["carries"][node.name], static, ticks - len(heads)))
+            log = tuple(log)
         records[node.name] = Trajectory(
             None,
             {},
@@ -1616,9 +2154,9 @@ def _assemble_record(
             _relative(em, node.name),
             _relative(it, node.name),
             _relative(start[node.name], node.name),
-            None if carry_log is None else tuple(carry_log[node.name]),
-            live_carry[node.name],
-            jnp.asarray(decided[node.name], dtype=bool),
+            log,
+            state.carries[node.name],
+            decided.astype(bool),
         )
     # the tree above the stepped nodes: one node per component
     parents = {
@@ -1672,7 +2210,13 @@ def _assemble_record(
 
     top = {k: build(k) for k in order if parents[k] is None}
     root = union("", {k: v for k, v in top.items() if v is not None})
-    return root._replace(params=home)
+    faults = {}
+    if rest is not None:
+        for label, flags in rest["faults"].items():
+            faults[label] = jnp.concatenate(
+                [jnp.zeros((len(heads),), bool), jnp.asarray(flags, bool)]
+            )
+    return root._replace(params=state.home, faults=faults)
 
 
 def _relative(values: Mapping[str, Any], node: str) -> dict[str, Any]:
@@ -1709,13 +2253,22 @@ def run(
     to the home each round (the next view is taken from the new home), and ``Trajectory.params``
     is the home after the last round.
 
+    The rounds after the first are one compiled ``lax.scan`` of the round body (module docstring,
+    *The compiled round*): a step is a traced function whose outputs keep the shapes and dtypes
+    of round 0 and whose carry keeps its structure, and a step that calls host-side code on a
+    traced value is refused naming it (log from inside a step with ``jax.debug.callback``, or
+    record what it sees in its carry). A check of a value that fails after round 0 is recorded
+    in ``Trajectory.faults`` and the run goes on; round 0 refuses it.
+
     Refused, each naming the fix: an open System; ``steps`` that is not an antichain covering
     every leaf, that names no component, or that names a non-leaf node and a ``sample()`` leaf
     beneath it; a step that omits an emission or an action node of its node on a round; a cycle
     of identifications of action nodes with control nodes; ``clocks`` or ``carries`` naming no
     stepped node, or ``clocks`` naming a node that declares no durations; a duration whose
-    product with its clock is under one round or not a whole number of rounds; an action node
-    of a node with durations under a non-identity actuator. A black box
+    product with its clock is under one round or not a whole number of rounds, at any level of
+    its durations table; an action node of a node with durations under a non-identity actuator;
+    a step that calls host-side code on a traced value, or whose carry, params or out-ports change
+    structure or shape between rounds. A black box
     (:func:`~hybrid_aif.composition.black_box.black_box`) is stepped by a custom step; ``plan()``
     or ``sample()`` on one, a step marked ``sliced`` on one, a node planned jointly with one
     beneath it and an in-port of one that nothing drives are refused.
@@ -1782,36 +2335,33 @@ def _own_fields(system: System, view_params: SystemParams) -> dict[str, object]:
 
 
 def _check_parameters_only(
-    system: System, name: str, given: SystemParams, learned: SystemParams
+    system: System, name: str, given: SystemParams, learned: SystemParams, flag=None
 ) -> None:
     """Refuse learned params that differ from the given ones outside the parameter variables.
-    Leaves are compared by identity first and by value only where the identity changed."""
+    Leaves are compared by identity first and by value only where the identity changed; inside
+    the scanned round (traced values) a difference is handed to ``flag``, a recorded fault, and
+    the home is written from the parameter variables alone."""
     before = _own_fields(system, system._params_in(given, "run"))
     after = _own_fields(system, system._params_in(learned, "run"))
     differ = [] if before.keys() == after.keys() else ["the set of fields"]
+    traced = []
     for field in before.keys() & after.keys():
-        la, ta = jax.tree_util.tree_flatten(before[field])
-        lb, tb = jax.tree_util.tree_flatten(after[field])
-        if ta != tb or len(la) != len(lb):
+        same = _unchanged(before[field], after[field])
+        if same is False:
             differ.append(field)
-            continue
-        for x, y in zip(la, lb, strict=True):
-            if x is y:
-                continue
-            try:
-                same = bool(jnp.array_equal(x, y, equal_nan=True))
-            except TypeError:
-                same = x == y
-            if not same:
-                differ.append(field)
-                break
+        elif same is not True:
+            traced.append((field, same))
+    sentence = (
+        f"the step of component {name!r} returned params that differ from the ones it was "
+        f"given in {sorted(differ or [f for f, _ in traced])}; on a composite only declared "
+        "parameter variables are written back to the home, so a table that is learned must be "
+        "declared as a Parameter variable"
+    )
     if differ:
-        raise ValueError(
-            f"the step of component {name!r} returned params that differ from the ones it was "
-            f"given in {sorted(differ)}; on a composite only declared parameter variables are "
-            "written back to the home, so a table that is learned must be declared as a "
-            "Parameter variable"
-        )
+        raise ValueError(sentence)
+    if traced:
+        bad = functools.reduce(jnp.logical_or, [jnp.logical_not(same) for _, same in traced])
+        _flagged_or_raise(flag, bad, f"{name}:params", sentence)
 
 
 def _rounds_per_unit(value, what: str) -> float:
@@ -1834,26 +2384,19 @@ def _rounds_per_unit(value, what: str) -> float:
     return value
 
 
-def _option_rounds(unit: float, scale: float, what: str, clock: str) -> int:
+def _option_rounds(unit: float, scale: float, what: str, clock: str, level=None) -> int:
     """The rounds an option of duration ``unit`` lasts at ``scale`` rounds per unit, which must be
-    a whole number of at least one; ``what`` names the duration and ``clock`` the scale in the
-    refusals."""
+    a whole number of at least one; ``what`` names the duration, ``clock`` the scale and
+    ``level`` the level (``None``: the chosen one) in the refusals."""
     value = unit * scale
     rounds = round(value)
+    at = "the chosen level" if level is None else f"level {level}"
     if value < 1 - 1e-5:
         raise ValueError(
-            f"{what} at the chosen level is {unit:g}, which times {clock} is shorter than one round"
+            f"{what} at {at} is {unit:g}, which times {clock} is shorter than one round"
         )
     if abs(value - rounds) > 1e-5 * max(1.0, abs(value)):
         raise ValueError(
-            f"{what} at the chosen level is {unit:g}, which times {clock} is not a whole number "
-            "of rounds"
+            f"{what} at {at} is {unit:g}, which times {clock} is not a whole number of rounds"
         )
     return rounds
-
-
-def _durations_node(system: System, params: SystemParams) -> str:
-    """The control node that carries ``params.durations``."""
-    declared = system._durations(system._params_in(params, "run"), "run")
-    ((node, _),) = declared.items()
-    return node

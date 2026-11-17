@@ -12,7 +12,7 @@ its ``M`` minds, stepped mind ``j`` with key ``j``, realised sequentially with k
 simultaneously, and stepped its one process, with the last key, and reset the process with the
 reset key. ``run`` steps every node, the process included, with ``2N + 1`` keys.
 ``_old_layout(M)`` patches ``_round_keys`` and ``_reset_keys`` to hand the minds and the process
-those keys, and ``_sweep_generator`` to seed the async order with ``M``; nothing else differs, so
+those keys, and ``_sweep_key`` to seed the async order with ``M``; nothing else differs, so
 the comparison is of the rounds and not of a key schedule.
 
 Every case is compared under all three orders: every node's intended and realised actions, the
@@ -23,6 +23,12 @@ has one world that steps once at its turn with its own key, so the pushers' inde
 draw differently from the third tick of a sequential or async run. The zoo's world states match
 under every order (its two components share latents, and the draws land the same); the
 same-step zoo is compared under simultaneous and sequential only.
+
+**The async re-pin.** ``run``'s async order is drawn by ``jax.random.permutation`` inside the
+scanned round (design batched-run.md R9), where the previous drivers drew it from a host
+generator; under the same seed the two direct-wire cases (four of their fourteen arrays) draw
+another order, and are compared against ``tests/data/run_parity_async.npz``, recorded from
+``run`` on 2026-11-17. Every other async array is still the previous drivers' own.
 """
 
 import dataclasses
@@ -55,6 +61,11 @@ from tests.test_run_nested import _shared
 from tests.test_run_nested import _zoo as _same_step_zoo
 
 FIXTURE = np.load(pathlib.Path(__file__).parent / "data" / "run_parity.npz")
+#: The async direct-wire case re-pinned when ``run``'s async order moved from a host generator to
+#: ``jax.random.permutation`` (design batched-run.md R9, R13 pin 1): recorded from ``run`` itself,
+#: so it pins that run's own draws, not a previous driver's. Every other async array still matches
+#: ``run_parity.npz``.
+REPINNED = np.load(pathlib.Path(__file__).parent / "data" / "run_parity_async.npz")
 KEY = jax.random.PRNGKey(0)
 ORDERS = ("simultaneous", "sequential", "async")
 
@@ -89,11 +100,11 @@ def _old_layout(minds: int):
             key if p == 0 else jax.random.fold_in(key, p) for p in range(count - minds)
         ]
 
-    original = runner._sweep_generator
+    original = runner._sweep_key
     return (
         mock.patch.object(runner, "_round_keys", round_keys),
         mock.patch.object(runner, "_reset_keys", reset_keys),
-        mock.patch.object(runner, "_sweep_generator", lambda key, count: original(key, minds)),
+        mock.patch.object(runner, "_sweep_key", lambda key, count: original(key, minds)),
     )
 
 
@@ -151,7 +162,8 @@ def idle(system, key, obs, carry, params):
 
 
 def same(got, name):
-    np.testing.assert_array_equal(np.asarray(got), FIXTURE[name], err_msg=name)
+    want = REPINNED[name] if name in REPINNED.files else FIXTURE[name]
+    np.testing.assert_array_equal(np.asarray(got), want, err_msg=name)
 
 
 def states(trajectory, factor, node="world"):

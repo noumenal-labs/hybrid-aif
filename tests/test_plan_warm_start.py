@@ -149,7 +149,9 @@ def test_a_held_node_shifts_its_plan_once_per_decision():
         carry = node.carries[t + 1]
         acted = np.clip(expected + np.asarray(BUMP), -2.0, 2.0)
         np.testing.assert_allclose(np.asarray(carry.plan), acted, atol=1e-6)
-        assert carry.plan is node.carries[t + 2].plan  # held: the carry stands
+        #  held: the carry stands (the record of a compiled run holds equal values, not the
+        #  same object)
+        np.testing.assert_array_equal(carry.plan, node.carries[t + 2].plan)
         expected = shifted(acted)
 
 

@@ -84,7 +84,8 @@ def test_a_learner_is_handed_what_it_returned_the_round_before():
 
     def watcher(system, key, obs, carry, params):
         if obs is not None:
-            seen.append(_offset(params))
+            #  logged on the host: the rounds after the first run in one compiled scan
+            jax.debug.callback(lambda p: seen.append(_offset(p)), params, ordered=True)
         return inner(system, key, obs, carry, params)
 
     watcher.sliced = True

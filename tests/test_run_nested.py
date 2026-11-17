@@ -43,6 +43,7 @@ from hybrid_aif.composition import (
 )
 from hybrid_aif.composition.merge import _inputs_of, retake
 from hybrid_aif.system.mirror import mirror
+from tests.host_log import logged
 from tests.test_merge import OBSERVATION_BINDINGS, agent_and_world, merged
 from tests.test_merge_gaussian_control import mission as mission_tier
 from tests.test_merge_gaussian_control import rover as lg_rover
@@ -130,7 +131,7 @@ def _viewer(log):
     marked ``sliced`` so ``run`` hands it the view sliced at its driver's realised level."""
 
     def step(system, key, obs, carry, params):
-        log.append(params)
+        logged(log, params)
         return {}, carry, params
 
     step.sliced = True
@@ -143,7 +144,7 @@ def _levels(levels):
     def step(system, key, obs, carry, params):
         if obs is None:
             return {}, 0, params
-        return {f"{M}{ACTION}": jnp.asarray(levels[carry], jnp.int32)}, carry + 1, params
+        return {f"{M}{ACTION}": jnp.asarray(levels, jnp.int32)[carry]}, carry + 1, params
 
     return step
 
@@ -244,7 +245,7 @@ def _learning(log=None):
         if obs is None:
             return out, carry, params
         if log is not None:
-            log.append(params)
+            logged(log, params)
         return out, carry, _bump_any(system, params)
 
     return step
@@ -257,7 +258,7 @@ def _watching(seen):
     @functools.wraps(inner)
     def step(system, key, obs, carry, params):
         if obs is not None:
-            seen.append(params)
+            logged(seen, params)
         return inner(system, key, obs, carry, params)
 
     return step
@@ -399,7 +400,7 @@ def test_a_step_that_does_not_learn_writes_nothing_and_a_learner_beside_it_still
 
     def plain(system, key, obs, carry, params):
         if obs is not None:
-            seen.append(obs)
+            logged(seen, obs)
         action, carry, same = inner(system, key, obs, carry, params)
         assert same is params
         return action, carry, same
@@ -662,7 +663,7 @@ def _rover_step(seen):
     def step(system, key, obs, carry, params):
         if obs is None:
             return {}, carry, params
-        seen.append(int(obs[f"{M}rover.u_opt"]))
+        logged(seen, obs[f"{M}rover.u_opt"])
         return {f"{M}rover.a_v": jnp.zeros(2, jnp.float32)}, carry, params
 
     return step
@@ -697,7 +698,7 @@ def _sliced_target_log(inner, log):
     @functools.wraps(inner)
     def step(system, key, obs, carry, params):
         if obs is not None:
-            log.append(np.asarray(params.state_targets[f"{M}rover.x"].loc))
+            logged(log, params.state_targets[f"{M}rover.x"].loc)
         return inner(system, key, obs, carry, params)
 
     return step
@@ -754,7 +755,7 @@ def test_a_sliced_step_runs_a_view_whose_transition_reads_its_driven_node(order)
 
     def rover(view, key, obs, carry, p):
         if obs is not None:
-            log.append(p)
+            logged(log, p)
         return ({} if obs is None else {f"{M}rover.a_v": jnp.zeros(2, jnp.float32)}), carry, p
 
     rover.sliced = True
@@ -848,12 +849,12 @@ def test_a_slow_mind_with_durations_and_a_fast_learner_sharing_a_parameter():
 
     def mission(view, key, obs, carry, vparams):
         if obs is not None:
-            slow_seen.append(vparams)
+            logged(slow_seen, vparams)
         return slow(view, key, obs, carry, vparams)
 
     def rover(view, key, obs, carry, vparams):
         if obs is not None:
-            fast_seen.append((obs, vparams))
+            logged(fast_seen, (obs, vparams))
         return fast(view, key, obs, carry, vparams)
 
     steps = {"agent.mission": mission, "agent.rover": rover, "world": _gauge_step}
