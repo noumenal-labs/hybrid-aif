@@ -16,6 +16,7 @@ factors ``H Σ Hᵀ + R``, whose condition number is that matrix's squared. Desi
 docs/design/recognition-beside-analytic.md L10.
 """
 
+import math
 from typing import NamedTuple
 
 import jax.numpy as jnp
@@ -24,7 +25,7 @@ from jax.scipy.linalg import cho_solve, solve_triangular
 
 from hybrid_aif.distributions.gaussian import Gaussian
 
-_LOG_2PI = jnp.log(2.0 * jnp.pi)
+_LOG_2PI = math.log(2.0 * math.pi)
 
 
 def _tr(a: Array) -> Array:

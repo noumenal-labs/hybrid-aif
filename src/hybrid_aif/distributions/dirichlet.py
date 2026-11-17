@@ -165,7 +165,12 @@ class Dirichlet(ExponentialFamily):
         return jnp.sum((self.concentration - 1.0) * jnp.log(x), axis=-1) - self._log_beta()
 
     def sample(self, key: Array, sample_shape: tuple[int, ...] = ()) -> Array:
-        return jax.random.dirichlet(key, self.concentration, shape=sample_shape + self.batch_shape)
+        return jax.random.dirichlet(
+            key,
+            self.concentration,
+            shape=sample_shape + self.batch_shape,
+            dtype=self.concentration.dtype,
+        )
 
     def mean(self) -> Array:
         return self.concentration / self._total()[..., None]

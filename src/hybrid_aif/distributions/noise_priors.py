@@ -133,7 +133,9 @@ class InverseGamma(eqx.Module):
 
     def sample(self, key: Array) -> Array:
         """One noise draw as an ``R_chol`` array: ``σ² ~ InvGamma(α, β)`` per dim."""
-        return _diag_chol(jnp.sqrt(self.beta / jax.random.gamma(key, self.alpha)))
+        return _diag_chol(
+            jnp.sqrt(self.beta / jax.random.gamma(key, self.alpha, dtype=self.alpha.dtype))
+        )
 
     def expected_log_params(self) -> Array:
         raise NotImplementedError(
@@ -212,8 +214,8 @@ class InverseWishart(eqx.Module):
         i = jnp.arange(d, dtype=self.Psi.dtype)
         # diag_j ~ sqrt(chi2(nu - j)) = sqrt(2 * Gamma((nu - j)/2))
         df = (self.nu[..., None] - i) / 2.0
-        diag = jnp.sqrt(2.0 * jax.random.gamma(kg, df))
-        lower = jnp.tril(jax.random.normal(kn, (*batch, d, d)), k=-1)
+        diag = jnp.sqrt(2.0 * jax.random.gamma(kg, df, dtype=self.Psi.dtype))
+        lower = jnp.tril(jax.random.normal(kn, (*batch, d, d), dtype=self.Psi.dtype), k=-1)
         a = lower + _diag_embed(diag)
         # W = (L A)(L A)^T with L = chol(Psi^{-1}) and L A lower-triangular, so
         # R = W^{-1} = M^T M with M = (L A)^{-1} from one triangular solve.

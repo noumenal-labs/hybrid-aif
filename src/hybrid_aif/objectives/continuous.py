@@ -79,7 +79,7 @@ __all__ = [
 ]
 
 _AXES = string.ascii_lowercase
-_LOG_2PI = jnp.log(2.0 * jnp.pi)
+_LOG_2PI = math.log(2.0 * math.pi)
 
 
 def uncertainty(
