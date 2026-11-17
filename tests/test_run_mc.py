@@ -557,9 +557,12 @@ def test_the_throughput_benchmark_reports_a_vmap_gain(tmp_path):
     #  suite. Under that load both arms are throttled unequally and the ratio says
     #  nothing about vmap. Skip rather than fail: a red gate that means "the laptop was
     #  busy" trains everyone to ignore it.
-    per_core = os.getloadavg()[0] / (os.cpu_count() or 1)
-    if per_core > 0.6:
-        pytest.skip(f"machine is loaded (1-minute load {per_core:.2f} per core); timings are noise")
+    if hasattr(os, "getloadavg"):
+        per_core = os.getloadavg()[0] / (os.cpu_count() or 1)
+        if per_core > 0.6:
+            pytest.skip(
+                f"machine is loaded (1-minute load {per_core:.2f} per core); timings are noise"
+            )
     out = run_mc.benchmark(_config(tmp_path, chunk_steps=64), reps=1, log=lambda *a: None)
     assert out["ratio"] > 1.0, out
     assert out["projected_hours"] > 0.0

@@ -349,7 +349,7 @@ _TRANSITIONS: dict[str, _Registered] = {}
 _NAMESPACED = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
 
 
-def register_transition(name: str, cls: type) -> type:
+def register_transition(name: str, cls: type, *, replace: bool = False) -> type:
     """Register ``cls``, the class of a :class:`~hybrid_aif.NonlinearGaussianTransition`'s
     ``f``, under ``name``, so that :func:`describe` writes such an ``f`` as its name and its
     fields and :func:`build` rebuilds it.
@@ -360,7 +360,8 @@ def register_transition(name: str, cls: type) -> type:
     field's name and whether it is static (``eqx.field(static=True)``) or a leaf; a leaf's shape
     is an instance's, not the class's, and is checked when the built System is validated. A name
     is registered once and a class under one name: registering a taken name, or a class already
-    registered, raises :class:`ValueError`. Returns ``cls``.
+    registered, raises :class:`ValueError` unless ``replace=True`` (for interactive module
+    reloads rebinding the same ``name``). Returns ``cls``.
     Design: docs/design/nonlinear-transitions.md N5.
     """
     if not isinstance(name, str) or not _NAMESPACED.match(name):
@@ -380,13 +381,16 @@ def register_transition(name: str, cls: type) -> type:
             f"register_transition({name!r}, {cls.__qualname__}): the class defines no __call__; "
             "f is called as f(x, controls)"
         )
-    if name in _TRANSITIONS:
+    if name in _TRANSITIONS and not replace:
         raise ValueError(
             f"register_transition: {name!r} is already registered to "
             f"{_TRANSITIONS[name].cls.__module__}.{_TRANSITIONS[name].cls.__qualname__}; a "
-            "name is registered once (choose another name under your package's namespace)"
+            "name is registered once (choose another name under your package's namespace, or pass "
+            "replace=True when reloading a module)"
         )
-    taken = [n for n, entry in _TRANSITIONS.items() if entry.cls is cls]
+    taken = [
+        n for n, entry in _TRANSITIONS.items() if entry.cls is cls and (not replace or n != name)
+    ]
     if taken:
         raise ValueError(
             f"register_transition: {cls.__qualname__} is already registered as {taken[0]!r}; a "
