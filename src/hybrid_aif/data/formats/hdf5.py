@@ -73,6 +73,12 @@ class HDF5Reader:
             self._file.close()
             self._file = None
 
+    def __enter__(self) -> HDF5Reader:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
 
 class HDF5Writer:
     """Streaming writer appending episodes to a single ``.h5`` file.
@@ -99,11 +105,18 @@ class HDF5Writer:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if exists and self.mode == "append":
             self._f = h5py.File(self.path, "a")
+            for key in _META_KEYS:
+                if key not in self._f:
+                    self._f.create_dataset(key, shape=(0,), maxshape=(None,), dtype=np.int64)
             lengths = self._f["ep_len"][:]
             self._ptr = int(lengths.sum()) if len(lengths) else 0
-            self._schema = _file_schema(self._f)
+            schema = _file_schema(self._f)
+            self._schema = schema if schema else None
         else:
             self._f = h5py.File(self.path, "w")
+            for key in _META_KEYS:
+                if key not in self._f:
+                    self._f.create_dataset(key, shape=(0,), maxshape=(None,), dtype=np.int64)
         return self
 
     def __exit__(self, *exc) -> None:
@@ -119,7 +132,8 @@ class HDF5Writer:
             for col, (shape, dtype) in self._schema.items():
                 self._f.create_dataset(col, shape=(0, *shape), maxshape=(None, *shape), dtype=dtype)
             for key in _META_KEYS:
-                self._f.create_dataset(key, shape=(0,), maxshape=(None,), dtype=np.int64)
+                if key not in self._f:
+                    self._f.create_dataset(key, shape=(0,), maxshape=(None,), dtype=np.int64)
         else:
             check_schema(self._schema, ep_data, f"hdf5 append to '{self.path}'")
 

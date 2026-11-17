@@ -143,6 +143,17 @@ class ReaderDataset(Dataset):
     def _load_slice(self, ep_idx: int, start: int, end: int) -> dict[str, np.ndarray]:
         return self.reader.read_slice(ep_idx, start, end)
 
+    def close(self) -> None:
+        close = getattr(self.reader, "close", None)
+        if callable(close):
+            close()
+
+    def __enter__(self) -> ReaderDataset:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
 
 class HDF5Dataset(ReaderDataset):
     def __init__(self, path, num_steps: int = 1, frameskip: int = 1) -> None:

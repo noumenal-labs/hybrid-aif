@@ -14,7 +14,6 @@ no image-specific special cases. Only the folder and HDF5 backends are registere
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +40,11 @@ class FolderReader:
     def __init__(self, path) -> None:
         self.path = Path(path)
         self.lengths = np.load(self.path / _INDEX).astype(np.int64)
-        self.offsets = np.concatenate(([0], np.cumsum(self.lengths[:-1]))).astype(np.int64)
+        self.offsets = (
+            np.concatenate(([0], np.cumsum(self.lengths[:-1]))).astype(np.int64)
+            if len(self.lengths)
+            else np.zeros((0,), dtype=np.int64)
+        )
         self._files = _episode_files(self.path)
         if len(self._files) != len(self.lengths):
             raise ValueError(
@@ -68,6 +71,15 @@ class FolderReader:
         ep = self._episode(ep_idx)
         return {col: arr[start:end] for col, arr in ep.items()}
 
+    def close(self) -> None:
+        self._cache = None
+
+    def __enter__(self) -> FolderReader:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
 
 class FolderWriter:
     """Streaming writer: one ``.npz`` per episode, index rewritten on exit."""
@@ -87,7 +99,9 @@ class FolderWriter:
                 f"{self.path} already contains a dataset; use mode='overwrite' or mode='append'"
             )
         if exists and self.mode == "overwrite":
-            shutil.rmtree(self.path)
+            (self.path / _INDEX).unlink(missing_ok=True)
+            for ep_file in _episode_files(self.path):
+                ep_file.unlink()
             exists = False
         self.path.mkdir(parents=True, exist_ok=True)
         if exists and self.mode == "append":
