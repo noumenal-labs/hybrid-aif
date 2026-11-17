@@ -22,6 +22,7 @@ view. Eager NumPy, not for a jitted body.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Mapping
 from typing import Any, NamedTuple
@@ -407,6 +408,48 @@ def _lg_counts(decl) -> tuple[int, int]:
     return _field_count(head), k_noise
 
 
+def _noise_count(noise) -> int:
+    """A noise prior's parameter count: one variance per dimension per mode (inverse-Gamma), one
+    covariance per mode (inverse-Wishart)."""
+    if isinstance(noise, _dist.InverseGamma):
+        return _field_count(noise.alpha)
+    d = noise.Psi.shape[-1]
+    return _batch(noise.Psi, 2) * (d * (d + 1) // 2)
+
+
+def _noise_links(noise, n, scale: float) -> tuple[float, float]:
+    """A noise prior's ``(family room, prior link)``: the Fisher-Rao entropy of the reference
+    prior per independent family when ``n`` is given (``0.0`` otherwise), and the KL from the
+    reference prior at ``scale``. The links of a linear-Gaussian observation's noise prior, read
+    the same way for a transition's (process-noise-learning.md D3)."""
+    if isinstance(noise, _dist.InverseGamma):
+        a0, b0 = reference_inverse_gamma(scale)
+        room = _field_count(noise.alpha) * inverse_gamma_fisher_rao_entropy(a0, b0)
+        return (room if n is not None else 0.0), kl_inverse_gamma(noise.alpha, noise.beta, a0, b0)
+    d = noise.Psi.shape[-1]
+    psi0, nu0 = reference_noise(d, scale)
+    room = _batch(noise.Psi, 2) * inverse_wishart_fisher_rao_entropy(psi0, nu0)
+    prior = sum(
+        kl_inverse_wishart(psi, float(nu), psi0, nu0)
+        for psi, nu in zip(
+            np.asarray(noise.Psi).reshape(-1, d, d),
+            np.asarray(noise.nu).reshape(-1),
+            strict=True,
+        )
+    )
+    return (room if n is not None else 0.0), prior
+
+
+def _transition_rest_count(decl) -> int:
+    """A Gaussian transition's parameter count apart from its noise: ``F`` (or ``f``'s leaves),
+    the offsets and ``G``."""
+    if isinstance(decl, _factors.LinearGaussianTransition):
+        k = _field_count(decl.F) + (0 if decl.G is None else _field_count(decl.G))
+    else:
+        k = _map_count(decl.f)
+    return k + _field_count(decl.innovations.loc)
+
+
 def _field_count(array) -> int:
     """The parameters one field holds: its size, which counts a per-mode field once per mode and
     a shared one once."""
@@ -483,6 +526,22 @@ class _Walk:
             if isinstance(params.emission[e], _factors.Parameter):
                 self.reading[("emission", i)] = params.emission[e].name
                 self.readers.setdefault(params.emission[e].name, []).append(f"emission:{e}")
+        #  a reader of a noise variable keeps its own record and prices its noise nowhere: the
+        #  variable is priced once under parameter:<name>, at its readers' summed resolution
+        self.noise_reading: dict[tuple[str, int], str] = {}
+        for slot, i, home in getattr(params, "noise_references", ()):
+            noun = tuple(system.modality_names) if slot == "likelihood" else tuple(self.states)
+            self.noise_reading[(slot, i)] = home
+            self.readers.setdefault(home, []).append(f"{slot}:{noun[i]}")
+        if prior is not None:
+            now = {(s, i): h for s, i, h in getattr(params, "noise_references", ())}
+            then = {(s, i): h for s, i, h in getattr(prior, "noise_references", ())}
+            if now != then:
+                raise ValueError(
+                    "description_length: the model and the prior read their noise variables at "
+                    f"different readers ({sorted(now.items())} and {sorted(then.items())}), and a "
+                    "posterior is priced against a prior of the same form only; declare both alike"
+                )
         if prior is not None:
             for i, e in enumerate(self.emissions):
                 was = (
@@ -614,6 +673,7 @@ class _Walk:
                 live,
                 size_code=size_code,
                 home=self.reading.get(("transition", f)),
+                noise_home=self.noise_reading.get(("transition", f)),
             )
         for m, o in enumerate(self.mods):
             deps = self.system.A_deps[m]
@@ -630,6 +690,7 @@ class _Walk:
                 size_code=_size_code(_description._observation_domain(decl, f"likelihood:{o}")),
                 mode_masks=self.mode_masks(deps),
                 home=self.reading.get(("likelihood", m)),
+                noise_home=self.noise_reading.get(("likelihood", m)),
             )
         emission_decls = self.system._emission_decls(self.params) if self.emissions else ()
         for i, (e, decl) in enumerate(zip(self.emissions, emission_decls, strict=True)):
@@ -784,12 +845,15 @@ class _Walk:
         size_code,
         mode_masks=None,
         home=None,
+        noise_home=None,
     ) -> None:
         """One record's links: ``parents`` is ``(how many it reads, how many it could read)``,
         or ``None`` for a parameter variable's record, which holds no structure of its own;
         ``mode_masks`` are the live levels of the parents a per-mode family is batched over
         (its discrete parents, a continuous one being the regressor). A reader of the parameter
-        variable ``home`` (its name) holds its structure only: its parents and sizes, no table."""
+        variable ``home`` (its name) holds its structure only: its parents and sizes, no table;
+        a reader of the noise variable ``noise_home`` prices everything but its noise, which the
+        variable's own record prices."""
         n = self.resolution(key)
         graph = 0.0
         if parents is not None:
@@ -859,34 +923,44 @@ class _Walk:
                 family = resolution_term(k_mix - 1 + k_mix * _gaussian_k(d), n)
             exact = False
             note += " (singular; k/2 is an upper bound on the learning coefficient)"
-        elif isinstance(decl, _factors.LinearGaussianTransition):
-            d = decl.F.shape[-1]
-            innovations = decl.innovations
-            k = (
-                _field_count(decl.F)
-                + _field_count(innovations.loc)
-                + _batch(innovations.chol, 2) * (d * (d + 1) // 2)
-            )
-            if getattr(decl, "G", None) is not None:
-                k += _field_count(decl.G)
+        elif isinstance(decl, _dist.InverseGamma | _dist.InverseWishart):
+            # a noise variable's own record: its count at its readers' summed resolution, the
+            # room and the prior link of a noise prior
+            room, prior = _noise_links(decl, n, self.scale)
             if n is not None:
-                family = resolution_term(k, n)
+                family = resolution_term(_noise_count(decl), n) + room
             exact = False
-            note += " (a regression family: fixed, its extent unscored)"
-        elif isinstance(decl, _factors.NonlinearGaussianTransition):
+            note += " (a noise variable)" + self._base_note(True)
+        elif isinstance(decl, _factors.GaussianTransition):
             d = decl.dim
             innovations = decl.innovations
-            k = (
-                _map_count(decl.f)
-                + _field_count(innovations.loc)
-                + _batch(innovations.chol, 2) * (d * (d + 1) // 2)
-            )
+            linear = isinstance(decl, _factors.LinearGaussianTransition)
+            k = _transition_rest_count(decl)
+            noise = decl.noise_prior
+            if noise_home is None:
+                k += (
+                    _noise_count(noise)
+                    if decl.learnable_noise
+                    else _batch(innovations.chol, 2) * (d * (d + 1) // 2)
+                )
             if n is not None:
                 family = resolution_term(k, n)
             exact = False
-            note += f" (a point map of {_map_count(decl.f)} parameters: fixed, its extent unscored)"
-            if decl._scaled:  # the scale is f's code and leaves, counted above
+            note += (
+                " (a regression family: fixed, its extent unscored)"
+                if linear
+                else f" (a point map of {_map_count(decl.f)} parameters: fixed, its extent "
+                "unscored)"
+            )
+            if not linear and decl._scaled:  # the scale is f's code and leaves, counted above
                 note += "; its noise scaled per coordinate by the map"
+            if noise_home is not None:
+                note += f"; its noise reads parameter variable {noise_home!r}"
+            elif decl.learnable_noise:
+                room, prior = _noise_links(noise, n, self.scale)
+                if n is not None:
+                    family += room
+                note += "; its noise under a noise prior" + self._base_note(True)
         elif isinstance(decl, _factors.LinearGaussianObservationMNIW):
             d, p = decl.M.shape[-2], decl.M.shape[-1]
             batch = decl.M.shape[:-2]
@@ -912,33 +986,20 @@ class _Walk:
             note += self._base_note(p == 1)
         elif isinstance(decl, _factors.LinearGaussianObservation):
             noise = decl.noise
-            d = np.asarray(decl._head_value).shape[-2]
             k_head, k_noise = _lg_counts(decl)
+            if noise_home is not None:
+                k_noise = 0  # its noise is the variable's, priced under parameter:<name>
             if n is not None:
                 family = resolution_term(k_head + k_noise, n)
             exact = False  # the head's room is unscored: a point, or a matrix normal whose row
             # covariance is external, so no closed form over it alone
-            if decl.learnable_noise:
-                if isinstance(noise, _dist.InverseGamma):
-                    a0, b0 = reference_inverse_gamma(self.scale)
-                    if n is not None:
-                        family += _field_count(noise.alpha) * inverse_gamma_fisher_rao_entropy(
-                            a0, b0
-                        )
-                    prior = kl_inverse_gamma(noise.alpha, noise.beta, a0, b0)
-                else:
-                    psi0, nu0 = reference_noise(d, self.scale)
-                    modes = _batch(noise.Psi, 2)
-                    if n is not None:
-                        family += modes * inverse_wishart_fisher_rao_entropy(psi0, nu0)
-                    prior = sum(
-                        kl_inverse_wishart(psi, float(nu), psi0, nu0)
-                        for psi, nu in zip(
-                            np.asarray(noise.Psi).reshape(-1, d, d),
-                            np.asarray(noise.nu).reshape(-1),
-                            strict=True,
-                        )
-                    )
+            if noise_home is not None:
+                note += f" (its noise reads parameter variable {noise_home!r}; a regression "
+                note += "family, fixed: its extent is unscored)"
+            elif decl.learnable_noise:
+                room, prior = _noise_links(noise, n, self.scale)
+                if n is not None:
+                    family += room
                 head_note = (
                     "an independent matrix-normal head (its prior unscored)"
                     if decl.learnable_head
@@ -1056,6 +1117,15 @@ def _unpaid_family(start, end, family: float | None, n: float | None) -> float |
     are separate parts, the resolution of the part that did not (``k/2 · log(n/2π)`` is linear
     in ``k``, so the parts' terms add)."""
     if (
+        family is not None
+        and n is not None
+        and isinstance(start, _factors.GaussianTransition)
+        and start.learnable_noise
+    ):
+        # the noise prior is the only part a learn step moves: the rest stays unpaid
+        k_rest = _transition_rest_count(start)
+        return resolution_term(k_rest, n) if k_rest else 0.0
+    if (
         family is None
         or n is None
         or not isinstance(start, _factors.LinearGaussianObservation)
@@ -1154,6 +1224,14 @@ def description_length(
             after = system._params_in(replay.params, "description_length")
             states = tuple(system._table.state_names)
             reading = {(slot, i) for slot, i, _ in before.references}
+            #  a noise reader's noise is its variable's, which moves under parameter:<name>
+            for slot, i, _ in before.noise_references:
+                field = "noise" if slot == "likelihood" else "noise_prior"
+                container = list(getattr(after, slot))
+                container[i] = dataclasses.replace(
+                    container[i], **{field: getattr(getattr(before, slot)[i], field)}
+                )
+                after = dataclasses.replace(after, **{slot: tuple(container)})
             slots = (
                 [
                     (f"likelihood:{o}", before.likelihood[m], after.likelihood[m])

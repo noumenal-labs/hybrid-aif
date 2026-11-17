@@ -8,7 +8,13 @@ step computes the predicted-observation marginal once per modality. The prob-spa
 carry follows pymdp's ``control.compute_neg_efe_policy``, which never round-trips through
 logits. Results match the reference to float tolerance, not bitwise. Tables change with
 every ``learn``, so a ``PlannerContext`` is per-call scratch and must not be cached across ticks.
+A table the System learns within the plan (``System.plan_learning``) is the exception to the
+hoisting: :func:`make_learning` carries its working counts through the scan and re-reads its mean,
+entropy and novelty at each step (design: parameters-within-the-plan.md A3).
 """
+
+import dataclasses
+from typing import NamedTuple
 
 import equinox as eqx
 import jax
@@ -19,6 +25,7 @@ from jax.scipy.special import xlogy
 from hybrid_aif.controls import (
     ControlDeps,
     ControlStep,
+    ControlTable,
     SensedNodes,
     action_node_beliefs,
     control_read,
@@ -33,6 +40,7 @@ from hybrid_aif.distributions import (
     Learnable,
 )
 from hybrid_aif.interval import Interval
+from hybrid_aif.objectives import hybrid as _hybrid
 from hybrid_aif.objectives import registry
 from hybrid_aif.objectives.base import INFOGAIN, TermTree
 from hybrid_aif.objectives.discrete import (
@@ -45,7 +53,7 @@ from hybrid_aif.objectives.discrete import (
     terminal_cross_entropy_risk,
 )
 from hybrid_aif.objectives.discrete import contract_probs as _contract
-from hybrid_aif.objectives.pooling import Pooled, scale_pooled
+from hybrid_aif.objectives.pooling import Pooled, PooledEntry, count_at, scale_pooled
 from hybrid_aif.objectives.presence import Presence, mask_absent, presence_at
 
 
@@ -113,16 +121,20 @@ def make_transition(
     control node), or a
     per-factor declaration (``action`` one level per factor). A
     :class:`~hybrid_aif.controls.ControlStep` action mixes each table over its belief entries.
+    The closure's ``tables_t`` replaces ``tables`` for one step (:func:`make_learning`).
     """
 
-    def transition(qs: tuple[Array, ...], action: Array) -> tuple[Array, ...]:
+    def transition(
+        qs: tuple[Array, ...], action: Array, tables_t: CompiledTables | None = None
+    ) -> tuple[Array, ...]:
         if not isinstance(action, ControlStep):
             action = jnp.asarray(action, jnp.int32)
+        B_probs = (tables if tables_t is None else tables_t).B_probs
         return tuple(
             _contract(
-                take_controls(tables.B_probs[f], control_read(action, f, control_deps))
-                if has_control_axes(control_deps, f, tables.B_probs[f].ndim - 1)
-                else tables.B_probs[f],
+                take_controls(B_probs[f], control_read(action, f, control_deps))
+                if has_control_axes(control_deps, f, B_probs[f].ndim - 1)
+                else B_probs[f],
                 tuple(qs[i] for i in deps),
                 keep_child=True,
             )
@@ -183,7 +195,9 @@ def make_step_terms(
     ``present`` (:class:`~hybrid_aif.objectives.presence.Presence`) zeroes the leaves of a
     modality absent at the step, keyed by its name and by ``likelihood:<name>``. ``pooled``
     (:class:`~hybrid_aif.objectives.pooling.Pooled`) multiplies a declared table's novelty leaf by
-    the count of the step's level of its control node.
+    the count of the step's level of its control node. The closure's ``tables_t`` keyword
+    replaces ``tables`` for one step (the working posterior of a plan that learns tables within
+    it, :func:`make_learning`); every reader of a table reads it there.
     """
     mods = _block_names("modality", len(A_deps), modality_names)
     c_deps = dict(c_deps or {})
@@ -228,8 +242,13 @@ def make_step_terms(
     row_steps = registry.prepare_step_rows(mounts, statics, compiled=True)
 
     def step_terms(
-        qs: tuple[Array, ...], action: Array, t: Array, qs_prev: tuple[Array, ...] | None = None
+        qs: tuple[Array, ...],
+        action: Array,
+        t: Array,
+        qs_prev: tuple[Array, ...] | None = None,
+        tables_t: CompiledTables | None = None,
     ) -> TermTree:
+        held = tables if tables_t is None else tables_t
         present_t = None if present is None else presence_at(present, action, t, None)
         if sensed is not None:
             qs = (*qs, *action_node_beliefs(action, sensed))
@@ -244,11 +263,11 @@ def make_step_terms(
             else tables.state_targets
         )
         parents = {m: tuple(qs[i] for i in A_deps[m]) for m in {*need_qobs, *need_h}}
-        q_obs = {m: _contract(tables.A_probs[m], parents[m], keep_child=True) for m in need_qobs}
+        q_obs = {m: _contract(held.A_probs[m], parents[m], keep_child=True) for m in need_qobs}
         h_cond = {
-            m: selected_conditional_entropy(tables.A_probs[m], parents[m], partial[m])
+            m: selected_conditional_entropy(held.A_probs[m], parents[m], partial[m])
             if m in partial
-            else _contract(tables.A_H[m], parents[m], keep_child=False)
+            else _contract(held.A_H[m], parents[m], keep_child=False)
             for m in need_h
         }
         tree: TermTree = {}
@@ -280,7 +299,13 @@ def make_step_terms(
                 tree["ambiguity"] = {mods[m]: Interval.exact(h_cond[m]) for m in amb_idx}
         if infogain_steps or row_steps:
             ctx = registry.StepContext(
-                qs=qs, action=action, qs_prev=qs_prev, parents=parents, q_obs=q_obs, h_cond=h_cond
+                qs=qs,
+                action=action,
+                qs_prev=qs_prev,
+                parents=parents,
+                q_obs=q_obs,
+                h_cond=h_cond,
+                tables=tables_t,
             )
             if infogain_steps:
                 leaves: dict[str, Interval] = {}
@@ -346,3 +371,240 @@ def make_terminal_terms(
         }
 
     return terminal_terms
+
+
+# ------------------------------------------------- parameters learned within the plan
+
+
+class FusedLearning(NamedTuple):
+    """The tables a plan on the fused path learns within it (design:
+    parameters-within-the-plan.md D1, A3): the working ``tables``
+    (:class:`~hybrid_aif.objectives.hybrid.WorkingTable`, one per key of the carry's counts, each
+    with its readers), the declarations ``A`` and ``B`` (a learned reader's a
+    ``ConditionalDirichlet``), their parents ``A_deps`` and ``B_deps`` (engine positions), the
+    System's ``control`` table, and ``pooled``, the :class:`~hybrid_aif.objectives.pooling.
+    PooledEntry` of each reader whose readings are pooled (keyed by ``(slot, index)``)."""
+
+    tables: tuple
+    A: tuple
+    B: tuple
+    A_deps: tuple[tuple[int, ...], ...]
+    B_deps: tuple[tuple[int, ...], ...]
+    control: ControlTable
+    pooled: dict[tuple[str, int], PooledEntry]
+
+    def decl(self, slot: str, i: int):
+        return (self.A if slot == "likelihood" else self.B)[i]
+
+    def seed(self) -> dict[str, Array]:
+        """Each table's counts at the plan's start: the posterior's concentration."""
+        return {t.key: self.decl(*t.readers[0]).concentration for t in self.tables}
+
+    def scale(self, slot: str, i: int, action: object) -> Array:
+        """How many readings the step's one reading of reader ``(slot, i)`` stands for: the
+        pooled count of the step's level (1 where the reader is not pooled)."""
+        entry = self.pooled.get((slot, i))
+        dtype = self.decl(slot, i).concentration.dtype
+        if entry is None:
+            return jnp.ones((), dtype)
+        return jnp.asarray(count_at(entry, action, None), dtype)
+
+    def reads(self) -> dict[str, Array]:
+        """The per-reader record a step leaves for a branch, zeroed (the carry's structure)."""
+        out = {}
+        for t in self.tables:
+            for slot, i in t.readers:
+                decl = self.decl(slot, i)
+                shape = decl.concentration.shape if slot == "transition" else ()
+                out[f"{slot}:{i}"] = jnp.zeros(shape, decl.concentration.dtype)
+        return out
+
+
+def pooled_readers(
+    pooled: Pooled | None, modality_names: tuple[str, ...], state_names: tuple[str, ...]
+) -> dict[tuple[str, int], PooledEntry]:
+    """``pooled``'s entries keyed by reader, ``("likelihood", m)`` or ``("transition", f)``."""
+    if pooled is None:
+        return {}
+    out = {}
+    for entry in pooled.entries:
+        slot, name = entry.key.split(":", 1)
+        names = modality_names if slot == "likelihood" else state_names
+        if name in names:
+            out[(slot, names.index(name))] = entry
+    return out
+
+
+def working_tables(
+    tables: CompiledTables, learning: FusedLearning, counts: dict[str, Array]
+) -> CompiledTables:
+    """``tables`` with each learned reader's entries read from the working ``counts``: its mean
+    table, its conditional entropy (a likelihood) and its novelty weights. Every other entry is
+    the hoisted one, untouched."""
+    A_probs, A_H, wA = list(tables.A_probs), list(tables.A_H), list(tables.wA)
+    B_probs, wB = list(tables.B_probs), list(tables.wB)
+    for t in learning.tables:
+        slot, i = t.readers[0]
+        decl = learning.decl(slot, i)
+        held = eqx.tree_at(lambda d: d.concentration, decl, counts[t.key])
+        probs, novelty = held.mean(), held.novelty()
+        entropy = -xlogy(probs, probs).sum(axis=-(decl.parent_ndims + 1))
+        for slot, i in t.readers:
+            if slot == "likelihood":
+                A_probs[i], A_H[i], wA[i] = probs, entropy, novelty
+            else:
+                B_probs[i], wB[i] = probs, novelty
+    return dataclasses.replace(
+        tables,
+        A_probs=tuple(A_probs),
+        A_H=tuple(A_H),
+        wA=tuple(wA),
+        B_probs=tuple(B_probs),
+        wB=tuple(wB),
+    )
+
+
+def _times(child: Array, parents: Array) -> Array:
+    """``child ⊗ parents``, child-first; leading axes of ``child`` (``(..., L)``) batch."""
+    lead = child.shape[:-1]
+    return child.reshape(*child.shape, *([1] * parents.ndim)) * parents.reshape(
+        (1,) * (len(lead) + 1) + parents.shape
+    )
+
+
+def make_learning(
+    tables: CompiledTables,
+    learning: FusedLearning,
+    transition_fn,
+    step_terms_fn,
+    terminal_terms_fn,
+    init_beliefs: tuple[Array, ...],
+):
+    """The fused closures over a :class:`~hybrid_aif.system.core.WorkingCarry` (design:
+    parameters-within-the-plan.md D1, A3).
+
+    ``transition(carry, action)`` reads each learned table through the mean of the working
+    counts and absorbs, at rate one, the step's expected count statistic, the model's joint over
+    child and parents (:func:`~hybrid_aif.objectives.hybrid.expected_joint`): a transition's
+    ``B(s'_f | p) Π q(p)`` over its parents as the tabular reader reads them (the pre-step parent
+    vectors, a control axis as the taken level's one-hot or a belief-valued step's probability
+    vector), a likelihood's ``A(o | s) Π q(s)`` over the predicted parents; a reader whose
+    readings are pooled absorbs its statistic times the step's count. The carry's ``reads``
+    keeps each transition reader's joint (times the count) and each likelihood reader's count,
+    for a branch. ``step_terms(carry,
+    action, t, qs_prev=None)`` scores the step over the tables the counts before the absorption
+    define (``working_tables``), so the novelty leaf, the occupancy row and every likelihood
+    read take the working posterior; nothing else is recomputed. ``transition_fn`` and
+    ``step_terms_fn`` are :func:`make_transition`'s and :func:`make_step_terms`'s closures over
+    ``tables``. Returns the four closures and the seeded carry.
+    """
+    WorkingCarry = _hybrid.WorkingCarry
+
+    B_deps, A_deps = learning.B_deps, learning.A_deps
+
+    def transition(carry, action):
+        if not isinstance(action, ControlStep):
+            action = jnp.asarray(action, jnp.int32)
+        work = working_tables(tables, learning, carry.counts)
+        qs = carry.beliefs
+        new = transition_fn(qs, action, work)
+        after, reads = dict(carry.counts), {}
+        for t in learning.tables:
+            for slot, i in t.readers:
+                decl, n = learning.decl(slot, i), learning.scale(slot, i, action)
+                if slot == "transition":
+                    parents = _hybrid._table_parents(
+                        decl, i, tuple(qs[g] for g in B_deps[i]), action, learning.control, None
+                    )
+                    joint = _hybrid.expected_joint(carry.counts[t.key], decl.parent_ndims, parents)
+                    reads[f"{slot}:{i}"] = (n * joint).astype(n.dtype)
+                    stats = reads[f"{slot}:{i}"]
+                else:
+                    parents = tuple(new[g] for g in A_deps[i])
+                    reads[f"{slot}:{i}"] = n
+                    stats = n * _hybrid.expected_joint(
+                        carry.counts[t.key], decl.parent_ndims, parents
+                    )
+                after[t.key] = after[t.key] + stats.astype(after[t.key].dtype)
+        return WorkingCarry(new, after, carry.counts, reads)
+
+    def step_terms(carry, action, t, qs_prev=None):
+        work = working_tables(tables, learning, carry.before)
+        prev = None if qs_prev is None else qs_prev.beliefs
+        return step_terms_fn(carry.beliefs, action, t, prev, tables_t=work)
+
+    terminal = (
+        None if terminal_terms_fn is None else (lambda carry: terminal_terms_fn(carry.beliefs))
+    )
+    counts = learning.seed()
+    return (
+        transition,
+        step_terms,
+        terminal,
+        WorkingCarry(tuple(init_beliefs), counts, counts, learning.reads()),
+    )
+
+
+def make_learning_branch(
+    tables: CompiledTables,
+    learning: FusedLearning,
+    likelihood: tuple,
+    A_deps: tuple[tuple[int, ...], ...],
+    modalities: tuple[int, ...],
+):
+    """The ``branch_on`` closure over a :class:`~hybrid_aif.system.core.WorkingCarry` (design:
+    parameters-within-the-plan.md A3): each outcome is predicted through the working posterior
+    the step read (its counts before the absorption), and each branch's counts absorb that
+    branch's outcome in place of the step's expected statistic: a learned likelihood of a
+    branched modality the exact conjugate update ``onehot(o) ⊗ q(s_P | o)`` (the joint
+    posterior over its parents), every other learned table its expected joint conditioned on the
+    branch (a transition's step joint reweighted along the child by ``q(s'_f | o) / q(s'_f)``,
+    a likelihood's ``A(o' | s) Π q(s | o)`` over the branch's parents). ``likelihood`` holds
+    each modality's point table."""
+    from hybrid_aif.planning.branching import make_branch_fn
+
+    WorkingCarry = _hybrid.WorkingCarry
+
+    learned = {i: t for t in learning.tables for slot, i in t.readers if slot == "likelihood"}
+
+    def branch(carry):
+        work = working_tables(tables, learning, carry.before)
+        tables_t = list(likelihood)
+        for m in modalities:
+            if m in learned:
+                decl = learning.A[m]
+                tables_t[m] = ConditionalCategorical(
+                    log_table=jnp.log(work.A_probs[m]), parent_ndims=decl.parent_ndims
+                )
+        p, after, evidence = make_branch_fn(tables_t, A_deps, modalities, evidence=True)(
+            carry.beliefs
+        )
+        exact = dict(zip(modalities, evidence, strict=True))
+        n = p.shape[0]
+
+        def spread(tree):
+            return jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (n, *x.shape)), tree)
+
+        counts = {}
+        for t in learning.tables:
+            total = jnp.broadcast_to(carry.before[t.key], (n, *carry.before[t.key].shape))
+            for slot, i in t.readers:
+                read = carry.reads[f"{slot}:{i}"]
+                if slot == "transition":
+                    prior = carry.beliefs[i]
+                    ratio = jnp.where(prior > 0, after[i] / jnp.where(prior > 0, prior, 1.0), 0.0)
+                    stats = _times(ratio, jnp.ones(read.shape[1:], read.dtype)) * read
+                elif i in exact:
+                    stats = read * exact[i]
+                else:
+                    decl = learning.A[i]
+                    stats = read * jax.vmap(
+                        lambda *ps, i=i, decl=decl: _hybrid.expected_joint(
+                            carry.before[learned[i].key], decl.parent_ndims, ps
+                        )
+                    )(*(after[g] for g in A_deps[i]))
+                total = total + stats.astype(total.dtype)
+            counts[t.key] = total
+        return p, WorkingCarry(after, counts, spread(carry.before), spread(carry.reads))
+
+    return branch

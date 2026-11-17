@@ -193,10 +193,13 @@ def _mirror_whole(system: System, keyed_params, params, lowered, lower: bool, fa
         epistemic=False,
     )
     kernels = dict(zip(system.modality_names, lowered.likelihood, strict=True))
-    parameters, references = lowered.parameters, ()
+    parameters, references, noise_references = lowered.parameters, (), ()
     if lower:
         parameters = {}
     else:
+        #  a transition's noise variable stays a reference; a likelihood's becomes an emission
+        #  kernel, which holds the variable's prior as it stands (no face learns an emission)
+        noise_references = tuple(r for r in lowered.noise_references if r[0] == "transition")
         read = {i: home for slot, i, home in lowered.references if slot == "likelihood"}
         for i, m in enumerate(system.modality_names):
             if i in read:
@@ -212,6 +215,7 @@ def _mirror_whole(system: System, keyed_params, params, lowered, lower: bool, fa
         policy_prior=habit,
         parameters=parameters,
         references=references,
+        noise_references=noise_references,
     )
     return world, keyed.params_keyed(world._names(), mirrored)
 

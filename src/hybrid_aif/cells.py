@@ -87,7 +87,7 @@ def _axis_masses(mean: Array, std: Array, n: int, low: float, high: float) -> Ar
     first and last absorbing the tails: ``(..., n)``, summing to one."""
     edges = jnp.linspace(low, high, n + 1)[1:-1]
     cdf = ndtr((edges - mean[..., None]) / std[..., None])
-    zeros = jnp.zeros_like(cdf[..., :1])
+    zeros = jnp.zeros((*cdf.shape[:-1], 1), cdf.dtype)  # an axis of one cell has no edges
     cdf = jnp.concatenate([zeros, cdf, zeros + 1.0], axis=-1)
     return cdf[..., 1:] - cdf[..., :-1]
 
@@ -122,6 +122,12 @@ def cell_mass(belief: Gaussian | MixtureGaussian, grid: Grid) -> Array:
     raise TypeError(
         f"cell_mass reads a Gaussian or MixtureGaussian belief, got {type(belief).__name__}"
     )
+
+
+def component_cell_mass(belief: MixtureGaussian, grid: Grid) -> Array:
+    """Each component's :func:`cell_mass` of a mixture: ``(*batch, K, cells)``, the weights left
+    out (the per-component read of a closed pair, design: parameters-within-the-plan.md D2)."""
+    return _gaussian_mass(belief.means, belief.chols, grid)
 
 
 def cell_index(point: Array, grid: Grid) -> Array:

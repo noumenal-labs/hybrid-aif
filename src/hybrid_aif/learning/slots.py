@@ -1,7 +1,7 @@
 """Which declarations learn, and how: the predicates every learning path and selector reads."""
 
 from hybrid_aif.distributions import Learnable
-from hybrid_aif.factors import GradientDeclaration, LGObservation
+from hybrid_aif.factors import GaussianTransition, GradientDeclaration, LGObservation
 
 
 def gradient_learnable(decl) -> bool:
@@ -17,11 +17,13 @@ def slot_learnable(decl) -> bool:
     """Whether a slot is learnable, by conjugate update or by gradient.
 
     True for a declaration that is itself a parameter posterior (tabular families), an LG head whose
-    ``noise`` field holds one, or a non-frozen neural conditional. A learnable slot is
-    rate-addressable and appears in the epistemic namespace.
+    ``noise`` field holds one, a Gaussian transition whose ``noise_prior`` holds one, or a
+    non-frozen neural conditional. A learnable slot is rate-addressable and appears in the
+    epistemic namespace.
     """
     return (
         isinstance(decl, Learnable)
         or (isinstance(decl, LGObservation) and (decl.learnable_noise or decl.learnable_head))
+        or (isinstance(decl, GaussianTransition) and decl.learnable_noise)
         or gradient_learnable(decl)
     )

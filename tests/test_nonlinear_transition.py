@@ -575,29 +575,36 @@ def test_planning_belief_posterior_steps_the_epistemic_chain_through_f():
 # ------------------------------------------------------------------- N6 (6): the refusals
 
 
-def test_switching_dynamics_are_refused():
-    system = System(B_deps=((1,), ()), state_names=("pose", "mode"), policy_len=1)
-    params = SystemParams(
+def test_switching_dynamics_are_carried_as_a_mode_mixture():
+    """A discrete state parent switches ``f`` (N4, amended 2026-11-15): the factor is carried
+    as a mixture once the parent is declared first; declared after, the ordering refusal the
+    linear bank gives is raised (the full switching tests: test_nonlinear_switching.py)."""
+    parts = dict(
         transition={
+            "mode": ConditionalCategorical(log_table=jnp.zeros((2, 2)), parent_ndims=1),
             "pose": NonlinearGaussianTransition(
                 Unicycle(0.1, 0.5, 0.0), _noise(jnp.zeros((2, 3)), 0.01 * jnp.eye(3))
             ),
-            "mode": ConditionalCategorical(log_table=jnp.zeros((2, 2)), parent_ndims=1),
         },
         initial_state_prior={
-            "pose": Gaussian(loc=jnp.zeros(3), chol=jnp.eye(3)),
             "mode": Categorical(logits=jnp.zeros(2)),
+            "pose": Gaussian(loc=jnp.zeros(3), chol=jnp.eye(3)),
         },
         state_targets={},
     )
-    with pytest.raises(NotImplementedError, match="switching dynamics"):
-        system.update_empirical_prior(params, system.initial_priors(params), {})
-    # with a control node of its own too, the switching refusal is the one raised
-    controlled = System(
-        B_deps=((1,), ()), controlled=(True, False), state_names=("pose", "mode"), policy_len=1
+    params = SystemParams(**parts)
+    system = System(
+        B_deps=((0,), (0,)),
+        state_names=("mode", "pose"),
+        policy_len=1,
+        mixture_k=2,
+        mixture_schedule="mode_aligned",
     )
-    with pytest.raises(NotImplementedError, match="switching dynamics"):
-        controlled.update_empirical_prior(params, controlled.initial_priors(params), {})
+    prior = system.update_empirical_prior(params, system.initial_priors(params), {})
+    assert isinstance(prior["pose"], MixtureGaussian) and prior["pose"].num_components == 2
+    late = System(B_deps=((1,), (1,)), state_names=("pose", "mode"), policy_len=1, mixture_k=2)
+    with pytest.raises(ValueError, match="within-step ordering"):
+        late.update_empirical_prior(params, late.initial_priors(params), {})
 
 
 def test_a_neural_transition_steps_the_epistemic_chain():

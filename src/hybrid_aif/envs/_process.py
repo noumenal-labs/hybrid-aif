@@ -36,6 +36,7 @@ from hybrid_aif.controls import (
     ControlLayout,
     ControlStep,
     ControlTable,
+    declared_parents,
     lg_read,
     node_entry,
     parent_levels,
@@ -49,7 +50,7 @@ from hybrid_aif.distributions import (
     MLPConditional,
 )
 from hybrid_aif.envs.base import Env, Obs, State
-from hybrid_aif.factors import NonlinearGaussianTransition
+from hybrid_aif.factors import NonlinearGaussianTransition, transition_point
 
 
 def _reject_param_distribution(decl, slot: str, index: int) -> None:
@@ -333,16 +334,22 @@ class HybridProcess(Env):
                     )
                 next_state.append(B_f.sample(k, parents_mlp))
             elif isinstance(B_f, NonlinearGaussianTransition):
+                # one entry per parent in declared order: a discrete state parent's level
+                # read from this step's sampled value (as the linear path reads its modes),
+                # a discrete node's level, a continuous node's value
                 controls, levels = [], []
-                for c, _ in self._table.control_parents[f]:
-                    value = node_entry(action, c, self.controls)
-                    if self._kind(c) == LEVEL:
-                        value = jnp.asarray(value, jnp.int32)
+                for what, c in declared_parents(self._table, f):
+                    if what == "state":
+                        value = jnp.asarray(next_state[c], jnp.int32)
+                        levels.append(value)
+                    elif self._kind(c) == LEVEL:
+                        value = jnp.asarray(node_entry(action, c, self.controls), jnp.int32)
                         levels.append(value)
                     else:
-                        value = jnp.asarray(value, jnp.float32)
+                        value = jnp.asarray(node_entry(action, c, self.controls), jnp.float32)
                     controls.append(value)
-                innov = B_f.innovations.condition_on(tuple(levels) or (0,))
+                # a noise prior is sampled from at its point (as_env lowers or draws it first)
+                innov = transition_point(B_f).innovations.condition_on(tuple(levels) or (0,))
                 mean, scale = B_f._mean_and_scale(jnp.asarray(state[f]), tuple(controls))
                 if scale is None:
                     next_state.append(mean + innov.sample(k))
@@ -359,7 +366,7 @@ class HybridProcess(Env):
                     next_state[i] if what == "state" else node_entry(action, i, self.controls)
                     for what, i in read.axes
                 ) or (0,)  # trivial (1,) parent axis
-                innov = B_f.innovations.condition_on(parents)
+                innov = transition_point(B_f).innovations.condition_on(parents)
                 F, G = B_f.F, B_f.G
                 index = tuple(jnp.asarray(p, jnp.int32) for p in parents)
                 if F.ndim > 2:  # per-mode F_j, conditioned exactly as the innovations

@@ -13,7 +13,11 @@ from jax import Array
 from hybrid_aif.cells import cell_mass
 from hybrid_aif.controls import ControlSpace
 from hybrid_aif.distributions import ConditionalDirichlet, Learnable, MLPConditional
-from hybrid_aif.factors import LinearGaussianObservation, LinearGaussianObservationMNIW
+from hybrid_aif.factors import (
+    GaussianTransition,
+    LinearGaussianObservation,
+    LinearGaussianObservationMNIW,
+)
 from hybrid_aif.inference.detail import InferenceDetail
 from hybrid_aif.learning import carry as _carry
 from hybrid_aif.learning import conjugate_stats
@@ -127,6 +131,8 @@ def _learn(
     system._validate(params, face)
     mods, facs = (system.modality_names, system._facs)
     reads = {(slot, i): home for slot, i, home in params.references}
+    # the readers of a noise variable, by the field that holds it (process-noise-learning.md D4)
+    noise_reads = {(slot, i): home for slot, i, home in params.noise_references}
     homes = dict(params.parameters)  # the named tables, updated once from their readers' evidence
     home_stats: dict[str, Array] = {}  # a parameter variable's summed readers' statistic
     lr_rates = system._resolve_rates(lr_by_slot, "lr_by_slot", params)
@@ -158,8 +164,12 @@ def _learn(
     def contribute(home: str, stats: Array, weight: Array | None = None) -> None:
         """Add one reader's statistic (scaled by its availability, when traced) to its variable's
         sum."""
-        scaled = stats if weight is None else stats * weight
-        home_stats[home] = scaled if home not in home_stats else home_stats[home] + scaled
+        scaled = stats if weight is None else jax.tree_util.tree_map(lambda s: s * weight, stats)
+        home_stats[home] = (
+            scaled
+            if home not in home_stats
+            else jax.tree_util.tree_map(jnp.add, home_stats[home], scaled)
+        )
 
     def home_rate_of(home: str) -> float | Array:
         return rate(f"parameter:{home}", lr, lr_rates)
@@ -167,6 +177,13 @@ def _learn(
     def excluded(slot: str, name: str) -> bool:
         """A referencing reader whose own rate key is a static 0.0: it adds no statistic."""
         return lr_rates is not None and skipped(lr_rates.get(f"{slot}:{name}", 1.0))
+
+    def noise_excluded(slot: str, name: str) -> bool:
+        """A reader of a noise variable whose own noise key (or group key) is a static 0.0."""
+        return lr_rates is not None and (
+            skipped(lr_rates.get(f"{slot}:{name}:noise", 1.0))
+            or skipped(lr_rates.get(f"{slot}:{name}", 1.0))
+        )
 
     # structure moves with the weights: a growable factor whose weights' rate is a static
     # zero neither grows nor reduces, and a traced rate gates both at run time
@@ -213,6 +230,16 @@ def _learn(
                     f"({key}:head alone freezes the head and leaves the noise learning; "
                     "design parameter-learning.md D8)"
                 )
+            home = noise_reads.get(("likelihood", m))
+            if home is not None:  # one reader of a noise variable: its statistic joins the sum
+                if skipped(home_rate_of(home)) or noise_excluded("likelihood", mods[m]):
+                    continue
+                stats = a.noise.stats(
+                    *_lg_noise_stats(system, m, a, observations[m], beliefs, detail)
+                )
+                flag = True if present is None else present[m]
+                contribute(home, stats, None if flag is True else jnp.asarray(flag, jnp.float32))
+                continue
             r_noise = rate(key, lr, lr_rates, "noise")
             if not a.learnable_noise or skipped(r_noise):
                 continue
@@ -301,6 +328,57 @@ def _learn(
             continue
         new_B[f] = _absorbing(key, b, stats, lr=r, decay=rate(key, decay, decay_rates))
 
+    # ------------------------------------------- the process noise (process-noise-learning.md)
+    noisy = []
+    for f, b in enumerate(params.transition):
+        if not (isinstance(b, GaussianTransition) and b.learnable_noise):
+            continue
+        key = f"transition:{facs[f]}"
+        home = noise_reads.get(("transition", f))
+        if home is None:
+            r = rate(key, lr, lr_rates, "noise")
+        else:
+            r = home_rate_of(home)
+            if noise_excluded("transition", facs[f]):
+                continue
+        if not skipped(r):
+            noisy.append((f, b, key, home, r))
+    if noisy:
+        if prev_beliefs is None:
+            raise ValueError(
+                f"the process noise of {[facs[f] for f, *_ in noisy]} has a nonzero-or-traced "
+                "rate, so learn needs prev_beliefs (the previous tick's posteriors from the "
+                "carry): the statistic is the residual between two ticks' states; pass them, or "
+                "freeze the noise with a static rate of 0.0 ('transition:<factor>:noise')"
+            )
+        need = [facs[f] for f, *_ in noisy if system._table.control_parents[f]]
+        if need and action is None:
+            raise ValueError(
+                f"the process noise of controlled factor(s) {need} has a nonzero-or-traced rate, "
+                "so learn needs action (a_{t-1}, the action that produced this tick, from the "
+                "carry): it selects the mode and the control input of the residual"
+            )
+        space = system._space(params)
+    for f, b, key, home, r in noisy:
+        stats = b.noise_prior.stats(
+            *conjugate_stats._transition_noise_stats(
+                system, params, f, b, prev_beliefs[f], beliefs[f], action, space
+            )
+        )
+        if home is not None:
+            contribute(home, stats)
+            continue
+        new_B[f] = dataclasses.replace(
+            new_B[f],
+            noise_prior=_absorbing(
+                f"{key}:noise",
+                b.noise_prior,
+                stats,
+                lr=r,
+                decay=rate(key, decay, decay_rates, "noise"),
+            ),
+        )
+
     new_D = list(params.initial_state_prior)
     for f, d in enumerate(params.initial_state_prior):
         if not isinstance(d, Learnable):
@@ -384,6 +462,10 @@ def _learn(
         )
     for (slot, i), home in reads.items():  # every reader's position holds the updated variable
         (new_A if slot == "likelihood" else new_B)[i] = homes[home]
+    for (slot, i), home in noise_reads.items():  # and every noise reader's field
+        target = new_A if slot == "likelihood" else new_B
+        field = keyed.noise_field(slot, target[i])
+        target[i] = dataclasses.replace(target[i], **{field: homes[home]})
     new_params = dataclasses.replace(
         params,
         likelihood=tuple(new_A),

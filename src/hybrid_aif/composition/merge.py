@@ -63,6 +63,8 @@ from hybrid_aif.distributions import (
     ConditionalDirichlet,
     ConditionalGaussian,
     Gaussian,
+    InverseGamma,
+    InverseWishart,
 )
 from hybrid_aif.factors import (
     LinearGaussianTransition,
@@ -70,6 +72,8 @@ from hybrid_aif.factors import (
     Parameter,
     Recognition,
     TabularObservation,
+    _noise_batch,
+    map_noise_modes,
 )
 from hybrid_aif.objectives import hybrid as _hybrid
 from hybrid_aif.objectives import registry
@@ -338,6 +342,20 @@ def resolved_epistemic(system: System, params: SystemParams) -> tuple[str, ...]:
     return tuple(dict.fromkeys(out))
 
 
+def resolved_plan_learning(system: System, params: SystemParams) -> tuple[str, ...]:
+    """A component's ``plan_learning`` as an explicit tuple of reader keys
+    (``transition:<factor>``, ``likelihood:<modality>``): ``True`` and a ``parameter:<name>``
+    key expanded to the readers they name, so a composite's keys survive a binding that
+    identifies two parameter variables (readers of one variable share its working table
+    whatever they are keyed by). Design: parameters-within-the-plan.md D1."""
+    names = {"transition": system._facs, "likelihood": system.modality_names}
+    return tuple(
+        f"{slot}:{names[slot][i]}"
+        for _, readers in system._plan_learning(params)
+        for slot, i in readers
+    )
+
+
 # ------------------------------------------------------------------ small pieces
 
 
@@ -572,6 +590,7 @@ def _cut_gaussian(decl: LinearGaussianTransition, name: str, cuts: Sequence[tupl
         F=F,
         innovations=ConditionalGaussian(loc=loc, chol=chol, parent_ndims=parent_ndims),
         G=G,
+        noise_prior=map_noise_modes(decl.noise_prior, lambda arr, core: slice_modes(arr, core)),
     )
 
 
@@ -776,6 +795,7 @@ def _splice(subsystems: Mapping[str, System], params: Mapping[str, SystemParams]
     recognition_params: dict[str, object] = {}
     external_inputs: list[tuple[str, int]] = []
     epistemic_keys: list[str] = []
+    plan_learning_keys: list[str] = []
     dims: list[tuple[str, tuple[str, ...]]] = []
     cells: list[tuple[str, object]] = []
     readings: list[tuple[str, str]] = []
@@ -783,6 +803,7 @@ def _splice(subsystems: Mapping[str, System], params: Mapping[str, SystemParams]
     C_deps: list[tuple[str, tuple[str, ...]]] = []
     parameters: dict[str, object] = {}  # the named parameter variables, by composite name
     reads: dict[tuple[str, int], str] = {}  # (slot, composite index) -> the variable it reads
+    noise_reads: dict[tuple[str, int], str] = {}  # the same for a reader of a noise variable
     own_reads: list[tuple[str, System, tuple[str, str]]] = []  # a component's observes entries
     emissions: list[tuple[str, Emission]] = []  # composite names, parents namespaced
     emission_kernels: dict[str, object] = {}  # composite name -> kernel (or its reference)
@@ -884,6 +905,10 @@ def _splice(subsystems: Mapping[str, System], params: Mapping[str, SystemParams]
             reads[(slot, i + (f_off if slot == "transition" else m_off))] = (
                 f"{name}{SEPARATOR}{home}"
             )
+        for slot, i, home in p.noise_references:
+            noise_reads[(slot, i + (f_off if slot == "transition" else m_off))] = (
+                f"{name}{SEPARATOR}{home}"
+            )
         for src, dst in (
             (p.obs_targets, obs_targets),
             (p.state_targets, state_targets),
@@ -905,6 +930,9 @@ def _splice(subsystems: Mapping[str, System], params: Mapping[str, SystemParams]
             namespaced_key(name, key) for key in resolved_epistemic(system, p)
         ]
         epistemic_keys.extend(epistemic_keys_of_component)
+        plan_learning_keys.extend(
+            namespaced_key(name, key) for key in resolved_plan_learning(system, p)
+        )
         terms.extend(namespaced_term(name, key) for key in system.terms)
         dims.extend((f"{name}{SEPARATOR}{factor}", names) for factor, names in system.dims)
         cells.extend((f"{name}{SEPARATOR}{factor}", grid) for factor, grid in system.cells)
@@ -950,6 +978,7 @@ def _splice(subsystems: Mapping[str, System], params: Mapping[str, SystemParams]
         recognition_params=recognition_params,
         external_inputs=external_inputs,
         epistemic_keys=epistemic_keys,
+        plan_learning_keys=plan_learning_keys,
         dims=dims,
         cells=cells,
         readings=readings,
@@ -957,6 +986,7 @@ def _splice(subsystems: Mapping[str, System], params: Mapping[str, SystemParams]
         C_deps=C_deps,
         parameters=parameters,
         reads=reads,
+        noise_reads=noise_reads,
         own_reads=own_reads,
         emissions=emissions,
         emission_kernels=emission_kernels,
@@ -1211,6 +1241,13 @@ def _assemble(
                 f"table, which is the parameter variable {reads[('transition', g)]!r} that other "
                 "readers share; declare the factor's own table (not a Parameter reference) "
                 "where a binding changes its axes"
+            )
+        home = sp.noise_reads.get(("transition", g))
+        if home is not None and _noise_batch(parameters[home]):
+            raise NotImplementedError(
+                f"{what} rewrites the control axis of factor {state_names[g]!r}, whose noise is "
+                f"the per-mode noise variable {home!r} that other readers share; declare the "
+                "factor's own noise_prior where a binding changes its axes"
             )
 
     def cut(k: int, keep, weights) -> None:
@@ -1769,6 +1806,9 @@ def _assemble(
             for address, home in reads.items():
                 if home == binding.b:
                     reads[address] = binding.a
+            for address, home in sp.noise_reads.items():
+                if home == binding.b:
+                    sp.noise_reads[address] = binding.a
             for emission, home in emission_reads.items():
                 if home == binding.b:
                     emission_reads[emission] = binding.a
@@ -2090,6 +2130,12 @@ def _assemble(
         epistemic = False
     else:
         epistemic = tuple(epistemic_keys)
+    #  the tables a plan learns within it compose as epistemic's keys do: a union of each
+    #  component's readers (parameters-within-the-plan.md D1)
+    if all(s.plan_learning is True for s in selecting):
+        plan_learning: bool | tuple[str, ...] = True
+    else:
+        plan_learning = tuple(dict.fromkeys(sp.plan_learning_keys))
     live = [k for k, node in enumerate(nodes) if node.live]
     planning = {
         field: _unanimous({leaf: c[field] for leaf, c in leaf_config.items()})
@@ -2112,6 +2158,7 @@ def _assemble(
         action_names=tuple(nodes[k].action for k in live),
         **planning,
         epistemic=epistemic,
+        plan_learning=plan_learning,
         terms=tuple(t for t in dict.fromkeys(terms) if t.partition(":")[0] not in owned_terms),
         mixture_k=next(iter(mixture_ks), None),
         mixture_schedule=mixture_schedule,
@@ -2138,6 +2185,7 @@ def _assemble(
         readings=reading_counts,
         parameters=parameters,
         references=tuple(sorted((slot, i, home) for (slot, i), home in reads.items())),
+        noise_references=tuple(sorted((s, i, home) for (s, i), home in sp.noise_reads.items())),
         transition=tuple(transition),
         initial_state_prior=tuple(initial_state_prior),
         likelihood=tuple(likelihood),
@@ -2204,6 +2252,11 @@ def _check_sibling_shapes(binding: _BeliefRead, composite: System, params: Syste
 
 
 def _table_of(decl):
+    """A parameter variable's defining array: a table's, or a noise prior's scale."""
+    if isinstance(decl, InverseWishart):
+        return decl.Psi
+    if isinstance(decl, InverseGamma):
+        return decl.beta
     return decl.concentration if isinstance(decl, ConditionalDirichlet) else decl.log_table
 
 
@@ -2216,7 +2269,9 @@ def _check_same_variable(binding: Identify, left, right) -> None:
             f"{type(right).__name__}; two parameter variables are identified only when they are "
             "the same family"
         )
-    if _table_of(left).shape != _table_of(right).shape or left.parent_ndims != right.parent_ndims:
+    if _table_of(left).shape != _table_of(right).shape or getattr(
+        left, "parent_ndims", None
+    ) != getattr(right, "parent_ndims", None):
         raise ValueError(
             f"{binding}: {binding.a!r} has table shape {tuple(_table_of(left).shape)} and "
             f"{binding.b!r} has {tuple(_table_of(right).shape)}; two parameter variables are "
@@ -2293,7 +2348,7 @@ def write_back(
         container = list(getattr(out, slot))
         container[i] = homes[home]
         out = dataclasses.replace(out, **{slot: tuple(container)})
-    return composite._params_out(out)
+    return composite._params_out(out)  # a noise reader's field is re-read from its variable
 
 
 def _state_deps(deps: tuple[int, ...], n_states: int) -> tuple[int, ...]:
@@ -2771,6 +2826,13 @@ def subsystem(
         for j, i in enumerate(items)
         if (slot, i) in held
     ]
+    noise_held = {(slot, i): home for slot, i, home in params.noise_references}
+    view_noise = [
+        (slot, j, noise_held[(slot, i)])
+        for slot, items in (("transition", facs), ("likelihood", mods))
+        for j, i in enumerate(items)
+        if (slot, i) in noise_held
+    ]
     emission_homes = {
         params.emission[e].name
         for e, _ in view_emissions
@@ -2803,10 +2865,17 @@ def subsystem(
     view_params = SystemParams(
         parameters={
             home: params.parameters[home]
-            for home in dict.fromkeys([*(h for _, _, h in view_reads), *sorted(emission_homes)])
+            for home in dict.fromkeys(
+                [
+                    *(h for _, _, h in view_reads),
+                    *(h for _, _, h in view_noise),
+                    *sorted(emission_homes),
+                ]
+            )
         },
         emission={e: params.emission[e] for e, _ in view_emissions if e in params.emission},
         references=tuple(sorted(view_reads)),
+        noise_references=tuple(sorted(view_noise)),
         recognition={e.variable: params.recognition[e.variable] for e in recognition},
         transition=tuple(transition),
         initial_state_prior=tuple(params.initial_state_prior[f] for f in facs),
@@ -2886,7 +2955,12 @@ def subsystem(
                 [t for t in leaf["terms"] if t in kept or t.partition(":")[0] in owned] + [*terms]
             )
         )
-    view = dataclasses.replace(view, epistemic=epistemic, terms=terms)
+    view = dataclasses.replace(
+        view,
+        epistemic=epistemic,
+        terms=terms,
+        plan_learning=_view_plan_learning(composite, view, view_params),
+    )
     view._validate(view_params)
     return view, view._params_out(view_params)
 
@@ -3027,6 +3101,23 @@ def _view_epistemic(
         return composite.epistemic
     variables = view._epistemic_variables(view_params)
     return tuple(key for key in composite.epistemic if key in variables and _key_name(key) in ours)
+
+
+def _view_plan_learning(
+    composite: System, view: System, view_params: SystemParams
+) -> "bool | tuple[str, ...]":
+    """Restrict the composite's ``plan_learning`` to the tables this mind reads: a key whose
+    reader (or parameter variable) the view lacks is dropped; ``True`` and ``()`` pass through.
+    Design: parameters-within-the-plan.md D1."""
+    if isinstance(composite.plan_learning, bool):
+        return composite.plan_learning
+    held = {"transition": set(view._facs), "likelihood": set(view.modality_names)}
+    held["parameter"] = set(view_params.parameters)
+    return tuple(
+        key
+        for key in composite.plan_learning
+        if key.partition(":")[2] in held.get(key.partition(":")[0], set())
+    )
 
 
 def _view_terms(composite: System, held: set[str]) -> tuple[str, ...]:

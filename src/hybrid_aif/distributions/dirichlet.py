@@ -22,6 +22,36 @@ from hybrid_aif.interval import Interval
 _MINVAL = float(jnp.finfo(jnp.float64).eps)
 
 
+def _trigamma(x: Array) -> Array:
+    """``ψ'(x)`` for ``x > 0``: the recurrence ``ψ'(x) = ψ'(x + 1) + 1/x²`` up to ``x ≥ 10``, then
+    the asymptotic series (relative error below 1e-11 there). Elementwise and cheap, where
+    ``jax.scipy.special.polygamma(1, ·)`` (the derivative JAX gives ``digamma``) sums a Hurwitz
+    zeta series."""
+    acc = jnp.zeros_like(x)
+    for _ in range(10):
+        small = x < 10.0
+        acc = acc + jnp.where(small, 1.0 / (x * x), 0.0)
+        x = jnp.where(small, x + 1.0, x)
+    r = 1.0 / x
+    r2 = r * r
+    series = r2 * (1.0 / 6 - r2 * (1.0 / 30 - r2 * (1.0 / 42 - r2 / 30)))
+    return acc + r + 0.5 * r2 + r * series
+
+
+@jax.custom_jvp
+def _digamma(x: Array) -> Array:
+    """``digamma`` with :func:`_trigamma` as its derivative: the same values, and a gradient
+    cheap enough to run at every step of a planning scan that differentiates novelty weights
+    of working counts (design: parameters-within-the-plan.md, "As built")."""
+    return digamma(x)
+
+
+@_digamma.defjvp
+def _digamma_jvp(primals, tangents):
+    (x,), (dx,) = primals, tangents
+    return digamma(x), _trigamma(x) * dx
+
+
 def _wnorm(concentration: Array, child_axis: int) -> Array:
     """Exact Dirichlet novelty weights: pymdp's ``maths._exact_wnorm`` (pymdp/maths.py), after
     SPM's ``spm_wnorm`` (the subfunction in ``toolbox/DEM/spm_MDP_VB_XXX.m``; Da Costa et al. 2020
@@ -36,8 +66,8 @@ def _wnorm(concentration: Array, child_axis: int) -> Array:
         - jnp.log(safe)
         + 1.0 / safe
         - 1.0 / safe_sum
-        + digamma(safe)
-        - digamma(safe_sum)
+        + _digamma(safe)
+        - _digamma(safe_sum)
     )
     return w * (concentration > 0.0)
 

@@ -9,6 +9,9 @@ per-slot arithmetic it steps with, one function per statistic:
   scatter and mass for an ``InverseGamma`` / ``InverseWishart`` LG noise;
 - :func:`_lg_joint_stats` — the MNIW regression moments over the augmented
   state, for a coupled head-and-noise posterior;
+- :func:`_transition_noise_stats` — the pairwise residual scatter and mass for a Gaussian
+  transition's ``InverseGamma`` / ``InverseWishart`` process noise (process-noise-learning.md
+  D2);
 - :func:`_mlp_evidence` — the ``(child, parents)`` pair a gradient-learnable
   neural slot is scored against (A2's optax path has evidence rather than a
   conjugate statistic, but extracting it is the same per-slot job);
@@ -30,6 +33,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 from hybrid_aif.controls import LEVEL, node_entry
@@ -43,7 +47,12 @@ from hybrid_aif.distributions import (
     MixtureGaussian,
     MLPConditional,
 )
-from hybrid_aif.factors import LinearGaussianObservation, LinearGaussianObservationMNIW
+from hybrid_aif.factors import (
+    GaussianTransition,
+    LinearGaussianObservation,
+    LinearGaussianObservationMNIW,
+    _noise_batch,
+)
 from hybrid_aif.inference.emission import is_emission
 from hybrid_aif.inference.mixture_filter import _per_mode
 from hybrid_aif.learning.slots import slot_learnable as _slot_learnable
@@ -75,6 +84,13 @@ def _lower_learnable(params: SystemParams, param_key: Array | None) -> SystemPar
     if not isinstance(getattr(params, "emission", None), tuple):
         slots = tuple(slot for slot in slots if slot != "emission")
     reads = {(slot, i): ("parameter", home) for slot, i, home in params.references}
+    # the readers of one noise variable share its one draw too
+    reads.update(
+        {
+            (slot, i): ("parameter", home)
+            for slot, i, home in getattr(params, "noise_references", ())
+        }
+    )
     learnable = [
         (slot, i)
         for slot in slots
@@ -111,6 +127,17 @@ def _lower_learnable(params: SystemParams, param_key: Array | None) -> SystemPar
             if decl.learnable_head:
                 head = head.point() if param_key is None else head.sample(key_i, row_chol=noise)
             return LinearGaussianObservation(head=head, noise=noise)
+        if isinstance(decl, GaussianTransition):
+            if not decl.learnable_noise:
+                return decl
+            prior = decl.noise_prior
+            chol = prior.point() if param_key is None else prior.sample(keys[(slot, i)])
+            inn = decl.innovations
+            return dataclasses.replace(
+                decl,
+                innovations=type(inn)(loc=inn.loc, chol=chol, parent_ndims=inn.parent_ndims),
+                noise_prior=None,
+            )
         if not isinstance(decl, Learnable):
             return decl
         if param_key is None:
@@ -380,3 +407,159 @@ def _lg_joint_stats(
     syy = jnp.einsum("o,p->op", y, y)
     count = jnp.asarray(1.0, dtype=sxx.dtype)
     return syy, syx, sxx, count
+
+
+# ------------------------------------------------------------- the process noise
+
+
+def pairwise_scatter(
+    mu: Array, cov: Array, mu1: Array, cov1: Array, F: Array, b: Array, Q: Array
+) -> Array:
+    """``E[(x' − F x − b)(x' − F x − b)ᵀ]`` under the pairwise posterior over ``(x, x')`` that the
+    one-step (Rauch-Tung-Striebel) smoother gives from the filtered ``N(mu, cov)`` at ``t − 1``,
+    the filtered ``N(mu1, cov1)`` at ``t`` and the step ``x' = F x + b + ε``, ``ε ~ N(0, Q)``:
+
+        Σ⁻ = F Σ Fᵀ + Q,  J = Σ Fᵀ (Σ⁻)⁻¹,
+        μₛ = μ + J (μ' − F μ − b),  Σₛ = Σ + J (Σ' − Σ⁻) Jᵀ,  C = Σ' Jᵀ = Cov(x', x),
+        S = (μ' − F μₛ − b)(·)ᵀ + Σ' − F Cᵀ − C Fᵀ + F Σₛ Fᵀ.
+
+    The cross-covariance ``C`` is what the two marginals alone lack; without it the scatter
+    overstates ``Q``. Exact for a linear-Gaussian filter (the EM M-step statistic for ``Q``).
+    Design: process-noise-learning.md D2."""
+    pred = F @ cov @ F.T + Q
+    pred = 0.5 * (pred + pred.T)
+    gain = jnp.linalg.solve(pred, F @ cov).T  # J = Σ Fᵀ (Σ⁻)⁻¹, Σ⁻ symmetric
+    mu_s = mu + gain @ (mu1 - F @ mu - b)
+    cov_s = cov + gain @ (cov1 - pred) @ gain.T
+    cross = cov1 @ gain.T
+    r = mu1 - F @ mu_s - b
+    out = jnp.outer(r, r) + cov1 - F @ cross.T - cross @ F.T + F @ cov_s @ F.T
+    return 0.5 * (out + out.T)
+
+
+def _mode_responsibility(value: object, size: int, dtype) -> Array:
+    """A discrete control node's entry as its responsibility over the levels: a level's one-hot,
+    a belief's (``Categorical``) or a probability vector's own probabilities."""
+    if isinstance(value, Categorical):
+        return value.probs.astype(dtype)
+    value = jnp.asarray(value)
+    if jnp.issubdtype(value.dtype, jnp.floating) and value.shape[-1:] == (size,):
+        return value.astype(dtype)
+    return jax.nn.one_hot(value.astype(jnp.int32), size, dtype=dtype)
+
+
+def _transition_noise_stats(
+    system: System,
+    params: SystemParams,
+    f: int,
+    decl,
+    prev_q: Belief,
+    q: Belief,
+    action: Array | None,
+    space,
+) -> tuple[Array, Array]:
+    """One tick's process-noise sufficient statistic for state factor ``f`` (D2): the
+    responsibility-weighted pairwise residual scatter ``E_q[(x' − F x − G u − b)(·)ᵀ]``
+    (:func:`pairwise_scatter`, at the noise's current point) and the responsibility mass, per mode
+    for a per-mode prior and summed over the modes for a shared one; the diagonal for an
+    ``InverseGamma``.
+
+    A mode is a configuration of the factor's discrete control nodes: the taken level's one-hot is
+    its responsibility (a belief-valued entry's probabilities, which make the statistic the
+    responsibility-weighted one). A continuous control node enters through ``G u`` (a nonlinear
+    map's own argument). A :class:`~hybrid_aif.factors.NonlinearGaussianTransition` is linearised
+    at the previous posterior mean, ``F`` its Jacobian and ``b`` the remainder, the first-order
+    propagation's own linearisation; under ``noise_scale="per_coordinate"`` the residual is
+    standardised by the scale there, so the statistic is over the unscaled noise. Refused: a
+    mixture-carried factor (the pairwise posterior per component is lost at the reduce) and the
+    unscented rule. Design: process-noise-learning.md D2."""
+    from hybrid_aif import controls as _controls
+    from hybrid_aif.factors import NonlinearGaussianTransition, transition_point
+    from hybrid_aif.objectives import hybrid as _hybrid
+
+    name = system._facs[f]
+    nonlinear = isinstance(decl, NonlinearGaussianTransition)
+    if nonlinear and decl.propagation != "first_order":
+        raise NotImplementedError(
+            f"transition:{name}: learning the process noise of a nonlinear transition under "
+            f"propagation={decl.propagation!r} is not built: the pairwise moments under sigma "
+            "points are a different computation from the first-order smoother "
+            "(process-noise-learning.md D2); declare propagation='first_order' or freeze the "
+            f"noise (lr_by_slot={{'transition:{name}:noise': 0.0}})"
+        )
+    if system._families(params)[f] != _hybrid.GAUSSIAN or not (
+        isinstance(prev_q, Gaussian) and isinstance(q, Gaussian)
+    ):
+        raise NotImplementedError(
+            f"transition:{name}: learning the process noise of a mixture-carried factor (a "
+            "MixtureGaussian prior, or discrete state parents that switch it) is not built: the "
+            "pairwise posterior per component is lost when the grown mixture is reduced "
+            "(parameter-learning.md O3; process-noise-learning.md D2). Control modes are "
+            f"supported; freeze the noise (lr_by_slot={{'transition:{name}:noise': 0.0}})"
+        )
+    prior = decl.noise_prior
+    point = transition_point(decl)
+    table, kinds = system._table, space.kinds if space is not None else ()
+    dtype = q.loc.dtype
+    shape = tuple(decl.innovations.parent_shape)
+    discrete = [
+        k
+        for what, k in _controls.declared_parents(table, f)
+        if what == "control" and not (kinds and kinds[k] == _controls.FLOAT)
+    ]
+    given = {
+        k: _controls.node_entry(action, k, None if space is None else space.layout)
+        for k, _ in table.control_parents[f]
+    }
+    weights = jnp.ones((), dtype)
+    for k in discrete:
+        weights = weights[..., None] * _mode_responsibility(given[k], space.sizes[k], dtype)
+    weights = jnp.broadcast_to(weights, shape) if not discrete else weights
+    mu, cov, mu1, cov1 = prev_q.loc, prev_q.cov, q.loc, q.cov
+    d = mu.shape[-1]
+    scatters = []
+    for levels in np.ndindex(*shape):
+        entries = dict(given)
+        for k, level in zip(discrete, levels if discrete else (), strict=True):
+            entries[k] = jnp.asarray(level, jnp.int32)
+        if nonlinear:
+            inputs = _hybrid._nl_inputs(point, table.control_parents[f], kinds, entries)
+            if inputs.beliefs:
+                raise NotImplementedError(
+                    f"transition:{name}: learning the process noise under a belief over a "
+                    "continuous control input is not built; learn from the taken action"
+                )
+
+            def mean_scale(x, controls=inputs.controls):
+                return decl._mean_and_scale(x, controls)
+
+            F = jax.jacfwd(lambda x, ms=mean_scale: ms(x)[0])(mu)
+            m0, scale = mean_scale(mu)
+            b = m0 - F @ mu + inputs.loc
+            Q = inputs.chol @ inputs.chol.T
+            if scale is not None:
+                Q = scale[:, None] * Q * scale[None, :]
+            S = pairwise_scatter(mu, cov, mu1, cov1, F, b, Q)
+            if scale is not None:
+                S = S / (scale[:, None] * scale[None, :])
+        else:
+            read = _controls.lg_read(table, kinds, f)
+            inputs = _hybrid._lg_inputs(point, read, entries)
+            loc, chol, F, G = inputs.loc, inputs.chol, inputs.F, inputs.G
+            if inputs.trivial:
+                loc = loc[..., 0, :]
+                chol = chol if inputs.shared else chol[..., 0, :, :]
+                F = F[..., 0, :, :] if F.ndim > 2 else F
+                G = G[..., 0, :, :] if G is not None and G.ndim > 2 else G
+            if inputs.u_mean is not None:
+                loc = loc + G @ inputs.u_mean
+            S = pairwise_scatter(mu, cov, mu1, cov1, F, loc, chol @ chol.T)
+        scatters.append(S)
+    scatter = jnp.stack(scatters).reshape(*shape, d, d) * weights[..., None, None]
+    count = weights
+    if not _noise_batch(prior):  # one prior shared by every mode: the modes' evidence summed
+        scatter = jnp.sum(scatter.reshape(-1, d, d), axis=0)
+        count = jnp.sum(count)
+    if isinstance(prior, InverseGamma):
+        return jnp.diagonal(scatter, axis1=-2, axis2=-1), count
+    return scatter, count

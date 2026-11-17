@@ -12,7 +12,8 @@ A *block* is one posterior that :meth:`~hybrid_aif.system.System.learn` updates,
 its rates are (``"likelihood:<modality>"``, ``"transition:<factor>"``,
 ``"initial_state_prior:<factor>"``, ``"parameter:<name>"`` for a named parameter variable (the one
 block of every factor and modality that reads it), and ``"likelihood:<modality>:noise"`` for a
-linear-Gaussian observation's noise): a Dirichlet or conditional Dirichlet, a matrix-normal
+linear-Gaussian observation's noise, ``"transition:<factor>:noise"`` for a Gaussian transition's
+noise prior): a Dirichlet or conditional Dirichlet, a matrix-normal
 inverse-Wishart emission (one joint block, head and noise), a linear-Gaussian observation's
 learnable noise, a trainable neural conditional. A block is carried whole, its anchors and
 growth propensity included. Everything else comes from the fresh params: point values, and
@@ -23,7 +24,7 @@ counts over the same levels do. A posterior over a parameter the rebuild re-expr
 in a frame that moves with the agent) is carried as it stands, in the old expression, and is
 then wrong: keep such a parameter in a frame the rebuild does not move.
 
-Design: docs/design/parameter-learning.md D9
+Design: docs/design/parameter-learning.md D9; process-noise-learning.md D1, D4
 """
 
 from __future__ import annotations
@@ -36,7 +37,11 @@ import jax
 import numpy as np
 
 from hybrid_aif.distributions import ConditionalDirichlet, Dirichlet
-from hybrid_aif.factors import LinearGaussianObservation, LinearGaussianObservationMNIW
+from hybrid_aif.factors import (
+    GaussianTransition,
+    LinearGaussianObservation,
+    LinearGaussianObservationMNIW,
+)
 
 _SLOTS = ("likelihood", "transition", "initial_state_prior")
 
@@ -47,7 +52,7 @@ def learnable_blocks(decl) -> tuple[str, ...]:
     otherwise."""
     if isinstance(decl, LinearGaussianObservationMNIW):
         return ("",)
-    if isinstance(decl, LinearGaussianObservation):
+    if isinstance(decl, LinearGaussianObservation | GaussianTransition):
         return ("noise",) if decl.learnable_noise else ()
     if isinstance(decl, Dirichlet | ConditionalDirichlet):
         return ("",)
@@ -56,8 +61,13 @@ def learnable_blocks(decl) -> tuple[str, ...]:
     return ()
 
 
+def _field(decl, block: str) -> str:
+    """The field that holds ``block``: a Gaussian transition keeps its noise in ``noise_prior``."""
+    return "noise_prior" if block == "noise" and isinstance(decl, GaussianTransition) else block
+
+
 def _part(decl, block: str):
-    return decl if block == "" else getattr(decl, block)
+    return decl if block == "" else getattr(decl, _field(decl, block))
 
 
 def _same_form(key: str, fresh, learned) -> None:
@@ -125,7 +135,30 @@ def carry_learned(system, fresh, learned, slots: Iterable[str] | None = None, gr
                 + " in the learned ones; a posterior carries only between declarations of the "
                 "same form, so declare both alike or leave the slot out of slots="
             )
-    reading = set(now) | set(then)
+    noise_now = {(slot, i): home for slot, i, home in fresh.noise_references}
+    noise_then = {(slot, i): home for slot, i, home in learned.noise_references}
+    for slot, i in sorted(noise_now.keys() | noise_then.keys()):
+        key = f"{slot}:{names[slot][i]}"
+        if noise_now.get((slot, i)) != noise_then.get((slot, i)) and (
+            slots is None or any(k == key or key.startswith(f"{k}:") for k in slots)
+        ):
+            raise ValueError(
+                f"carry: {key} reads its noise from "
+                + (
+                    f"parameter variable {noise_now[(slot, i)]!r}"
+                    if (slot, i) in noise_now
+                    else "its own field"
+                )
+                + " in the fresh params and from "
+                + (
+                    f"parameter variable {noise_then[(slot, i)]!r}"
+                    if (slot, i) in noise_then
+                    else "its own field"
+                )
+                + " in the learned ones; a posterior carries only between declarations of the "
+                "same form, so declare both alike or leave the slot out of slots="
+            )
+    reading = set(now) | set(then) | set(noise_now) | set(noise_then)
     for name in fresh.parameters:  # a named parameter variable is one block, whoever reads it
         if name not in learned.parameters:
             continue
@@ -202,11 +235,16 @@ def carry_learned(system, fresh, learned, slots: Iterable[str] | None = None, gr
         if block == "":
             containers[slot][i] = old
         else:
+            name = _field(new, block)
             containers[slot][i] = eqx.tree_at(
-                lambda d, b=block: getattr(d, b), new, _part(old, block)
+                lambda d, b=name: getattr(d, b), new, _part(old, block)
             )
     for slot, i, home in fresh.references:  # each reader's position holds its variable's table
         containers[slot][i] = parameters[home]
+    for slot, i, home in fresh.noise_references:  # and each noise reader's field its variable
+        decl = containers[slot][i]
+        name = _field(decl, "noise")
+        containers[slot][i] = eqx.tree_at(lambda d, b=name: getattr(d, b), decl, parameters[home])
     return dataclasses.replace(
         fresh, parameters=parameters, **{slot: tuple(containers[slot]) for slot in _SLOTS}
     )

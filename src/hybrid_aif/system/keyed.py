@@ -46,7 +46,13 @@ import jax.numpy as jnp
 
 from hybrid_aif import controls
 from hybrid_aif.controls import FLOAT, LEVEL, ControlLayout, ControlStep
-from hybrid_aif.factors import Parameter, TabularHome
+from hybrid_aif.factors import (
+    GaussianTransition,
+    LinearGaussianObservation,
+    NoiseHome,
+    Parameter,
+    TabularHome,
+)
 from hybrid_aif.inference.detail import InferenceDetail
 
 Kind = Literal["beliefs", "observations", "actions", "detail", "params"]
@@ -673,15 +679,53 @@ def _keyed_slots(params: Any) -> list[str]:
 READER_SLOTS = ("transition", "likelihood")
 
 
-def _home(params: Any, name: str, slot: str, reader: str) -> Any:
-    """The declaration a reference names, or the refusal that says why it names none."""
+#: The field of a reader's declaration that may hold a :class:`~hybrid_aif.factors.Parameter`
+#: naming a noise variable, by slot.
+NOISE_FIELDS = {"transition": "noise_prior", "likelihood": "noise"}
+
+
+def noise_field(slot: str, decl: Any) -> str | None:
+    """The field of ``decl`` (in ``slot``) that holds a noise a variable may supply, or ``None``
+    for a declaration with none (a table, a neural conditional, an MNIW observation)."""
+    if slot == "transition" and isinstance(decl, GaussianTransition):
+        return NOISE_FIELDS[slot]
+    if slot == "likelihood" and isinstance(decl, LinearGaussianObservation):
+        return NOISE_FIELDS[slot]
+    return None
+
+
+def _home(params: Any, name: str, slot: str, reader: str, kind: str = "table") -> Any:
+    """The declaration a reference names, or the refusal that says why it names none. ``kind``
+    is what the reader reads: ``"table"``, a whole entry, or ``"noise"``, one field."""
     homes = getattr(params, "parameters", {})
     noun = {"likelihood": "modality", "emission": "emission"}.get(slot, "factor")
     if name not in homes:
+        where = (
+            f"params.{slot}[{reader!r}].{NOISE_FIELDS[slot]}"
+            if kind == "noise"
+            else f"params.{slot}[{reader!r}]"
+        )
         raise ValueError(
-            f"{noun} {reader!r} reads parameter variable {name!r} (params.{slot}[{reader!r}] is "
+            f"{noun} {reader!r} reads parameter variable {name!r} ({where} is "
             f"Parameter({name!r})), but params.parameters declares {sorted(homes)}; declare the "
             "variable there"
+        )
+    if kind == "noise":
+        home = homes[name]
+        if not isinstance(home, NoiseHome):
+            raise ValueError(
+                f"{noun} {reader!r} reads parameter variable {name!r} as its noise "
+                f"({NOISE_FIELDS[slot]}=Parameter({name!r})), and it holds a "
+                f"{type(home).__name__}; a noise variable holds an InverseGamma or an "
+                "InverseWishart prior over a noise covariance"
+            )
+        return home
+    if isinstance(homes[name], NoiseHome):
+        field = NOISE_FIELDS.get(slot, "noise")
+        raise ValueError(
+            f"{noun} {reader!r} reads parameter variable {name!r} as its whole entry, and it is a "
+            f"noise ({type(homes[name]).__name__}), which a declaration reads in one field: "
+            f"give the {slot} entry its own declaration with {field}=Parameter({name!r})"
         )
     home = homes[name]
     if isinstance(home, Parameter):
@@ -752,7 +796,61 @@ def params_positional(names: FaceNames, params: Any, face: str = "params") -> An
             if slot in out:
                 out[slot] = tuple(_resolve_slot(names, params, slot, list(out[slot]), refs))
         out["references"] = tuple(sorted((s, i, h) for (s, i), h in refs.items()))
+        noise = _resolve_noise(names, params, out)
+        if noise is not None:
+            out["noise_references"] = noise
     return dataclasses.replace(params, **out) if out else params
+
+
+def _with_noise(slot: str, decl: Any, field: str, home: Any, reader: str) -> Any:
+    """``decl`` with its noise field holding ``home``, checked against the reader."""
+    noun = "modality" if slot == "likelihood" else "factor"
+    if slot == "likelihood" and home.obs_dim != decl.obs_dim:
+        raise ValueError(
+            f"{noun} {reader!r} reads a {home.obs_dim}-dimensional noise variable as the noise "
+            f"of its {decl.obs_dim}-dimensional observation"
+        )
+    try:
+        return dataclasses.replace(decl, **{field: home})
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{noun} {reader!r} reads its noise from a parameter variable: {exc}"
+        ) from None
+
+
+def _resolve_noise(names: FaceNames, params: Any, out: dict) -> tuple | None:
+    """The noise references resolved in place: each reader whose noise field holds a
+    :class:`~hybrid_aif.factors.Parameter` (or whose position the params already record as one)
+    gets the variable's prior in that field; ``out`` takes the rewritten reader slots. Returns the
+    ``(slot, index, name)`` record, or ``None`` when there is nothing to record."""
+    refs = {(slot, i): home for slot, i, home in getattr(params, "noise_references", ())}
+    entries: dict[str, list] = {}
+    for slot in READER_SLOTS:
+        container = out.get(slot, getattr(params, slot))
+        if isinstance(container, Mapping):
+            continue  # a keyed container left as is: nothing positional to record
+        entries[slot] = list(container)
+        for i, decl in enumerate(entries[slot]):
+            field = noise_field(slot, decl)
+            if field is not None and isinstance(getattr(decl, field), Parameter):
+                refs[(slot, i)] = getattr(decl, field).name
+    if not refs:
+        return None
+    for (slot, i), home in refs.items():
+        decl = entries[slot][i]
+        reader = _slot_names(names, slot)[i]
+        field = noise_field(slot, decl)
+        if field is None:
+            raise ValueError(
+                f"params.{slot}[{reader!r}] is recorded as reading noise variable {home!r}, and "
+                f"its {type(decl).__name__} has no noise field"
+            )
+        entries[slot][i] = _with_noise(
+            slot, decl, field, _home(params, home, slot, reader, "noise"), reader
+        )
+    for slot, values in entries.items():
+        out[slot] = tuple(values)
+    return tuple(sorted((s, i, h) for (s, i), h in refs.items()))
 
 
 def _same_table(a: Any, b: Any) -> bool:
@@ -782,6 +880,16 @@ def params_keyed(names: FaceNames, params: Any) -> Any:
         out[slot][_slot_names(names, slot)[i]] = Parameter(home)
     if references:
         out["references"] = ()
+    noise = getattr(params, "noise_references", ())
+    for slot, i, home in noise:
+        reader = _slot_names(names, slot)[i]
+        if slot not in out:  # a keyed container: its readers are rewritten in a copy
+            out[slot] = dict(getattr(params, slot))
+        container = out[slot]
+        decl = container[reader]
+        container[reader] = dataclasses.replace(decl, **{noise_field(slot, decl): Parameter(home)})
+    if noise:
+        out["noise_references"] = ()
     return dataclasses.replace(params, **out) if out else params
 
 

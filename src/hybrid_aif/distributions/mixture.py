@@ -157,7 +157,7 @@ class MixtureGaussian(Distribution):
         h_f = self.entropy()
         return Interval(lower=ce.lower - h_f.upper, upper=ce.upper - h_f.lower).clip_lower(0.0)
 
-    def reduce(self, k: int) -> "MixtureGaussian":
+    def reduce(self, k: int, aux=None):
         """Runnalls (2007) greedy reduction to exactly ``k`` components.
 
         Exactly K−k merge iterations (a fixed trip count). Each merges the valid pair of least cost
@@ -166,31 +166,54 @@ class MixtureGaussian(Distribution):
         first; a surplus of dead components survives as dead output slots. The output is compacted
         to the top-k slots by log-weight (descending, ties by slot index) and renormalized.
         Gradients are defined a.e. but discontinuous at merge-decision boundaries.
+
+        ``aux`` is a per-component side statistic (a pytree of arrays, each with the component
+        axis where ``log_weights`` has it, ``(..., K, ...)``): it rides through the reduction by
+        the assignment that merges the moments, a merged slot holding its members'
+        weight-average, and the call returns ``(mixture, aux)``. It never steers a merge, so the
+        moments are those of the call without it (design: parameters-within-the-plan.md D2).
         """
         n = self.num_components
         if not 1 <= k <= n:
             raise ValueError(f"reduce: need 1 <= k <= {n}, got {k}")
         if k == n:
-            return self
+            return self if aux is None else (self, aux)
+        nb = len(self.batch_shape)
         if self.batch_shape:
             b = math.prod(self.batch_shape)
             lw = self.log_weights.reshape((b, n))
             means = self.means.reshape((b, n, self.dim))
             chols = self.chols.reshape((b, n, self.dim, self.dim))
-            out_lw, out_means, out_chols = jax.vmap(partial(_runnalls_reduce, k=k))(
-                lw, means, chols
-            )
-            return MixtureGaussian(
+            if aux is None:
+                out_lw, out_means, out_chols = jax.vmap(partial(_runnalls_reduce, k=k))(
+                    lw, means, chols
+                )
+            else:
+                flat = jax.tree.map(lambda a: a.reshape((b, n) + a.shape[nb + 1 :]), aux)
+                out_lw, out_means, out_chols, out_aux = jax.vmap(
+                    lambda lw, mu, ch, ax: _runnalls_reduce(lw, mu, ch, k=k, aux=ax)
+                )(lw, means, chols, flat)
+            reduced = MixtureGaussian(
                 log_weights=out_lw.reshape(self.batch_shape + (k,)),
                 means=out_means.reshape(self.batch_shape + (k, self.dim)),
                 chols=out_chols.reshape(self.batch_shape + (k, self.dim, self.dim)),
             )
-        out_lw, out_means, out_chols = _runnalls_reduce(
-            self.log_weights, self.means, self.chols, k=k
+            if aux is None:
+                return reduced
+            return reduced, jax.tree.map(
+                lambda a: a.reshape(self.batch_shape + (k,) + a.shape[2:]), out_aux
+            )
+        if aux is None:
+            out_lw, out_means, out_chols = _runnalls_reduce(
+                self.log_weights, self.means, self.chols, k=k
+            )
+            return MixtureGaussian(log_weights=out_lw, means=out_means, chols=out_chols)
+        out_lw, out_means, out_chols, out_aux = _runnalls_reduce(
+            self.log_weights, self.means, self.chols, k=k, aux=aux
         )
-        return MixtureGaussian(log_weights=out_lw, means=out_means, chols=out_chols)
+        return MixtureGaussian(log_weights=out_lw, means=out_means, chols=out_chols), out_aux
 
-    def reduce_mode_aligned(self, k: int, num_modes: int) -> "MixtureGaussian":
+    def reduce_mode_aligned(self, k: int, num_modes: int, aux=None):
         """Mode-aligned grouped Runnalls reduction to ``k`` components (IMM/GPB2).
 
         On a mixture in the component-major grow layout of
@@ -198,9 +221,11 @@ class MixtureGaussian(Distribution):
         num_modes``), Runnalls runs within each producing-mode group, reducing it to ``k //
         num_modes`` components. The output is contiguous blocks of ``k // num_modes`` slots per
         mode, so the mass of block ``g`` is the posterior mass of mode ``g``. ``k`` and the
-        component count must both be multiples of ``num_modes``.
+        component count must both be multiples of ``num_modes``. ``aux`` is a per-component side
+        statistic merged by the same assignment, as :meth:`reduce` takes it; the call then
+        returns ``(mixture, aux)``.
 
-        Design: docs/design/mixture-filtering.md D2
+        Design: docs/design/mixture-filtering.md D2; parameters-within-the-plan.md D2
         """
         n = self.num_components
         if num_modes < 1:
@@ -217,23 +242,42 @@ class MixtureGaussian(Distribution):
             )
         if not num_modes <= k <= n:
             raise ValueError(f"reduce_mode_aligned: need num_modes <= k <= {n}, got k={k}")
+        nb = len(self.batch_shape)
         if self.batch_shape:
             b = math.prod(self.batch_shape)
             lw = self.log_weights.reshape((b, n))
             means = self.means.reshape((b, n, self.dim))
             chols = self.chols.reshape((b, n, self.dim, self.dim))
-            out_lw, out_means, out_chols = jax.vmap(
-                partial(_mode_aligned_reduce, k=k, num_modes=num_modes)
-            )(lw, means, chols)
-            return MixtureGaussian(
+            if aux is None:
+                out_lw, out_means, out_chols = jax.vmap(
+                    partial(_mode_aligned_reduce, k=k, num_modes=num_modes)
+                )(lw, means, chols)
+            else:
+                flat = jax.tree.map(lambda a: a.reshape((b, n) + a.shape[nb + 1 :]), aux)
+                out_lw, out_means, out_chols, out_aux = jax.vmap(
+                    lambda lw, mu, ch, ax: _mode_aligned_reduce(
+                        lw, mu, ch, k=k, num_modes=num_modes, aux=ax
+                    )
+                )(lw, means, chols, flat)
+            reduced = MixtureGaussian(
                 log_weights=out_lw.reshape(self.batch_shape + (k,)),
                 means=out_means.reshape(self.batch_shape + (k, self.dim)),
                 chols=out_chols.reshape(self.batch_shape + (k, self.dim, self.dim)),
             )
-        out_lw, out_means, out_chols = _mode_aligned_reduce(
-            self.log_weights, self.means, self.chols, k=k, num_modes=num_modes
+            if aux is None:
+                return reduced
+            return reduced, jax.tree.map(
+                lambda a: a.reshape(self.batch_shape + (k,) + a.shape[2:]), out_aux
+            )
+        if aux is None:
+            out_lw, out_means, out_chols = _mode_aligned_reduce(
+                self.log_weights, self.means, self.chols, k=k, num_modes=num_modes
+            )
+            return MixtureGaussian(log_weights=out_lw, means=out_means, chols=out_chols)
+        out_lw, out_means, out_chols, out_aux = _mode_aligned_reduce(
+            self.log_weights, self.means, self.chols, k=k, num_modes=num_modes, aux=aux
         )
-        return MixtureGaussian(log_weights=out_lw, means=out_means, chols=out_chols)
+        return MixtureGaussian(log_weights=out_lw, means=out_means, chols=out_chols), out_aux
 
     def _pairwise_kl(self) -> Array:
         """KL(component_i ‖ component_j), shape (..., K, K)."""
@@ -284,13 +328,25 @@ def _pair_cost(lw_i, lw_j, mu_i, mu_j, cov_i, cov_j, ld_i, ld_j) -> Array:
     return 0.5 * (jnp.exp(lw_sum) * _log_det(cov_m) - jnp.exp(lw_i) * ld_i - jnp.exp(lw_j) * ld_j)
 
 
-def _runnalls_merge(log_w: Array, means: Array, chols: Array, k: int) -> tuple[Array, Array, Array]:
+def _merge_ratio(lw_i: Array, lw_j: Array) -> Array:
+    """The weight share ``w_i / (w_i + w_j)`` :func:`_merge_moments` merges by (one half for a
+    dead-dead pair)."""
+    lw_sum = jnp.logaddexp(lw_i, lw_j)
+    finite = jnp.isfinite(lw_sum)
+    return jnp.where(finite, jnp.exp(lw_i - jnp.where(finite, lw_sum, 0.0)), 0.5)
+
+
+def _runnalls_merge(log_w: Array, means: Array, chols: Array, k: int, aux=None):
     """Runnalls merge core: n components -> the k live slots, dead slots dropped.
 
     Returns the k live slots' log-weights in the input gauge (unnormalized) and their covariances
     (not Cholesky factors); merge decisions are gauge- and scale-invariant. Robust to a fully dead
     input. The cost matrix and per-slot log-determinants are updated incrementally (only the merged
     slot's row and column change), so decisions match a full rebuild except on exact ties.
+
+    ``aux`` (a pytree of ``(n, ...)`` arrays, or ``None``) is a per-component side statistic
+    merged by the same assignment, a merged slot holding its members' weight-average; it is
+    returned as a fourth value, the k slots' entries, and never steers a merge.
     """
     n = log_w.shape[0]
     covs = chols @ jnp.swapaxes(chols, -1, -2)
@@ -311,13 +367,16 @@ def _runnalls_merge(log_w: Array, means: Array, chols: Array, k: int) -> tuple[A
     )
 
     def body(_, state):
-        log_w, means, covs, ld, alive, cost = state
+        log_w, means, covs, ld, alive, cost, aux = state
         dead_pair = jnp.isneginf(log_w)[:, None] | jnp.isneginf(log_w)[None, :]
         valid = upper & alive[:, None] & alive[None, :]
         # Runnalls costs are >= 0, so -1 forces dead slots to be consumed first.
         masked = jnp.where(valid, jnp.where(dead_pair, -1.0, cost), jnp.inf)
         idx = jnp.argmin(masked.reshape(-1))
         i, j = idx // n, idx % n  # upper triangle only, so i < j
+        if aux is not None:
+            r_i = _merge_ratio(log_w[i], log_w[j])
+            aux = jax.tree.map(lambda a: a.at[i].set(r_i * a[i] + (1.0 - r_i) * a[j]), aux)
         lw_ij, mu_ij, cov_ij = _merge_moments(
             log_w[i], log_w[j], means[i], means[j], covs[i], covs[j]
         )
@@ -329,32 +388,35 @@ def _runnalls_merge(log_w: Array, means: Array, chols: Array, k: int) -> tuple[A
         # only pairs involving the merged slot changed: recompute its row and column
         row = _pair_cost(log_w[i], log_w, means[i], means, covs[i], covs, ld[i], ld)
         cost = cost.at[i, :].set(row).at[:, i].set(row)
-        return log_w, means, covs, ld, alive, cost
+        return log_w, means, covs, ld, alive, cost, aux
 
     alive = jnp.ones(n, dtype=bool)
-    log_w, means, covs, ld, alive, cost = lax.fori_loop(
-        0, n - k, body, (log_w, means, covs, ld, alive, cost)
+    log_w, means, covs, ld, alive, cost, aux = lax.fori_loop(
+        0, n - k, body, (log_w, means, covs, ld, alive, cost, aux)
     )
     top_lw, top_idx = lax.top_k(log_w, k)
-    return top_lw + offset, means[top_idx], covs[top_idx]
+    if aux is None:
+        return top_lw + offset, means[top_idx], covs[top_idx]
+    return top_lw + offset, means[top_idx], covs[top_idx], jax.tree.map(lambda a: a[top_idx], aux)
 
 
-def _runnalls_reduce(
-    log_w: Array, means: Array, chols: Array, k: int
-) -> tuple[Array, Array, Array]:
-    top_lw, means, covs = _runnalls_merge(log_w, means, chols, k)
-    return jax.nn.log_softmax(top_lw), means, jnp.linalg.cholesky(covs)
+def _runnalls_reduce(log_w: Array, means: Array, chols: Array, k: int, aux=None):
+    merged = _runnalls_merge(log_w, means, chols, k, aux)
+    top_lw, means, covs = merged[:3]
+    out = (jax.nn.log_softmax(top_lw), means, jnp.linalg.cholesky(covs))
+    return out if aux is None else (*out, merged[3])
 
 
 def _mode_aligned_reduce(
-    log_w: Array, means: Array, chols: Array, k: int, num_modes: int
-) -> tuple[Array, Array, Array]:
+    log_w: Array, means: Array, chols: Array, k: int, num_modes: int, aux=None
+):
     """Grouped Runnalls: reduce each producing-mode group independently.
 
     The input is :func:`propagate`'s component-major grow output (slot ``s`` from mode
     ``s % num_modes``); each group is reduced to ``k // num_modes`` components with its total mass
     preserved, then the output is renormalized globally. Output layout: contiguous blocks of
-    ``k // num_modes`` slots per mode.
+    ``k // num_modes`` slots per mode. ``aux`` (``(n, ...)`` arrays) rides through each group's
+    merge (:func:`_runnalls_merge`) and is returned fourth, in the output layout.
     """
     n = log_w.shape[0]
     per_out = k // num_modes
@@ -365,13 +427,24 @@ def _mode_aligned_reduce(
     g_chols = jnp.swapaxes(chols.reshape(per_in, num_modes, *chols.shape[-2:]), 0, 1)
     mass = logsumexp(g_lw, axis=-1)  # group total log-mass (may be -inf if fully dead)
     offset = jnp.where(jnp.isfinite(mass), mass, 0.0)
-    red_lw, red_means, red_covs = jax.vmap(partial(_runnalls_merge, k=per_out))(
-        g_lw - offset[:, None], g_means, g_chols
-    )
+    if aux is None:
+        red_lw, red_means, red_covs = jax.vmap(partial(_runnalls_merge, k=per_out))(
+            g_lw - offset[:, None], g_means, g_chols
+        )
+    else:
+        g_aux = jax.tree.map(
+            lambda a: jnp.swapaxes(a.reshape((per_in, num_modes) + a.shape[1:]), 0, 1), aux
+        )
+        red_lw, red_means, red_covs, red_aux = jax.vmap(
+            lambda lw, mu, ch, ax: _runnalls_merge(lw, mu, ch, per_out, ax)
+        )(g_lw - offset[:, None], g_means, g_chols, g_aux)
     cat_lw = (red_lw + offset[:, None]).reshape(-1)  # restore absolute group mass
     out_means = red_means.reshape(k, -1)
     out_covs = red_covs.reshape(k, *chols.shape[-2:])
-    return jax.nn.log_softmax(cat_lw), out_means, jnp.linalg.cholesky(out_covs)
+    out = (jax.nn.log_softmax(cat_lw), out_means, jnp.linalg.cholesky(out_covs))
+    if aux is None:
+        return out
+    return (*out, jax.tree.map(lambda a: a.reshape((k,) + a.shape[2:]), red_aux))
 
 
 _LOG_2PI = math.log(2.0 * math.pi)

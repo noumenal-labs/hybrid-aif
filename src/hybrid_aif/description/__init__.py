@@ -774,6 +774,8 @@ def _encode(
             else:
                 parameters[n] = field(n, getattr(decl, n), family)
         return _record(family, parameters=parameters)
+    if kind in (_dist.InverseGamma, _dist.InverseWishart):  # a noise variable's own record
+        return _encode_noise_home(w, decl, main or base, address)
     if kind is _factors.LinearGaussianTransition:
         inn = decl.innovations
         _check_layout(
@@ -781,14 +783,7 @@ def _encode(
         )
         parameters: dict[str, Any] = {
             "F": field("F", decl.F, "LinearGaussianTransition"),
-            "innovations": {
-                "loc": w.param(
-                    f"{base}_innovations_loc", inn.loc, "real", f"{address}/innovations"
-                ),
-                "chol": w.param(
-                    f"{base}_innovations_chol", inn.chol, "cholesky", f"{address}/innovations"
-                ),
-            },
+            "innovations": _encode_innovations(w, decl, base, address),
         }
         if decl.G is not None:
             parameters["G"] = field("G", decl.G, "LinearGaussianTransition")
@@ -839,6 +834,54 @@ def _check_layout(holds: bool, address: str, what: str) -> None:
         )
 
 
+#: The fields of a noise prior a document writes, by family.
+_NOISE_FIELDS = {
+    "InverseGamma": ("alpha", "beta", "alpha0", "beta0"),
+    "InverseWishart": ("Psi", "nu", "Psi0", "nu0"),
+}
+
+
+def _encode_noise_home(w: _Writer, prior, base: str, address: str) -> dict[str, Any]:
+    """A noise parameter variable's record: its prior's family and each hyperparameter a clamped
+    variable named ``<base>_<field>``; the readers name it in their noise field
+    (``{"parameter": <name>}``). Design: process-noise-learning.md D4."""
+    family = type(prior).__name__
+    parameters = {
+        field: w.param(
+            f"{base}_{field}", getattr(prior, field), _domain(family, field), f"{address}/{field}"
+        )
+        for field in _NOISE_FIELDS[family]
+        if getattr(prior, field) is not None
+    }
+    return _record(family, parameters=parameters)
+
+
+def _encode_noise_prior(w: _Writer, var: str, prior, address: str) -> str:
+    """A learned noise variable ``var`` (a Cholesky factor, the shape of the prior's point) under
+    its prior record, as a linear-Gaussian observation's noise is written."""
+    w.learned(var, np.shape(prior.point()), "cholesky", address)
+    family = type(prior).__name__
+    w.prior(var, family, {f: getattr(prior, f) for f in _NOISE_FIELDS[family]}, address)
+    return var
+
+
+def _encode_innovations(w: _Writer, decl, base: str, address: str) -> dict[str, Any]:
+    """A Gaussian transition's innovations: the offsets clamped, the Cholesky factor clamped, or
+    learned under the transition's noise prior (its point is then what the factor reads, and the
+    declared factor is not written), or ``{"parameter": <name>}`` naming a noise variable.
+    Design: process-noise-learning.md D3, D4."""
+    inn, where = decl.innovations, f"{address}/innovations"
+    loc = w.param(f"{base}_innovations_loc", inn.loc, "real", where)
+    prior, var = decl.noise_prior, f"{base}_innovations_chol"
+    if isinstance(prior, _factors.Parameter):
+        chol: Any = {"parameter": prior.name}
+    elif prior is not None:
+        chol = _encode_noise_prior(w, var, prior, f"{where}/noise_prior")
+    else:
+        chol = w.param(var, inn.chol, "cholesky", where)
+    return {"loc": loc, "chol": chol}
+
+
 def _encode_lg_observation(w: _Writer, decl, base: str, address: str, remember) -> dict[str, Any]:
     """A linear-Gaussian observation: ``head`` and ``noise`` parameter variables, each clamped or
     learned through a prior record. The matrix-normal-inverse-Wishart family is the pair of
@@ -858,7 +901,9 @@ def _encode_lg_observation(w: _Writer, decl, base: str, address: str, remember) 
         w.param(head_var, head, "real", f"{address}/head")
     options: dict[str, Any] = {}
     noise_record: Any = noise_var
-    if isinstance(noise, _dist.InverseGamma | _dist.InverseWishart):
+    if isinstance(noise, _factors.Parameter):  # a noise variable, recorded under parameters
+        noise_record = {"parameter": noise.name}
+    elif isinstance(noise, _dist.InverseGamma | _dist.InverseWishart):
         shape = noise.Psi.shape if joint else np.shape(noise.point())
         w.learned(noise_var, shape, "cholesky", f"{address}/noise")
     elif _factors._is_noise_map(noise):
@@ -971,10 +1016,7 @@ def _encode_nonlinear(w: _Writer, decl, base: str, address: str) -> dict[str, An
     parameters: dict[str, Any] = {}
     if leaves:
         parameters["f"] = w.tree(f"{base}_f", leaves, f"{address}/f")
-    parameters["innovations"] = {
-        "loc": w.param(f"{base}_innovations_loc", inn.loc, "real", f"{address}/innovations"),
-        "chol": w.param(f"{base}_innovations_chol", inn.chol, "cholesky", f"{address}/innovations"),
-    }
+    parameters["innovations"] = _encode_innovations(w, decl, base, address)
     spec: dict[str, Any] = {"name": name}
     if static:
         spec["static"] = static
@@ -1446,6 +1488,8 @@ def _write_system(w: _Writer, system: System, params: SystemParams, where: str) 
         return states[g] if g < len(states) else actions[g - n_nodes]
 
     reading = {(slot, i): home for slot, i, home in params.references}
+    #  a reader of a noise variable is written with the reference in its noise field
+    noise_reading = {(slot, i): home for slot, i, home in params.noise_references}
     for i, (e, _) in enumerate(kernelled):
         if isinstance(params.emission[e], _factors.Parameter):
             reading[("emission", i)] = params.emission[e].name
@@ -1478,6 +1522,10 @@ def _write_system(w: _Writer, system: System, params: SystemParams, where: str) 
         d_parents = [states[g] for g in table.D_deps[f]] if table.D_deps else []
         w.record(s, "initial", _with_parents(record, d_parents))
         b = params.transition[f]
+        if ("transition", f) in noise_reading:
+            b = dataclasses.replace(
+                b, noise_prior=_factors.Parameter(noise_reading[("transition", f)])
+            )
         if ("transition", f) in reading:
             record = reference("transition", f, s)
             spec = FAMILIES[homes[reading[("transition", f)]]["family"]]
@@ -1504,6 +1552,8 @@ def _write_system(w: _Writer, system: System, params: SystemParams, where: str) 
     observed = system._observed
     for m, o in enumerate(mods):
         a = params.likelihood[m]
+        if ("likelihood", m) in noise_reading:
+            a = dataclasses.replace(a, noise=_factors.Parameter(noise_reading[("likelihood", m)]))
         if ("likelihood", m) in reading:
             record = reference("likelihood", m, o)
         else:
@@ -1901,6 +1951,8 @@ _DEFAULTS = {
     f.name: f.default for f in dataclasses.fields(System) if f.default is not dataclasses.MISSING
 }
 _SCHEDULES = ("runnalls", "mode_aligned")
+#: The first segments of a ``plan_learning`` key (``learn``'s rate grammar).
+_PLAN_LEARNING_SLOTS = ("transition", "likelihood", "parameter")
 _BELIEFS = ("prior", "posterior")
 _FEEDBACK = FEEDBACK
 
@@ -1941,6 +1993,12 @@ def _write_configuration(
         "mixture_k": _DEFAULTS["mixture_k"],
         "mixture_schedule": _DEFAULTS["mixture_schedule"],
     }
+    if system.plan_learning not in ((), False):
+        #  an inference setting: which tables a plan reads as learned within it (design:
+        #  parameters-within-the-plan.md D1)
+        inference["plan_learning"] = (
+            True if system.plan_learning is True else list(system.plan_learning)
+        )
     if inference != defaults:
         out["inference"] = inference
     learning: dict[str, Any] = {}
@@ -2249,7 +2307,7 @@ _TERM_KEYS = ("term", "on", "parameters", "options", "model", "leaf")
 _RELATIONS = ("controls", "observed", "external", "driven", "driven_actions", "black_box")
 _CONFIGURATION = {
     "planning": ("planner", "horizon", "gamma", "precision", "branch_on", "belief", "feedback"),
-    "inference": ("iterations", "mixture_k", "mixture_schedule"),
+    "inference": ("iterations", "mixture_k", "mixture_schedule", "plan_learning"),
     "learning": ("frozen", "reduction_period", "reduction_pairs"),
 }
 _BODY_KEYS = (
@@ -2461,10 +2519,19 @@ def _is_leaf(record: object) -> bool:
     return isinstance(record, Mapping) and bool(set(record) & set(_LEAF_KEYS))
 
 
+def _is_reference(value: object) -> bool:
+    """Whether a field of a record's ``parameters`` is ``{"parameter": <name>}``, a reference to a
+    named noise variable (process-noise-learning.md D4)."""
+    return isinstance(value, Mapping) and set(value) == {"parameter"}
+
+
 def _parameter_names(parameters: object) -> list[str]:
-    """Every variable a record's ``parameters`` names (nested records and lists included)."""
+    """Every variable a record's ``parameters`` names (nested records and lists included; a
+    reference to a named parameter variable names none)."""
     if isinstance(parameters, str):
         return [parameters]
+    if _is_reference(parameters):
+        return []
     if isinstance(parameters, Mapping):
         return [n for v in parameters.values() for n in _parameter_names(v)]
     if isinstance(parameters, list):
@@ -2860,13 +2927,15 @@ class _Model:
                     raise self.fail(
                         f"{address}: unknown family {family!r}; the menu is {sorted(FAMILIES)}"
                     )
-                if family != "ConditionalCategorical":
+                if family not in ("ConditionalCategorical", *_NOISE_FIELDS):
                     raise self.fail(
                         f"{address}: a parameter variable holds a tabular family "
                         f"(ConditionalCategorical, with or without a Dirichlet prior on its "
-                        f"table), "
+                        f"table) or a noise prior ({' or '.join(_NOISE_FIELDS)}), "
                         f"and a {family} parameter variable is refused"
                     )
+                if family in _NOISE_FIELDS and "options" in record:
+                    raise self.fail(f"{address}: a noise variable's record takes no options")
                 self.homes[name] = record
         self.flush()
 
@@ -2945,6 +3014,12 @@ class _Model:
                 raise self.fail(
                     f"{address}.parameter names {named!r}, which the document's parameters do "
                     f"not declare; they declare {sorted(self.homes)}"
+                )
+            if self.homes[named].get("family") in _NOISE_FIELDS:
+                raise self.fail(
+                    f"{address}.parameter names {named!r}, a noise variable, which a record "
+                    "reads in one field (a likelihood's noise, a transition's innovations.chol: "
+                    f'{{"parameter": {named!r}}}), not as its whole record'
                 )
             clash = sorted({"family", "parameters"} & set(record))
             if clash:
@@ -3269,6 +3344,22 @@ class _Model:
                 f"configuration.inference.mixture_schedule is one of {list(_SCHEDULES)}, got "
                 f"{schedule!r}"
             )
+        plan_learning = inference.get("plan_learning", [])
+        if not (
+            isinstance(plan_learning, bool)
+            or (
+                isinstance(plan_learning, list)
+                and all(
+                    isinstance(k, str) and k.partition(":")[0] in _PLAN_LEARNING_SLOTS
+                    for k in plan_learning
+                )
+            )
+        ):
+            raise self.fail(
+                "configuration.inference.plan_learning is true (every learnable table is "
+                "learned within a plan) or a list of keys 'transition:<factor>', "
+                f"'likelihood:<modality>' or 'parameter:<name>'; got {plan_learning!r}"
+            )
         self.config = {
             "planner": planner,
             "policy_len": horizon,
@@ -3286,6 +3377,9 @@ class _Model:
                 inference.get("mixture_k"), "inference.mixture_k", "the mixture budget", True
             ),
             "mixture_schedule": schedule,
+            "plan_learning": (
+                plan_learning if isinstance(plan_learning, bool) else tuple(plan_learning)
+            ),
             "reduction_period": count(
                 learning.get("reduction_period"),
                 "learning.reduction_period",
@@ -3953,11 +4047,21 @@ class _Model:
                         f"is chosen, the step before the child: write {p} (or {p}[t-1])"
                     )
             elif p in self.states:
-                if family in ("MLPConditional", "NonlinearGaussianTransition"):
-                    article = "an" if family == "MLPConditional" else "a"
+                if family == "MLPConditional":
+                    #  a NonlinearGaussianTransition reads a latent as the mode that switches
+                    #  f (nonlinear-transitions.md N4, amended 2026-11-15); a neural one does not
                     raise self.fail(
-                        f"{fac.address}: {article} {family} transition reads its own previous "
+                        f"{fac.address}: an {family} transition reads its own previous "
                         f"value and control nodes only, not {p!r}"
+                    )
+                if (
+                    family == "NonlinearGaussianTransition"
+                    and self.variables.get(p, {}).get("domain") != "categorical"
+                ):
+                    raise self.fail(
+                        f"{fac.address}: a {family} transition reads its own previous value, "
+                        "control nodes, and categorical latents (the modes that switch f) only, "
+                        f"not the continuous latent {p!r}"
                     )
                 want = 0 if same_step else 1
                 if o != want:
@@ -4272,6 +4376,11 @@ class _Model:
                     raise self.fail(
                         f"{fac.address}.parameters.{key} is a nested record naming {list(fields)}"
                     )
+            elif _is_reference(value) and (fac.family, key) == (
+                "LinearGaussianObservation",
+                "noise",
+            ):
+                pass  # a noise variable's name, read by _decode_LinearGaussianObservation
             elif mapped is not None and isinstance(value, Mapping):
                 if set(value) != set(mapped):
                     raise self.fail(
@@ -4403,6 +4512,8 @@ class _Model:
         form only. Each reader's decode checks the table against that reader's wiring."""
         record = self.homes[name]
         address = f"parameters[{name!r}]"
+        if record.get("family") in _NOISE_FIELDS:
+            return self._decode_noise_home(name)
         var = record.get("parameters", {}).get("log_table")
         if not isinstance(var, str):
             raise self.fail(f"{address}.parameters.log_table must name a variable")
@@ -4546,17 +4657,81 @@ class _Model:
         self._trailing(fac, names["chols"], module.chols.shape, (k, d, d), exact=True)
         return module
 
+    def _decode_noise_home(self, name: str):
+        """A noise parameter variable (an ``InverseGamma`` or ``InverseWishart``) from its own
+        record: each hyperparameter a clamped variable."""
+        record = self.homes[name]
+        family, address = record["family"], f"parameters[{name!r}]"
+        given = record.get("parameters", {})
+        if not isinstance(given, Mapping):
+            raise self.fail(f"{address}.parameters must be an object of hyperparameters")
+        fields = _NOISE_FIELDS[family]
+        unknown = sorted(set(given) - set(fields))
+        if unknown:
+            raise self.fail(f"{address}: {family} has no parameter(s) {unknown}; it takes {fields}")
+        values = {}
+        for field in fields:
+            var = given.get(field)
+            if var is None:
+                if field in fields[:2]:
+                    raise self.fail(f"{address}: a {family} needs {field!r}")
+                continue
+            if not isinstance(var, str) or var not in self.variables:
+                raise self.fail(f"{address}.parameters.{field} must name a variable")
+            value = self.value(var, family, field, f"{address}.parameters.{field}")
+            if isinstance(value, _Learned):
+                raise self.fail(
+                    f"{address}: the hyperparameter {var!r} has a prior of its own, and the "
+                    "engine learns one level of parameters; clamp it"
+                )
+            values[field] = value
+        cls = _dist.InverseGamma if family == "InverseGamma" else _dist.InverseWishart
+        return _assemble(cls, address, **values)
+
+    def _noise_prior(self, learned: _Learned, var: str, point_shape: tuple) -> Any:
+        """A learned noise variable's prior (inverse-Gamma or inverse-Wishart), checked against
+        the variable's declared shape."""
+        self._check_prior(learned, tuple(_NOISE_FIELDS), "a noise")
+        fields = _NOISE_FIELDS[learned.family]
+        values = {f: self.hyper(learned, f, required=f in fields[:2]) for f in fields}
+        cls = _dist.InverseGamma if learned.family == "InverseGamma" else _dist.InverseWishart
+        prior = _assemble(cls, learned.address, **values)
+        point = np.shape(prior.point())
+        declared = self.variables[var].get("shape")
+        if declared is not None and list(point) != list(declared):
+            raise self.fail(
+                f"{learned.address}: the noise prior's point has shape {list(point)} and {var!r} "
+                f"declares {declared}"
+            )
+        return prior
+
     def _innovations(self, fac: _Factor, what: str):
         """A Gaussian transition's innovations, one leading axis per discrete parent (or one of
-        size 1 for none). Returns ``(innovations, modes, note)``, the leading axes' sizes and the
-        sentence that names them."""
+        size 1 for none). Returns ``(innovations, modes, note, noise_prior)``: the leading axes'
+        sizes, the sentence that names them, and the noise prior (``None`` for a clamped Cholesky
+        factor; the prior when the factor is learned under one, the innovations then holding its
+        point; a ``Parameter`` naming a noise variable, the point being the variable's)."""
         inner = fac.parameters["innovations"]
         address = f"{fac.address}.parameters.innovations"
         loc = self.value(inner["loc"], "ConditionalGaussian", "loc", f"{address}.loc")
-        chol = self.value(inner["chol"], "ConditionalGaussian", "chol", f"{address}.chol")
-        for value in (loc, chol):
-            if isinstance(value, _Learned):
-                raise self.fail(f"{value.address}: {what} is clamped")
+        noise_prior: Any = None
+        if _is_reference(inner["chol"]):
+            name = inner["chol"]["parameter"]
+            if name not in self.homes or self.homes[name].get("family") not in _NOISE_FIELDS:
+                raise self.fail(
+                    f"{address}.chol reads parameter variable {name!r}, and the document's "
+                    "parameters declare no noise variable of that name; they declare "
+                    f"{sorted(self.homes)}"
+                )
+            noise_prior = _factors.Parameter(name)
+            chol = self._decode_noise_home(name).point()
+        else:
+            chol = self.value(inner["chol"], "ConditionalGaussian", "chol", f"{address}.chol")
+            if isinstance(chol, _Learned):
+                noise_prior = self._noise_prior(chol, inner["chol"], ())
+                chol = noise_prior.point()
+        if isinstance(loc, _Learned):
+            raise self.fail(f"{loc.address}: {what} is clamped")
         d = self._dim(fac)
         parents = [p for p, _ in fac.parents if p != fac.child and self.levels.get(p)]
         modes = tuple(self.levels[p] for p in parents) or (1,)
@@ -4572,7 +4747,7 @@ class _Model:
         innovations = _assemble(
             _dist.ConditionalGaussian, address, loc=loc, chol=chol, parent_ndims=loc.ndim - 1
         )
-        return innovations, modes, note
+        return innovations, modes, note, noise_prior
 
     def _decode_LinearGaussianTransition(self, fac: _Factor, options, role: str):
         family = "LinearGaussianTransition"
@@ -4585,13 +4760,17 @@ class _Model:
         for value in fields.values():
             if isinstance(value, _Learned):
                 raise self.fail(f"{value.address}: {what} is clamped")
-        innovations, modes, note = self._innovations(fac, what)
+        innovations, modes, note, noise_prior = self._innovations(fac, what)
         d = self._dim(fac)
         F = fields["F"].shape
         if tuple(F) != (d, d):
             self._trailing(fac, fac.parameters["F"], F, (*modes, d, d), True, note)
         return _assemble(
-            _factors.LinearGaussianTransition, fac.address, innovations=innovations, **fields
+            _factors.LinearGaussianTransition,
+            fac.address,
+            innovations=innovations,
+            noise_prior=noise_prior,
+            **fields,
         )
 
     def _decode_NonlinearGaussianTransition(self, fac: _Factor, options, role: str):
@@ -4676,7 +4855,9 @@ class _Model:
             )
         fields = {**leaves, **{k: _as_tuples(v) for k, v in static.items()}}
         f = _assemble(entry.cls, f"{fac.address}.parameters.f", **fields)
-        innovations, _, _ = self._innovations(fac, "a nonlinear transition's process noise")
+        innovations, _, _, noise_prior = self._innovations(
+            fac, "a nonlinear transition's process noise"
+        )
         return _assemble(
             _factors.NonlinearGaussianTransition,
             fac.address,
@@ -4684,6 +4865,7 @@ class _Model:
             innovations=innovations,
             propagation=options["propagation"],
             noise_scale=options["noise_scale"],
+            noise_prior=noise_prior,
         )
 
     def _decode_LinearGaussianObservation(self, fac: _Factor, options, role: str):
@@ -4701,6 +4883,34 @@ class _Model:
         else:
             d_x = self._dim(fac, fac.parents[0][0])
         grid = options.get("noise_map")
+        if _is_reference(noise_var):
+            name = noise_var["parameter"]
+            if name not in self.homes or self.homes[name].get("family") not in _NOISE_FIELDS:
+                raise self.fail(
+                    f"{fac.address}.parameters.noise reads parameter variable {name!r}, and the "
+                    "document's parameters declare no noise variable of that name; they "
+                    f"declare {sorted(self.homes)}"
+                )
+            if grid is not None:
+                raise self.fail(f"{fac.address}: options.noise_map belongs with a noise map")
+            point = np.shape(self._decode_noise_home(name).point())
+            if isinstance(head, _Learned):
+                raise self.fail(
+                    f"{fac.address}: a learned head beside a noise variable is not built; clamp "
+                    "the head"
+                )
+            self._trailing(fac, head_var, head.shape, (d_obs, d_x + 1))
+            if point[-2:] != (d_obs, d_obs):
+                raise self.fail(
+                    f"{fac.address}: noise variable {name!r} is over a {point[-1]}-dimensional "
+                    f"noise and the observation is {d_obs}-dimensional"
+                )
+            return _assemble(
+                _factors.LinearGaussianObservation,
+                fac.address,
+                head=head,
+                noise=_factors.Parameter(name),
+            )
         if isinstance(noise_var, Mapping):
             if not isinstance(grid, Mapping) or set(grid) != {"low", "high", "axes"}:
                 raise self.fail(
@@ -5547,6 +5757,7 @@ class _Model:
             epistemic=self.epistemic,
             mixture_k=self.config["mixture_k"],
             mixture_schedule=self.config["mixture_schedule"],
+            plan_learning=self.config["plan_learning"],
             reduction_period=self.config["reduction_period"],
             reduction_pairs=self.config["reduction_pairs"],
             emissions={
@@ -5927,8 +6138,23 @@ def schema() -> dict[str, Any]:
                 "anyOf": [
                     {"type": "string", "minLength": 1},
                     {"type": "array", "items": {"type": "string", "minLength": 1}},
-                    {"type": "object", "additionalProperties": {"type": "string"}},
+                    {
+                        "type": "object",
+                        "additionalProperties": {
+                            "anyOf": [{"type": "string"}, {"$ref": "#/$defs/reference"}]
+                        },
+                    },
                 ]
+            },
+            "reference": {
+                "description": (
+                    "A field read from a named noise variable (a likelihood's noise, a "
+                    "transition's innovations.chol): the variable's name under 'parameters'."
+                ),
+                "type": "object",
+                "required": ["parameter"],
+                "additionalProperties": False,
+                "properties": {"parameter": {"type": "string", "minLength": 1}},
             },
             "leaf": {
                 "type": "object",
@@ -6072,8 +6298,10 @@ def schema() -> dict[str, Any]:
                     "parameters": {
                         "type": "object",
                         "description": (
-                            "Named parameter variables, each held once and read by every factor "
-                            "record that names it in its 'parameter' key."
+                            "Named parameter variables, each held once: a table, read by every "
+                            "factor record that names it in its 'parameter' key, or a noise "
+                            "prior (InverseGamma, InverseWishart), read by every record whose "
+                            "noise field is {'parameter': <name>}."
                         ),
                         "additionalProperties": {
                             "type": "object",
@@ -6155,6 +6383,15 @@ def schema() -> dict[str, Any]:
                                         ]
                                     },
                                     "mixture_schedule": {"enum": list(_SCHEDULES)},
+                                    "plan_learning": {
+                                        "anyOf": [
+                                            {"type": "boolean"},
+                                            {
+                                                "type": "array",
+                                                "items": {"type": "string", "minLength": 1},
+                                            },
+                                        ]
+                                    },
                                 },
                             },
                             "learning": {

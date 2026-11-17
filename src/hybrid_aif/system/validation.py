@@ -262,6 +262,7 @@ def _validate(
     _validate_dims(system, params)
     _validate_propagation_slots(system, params)
     system._term_targets(params, planning=False)  # one namespace, V1/V5.3
+    system._plan_learning(params)  # its keys name learnable tables
     system._dim_selections(params)  # a sub-block of a mixture-carried factor raises
     _validate_observes(system, params)
     deps_all = system._effective_D_deps()

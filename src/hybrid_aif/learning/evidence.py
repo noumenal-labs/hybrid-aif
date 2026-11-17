@@ -4,8 +4,8 @@
 relative to the prior it absorbed them from: the ratio of the family's normaliser at the two
 parameter settings, which is the whole content of conjugacy. It is exact for the families the
 engine learns in closed form (a Dirichlet over a table or an initial prior, an inverse-Gamma
-or inverse-Wishart noise under a point head, the matrix-normal inverse-Wishart over a head
-and its noise together), and it is the quantity a merge of two levels
+or inverse-Wishart noise under a point head or a Gaussian transition's, the matrix-normal
+inverse-Wishart over a head and its noise together), and it is the quantity a merge of two levels
 (``docs/design/structure-learning.md`` S4) and a description length
 (``docs/design/description-length.md`` D5, D6) both read. :func:`absorbed_count` is the mass a
 posterior took in, the resolution a family is priced at (D1). A Dirichlet with dead levels
@@ -31,7 +31,11 @@ from jax import Array
 from jax.scipy.special import gammaln, multigammaln
 
 from hybrid_aif.distributions import ConditionalDirichlet, Dirichlet, InverseGamma, InverseWishart
-from hybrid_aif.factors import LinearGaussianObservation, LinearGaussianObservationMNIW
+from hybrid_aif.factors import (
+    GaussianTransition,
+    LinearGaussianObservation,
+    LinearGaussianObservationMNIW,
+)
 
 _LOG_2PI = math.log(2.0 * math.pi)
 _LOG_2 = math.log(2.0)
@@ -146,6 +150,14 @@ def _lg_noise(prior: LinearGaussianObservation, posterior: LinearGaussianObserva
     return _inverse_wishart(prior.noise, posterior.noise)
 
 
+def _process_noise(prior, posterior):
+    """A Gaussian transition's noise prior (process-noise-learning.md D3)."""
+    if not prior.learnable_noise:
+        return None
+    _same(prior.noise_prior, posterior.noise_prior)
+    return log_evidence(prior.noise_prior, posterior.noise_prior)
+
+
 def log_evidence(prior, posterior) -> Array | None:
     """The log marginal likelihood of the statistics ``posterior`` absorbed from ``prior``, one
     number per independent family (a table's parent combinations, an LG declaration's modes):
@@ -167,6 +179,8 @@ def log_evidence(prior, posterior) -> Array | None:
         return _mniw(prior, posterior)
     if isinstance(prior, LinearGaussianObservation):
         return _lg_noise(prior, posterior)
+    if isinstance(prior, GaussianTransition):
+        return _process_noise(prior, posterior)
     return None
 
 
@@ -191,14 +205,34 @@ def absorbed_count(prior, posterior) -> Array | None:
         if not prior.learnable_noise or prior.learnable_head:
             return None
         return absorbed_count(prior.noise, posterior.noise)
+    if isinstance(prior, GaussianTransition):
+        if not prior.learnable_noise:
+            return None
+        return absorbed_count(prior.noise_prior, posterior.noise_prior)
     return None
+
+
+def _scored(key: str, p, q) -> Evidence:
+    """One declaration's :class:`Evidence`, from its prior ``p`` and posterior ``q``."""
+    if type(p) is not type(q):
+        raise TypeError(
+            f"{key}: the prior holds {type(p).__name__} and the posterior "
+            f"{type(q).__name__}; a posterior is its prior's family"
+        )
+    nats = log_evidence(p, q)
+    if nats is None:
+        return Evidence(None, False, None)
+    count = jnp.sum(absorbed_count(p, q))
+    total = jnp.sum(nats)
+    return Evidence(total if float(count) > 0.0 else None, True, count)
 
 
 def evidence_by_slot(system, prior, posterior) -> dict[str, Evidence]:
     """Every slot's :class:`Evidence`, keyed as ``learn`` keys its rates
     (``"likelihood:<modality>"``, ``"transition:<factor>"``,
-    ``"initial_state_prior:<factor>"``), summed over the slot's parent combinations; the two
-    params are name-keyed as every face takes them.
+    ``"initial_state_prior:<factor>"``, and ``"parameter:<name>"`` for a named parameter variable
+    both params declare, whose readers then report none of their own), summed over the slot's
+    parent combinations; the two params are name-keyed as every face takes them.
 
     A slot with no closed form is ``Evidence(None, False, None)``; a conjugate slot that absorbed
     no mass, or let mass go under a decay not anchored at its prior, is
@@ -222,17 +256,9 @@ def evidence_by_slot(system, prior, posterior) -> dict[str, Evidence]:
             key = f"{slot}:{label}"
             if label not in before or label not in after:
                 raise ValueError(f"{key}: missing from the prior or the posterior")
-            p, q = before[label], after[label]
-            if type(p) is not type(q):
-                raise TypeError(
-                    f"{key}: the prior holds {type(p).__name__} and the posterior "
-                    f"{type(q).__name__}; a posterior is its prior's family"
-                )
-            nats = log_evidence(p, q)
-            if nats is None:
-                out[key] = Evidence(None, False, None)
-                continue
-            count = jnp.sum(absorbed_count(p, q))
-            total = jnp.sum(nats)
-            out[key] = Evidence(total if float(count) > 0.0 else None, True, count)
+            out[key] = _scored(key, before[label], after[label])
+    for name, p in getattr(prior, "parameters", {}).items():
+        q = getattr(posterior, "parameters", {}).get(name)
+        if q is not None:
+            out[f"parameter:{name}"] = _scored(f"parameter:{name}", p, q)
     return out

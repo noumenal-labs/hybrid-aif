@@ -6,6 +6,7 @@ recorded here; the per-release capability and migration notes are in
 
 | version | date | summary |
 |---|---|---|
+| 0.21.0 | 2026-11-16 | Switching nonlinear dynamics (a `NonlinearGaussianTransition` over discrete state parents, carried as a mixture), parameters learned within a plan (`plan_learning`: working Dirichlet counts along the rollout on both planning paths), and learnable process noise (`noise_prior` on both Gaussian transitions, a noise as a parameter variable shared by `R` and `Q`) |
 | 0.20.0 | 2026-11-15 | One engine for composed Systems (`couple`, `merge` and `run` over a closed System), nodes named by kind, a neural likelihood's update in state space, state- and control-dependent transition noise, the API reference |
 | 0.19.0 | 2026-11-04 | Recognition beside analytic factors, a neural likelihood inverted by linearisation, a levelled noise map, more of `merge` and `subsystem`, and a slow-tier mind that holds its action for an option's duration |
 | 0.18.1 | 2026-10-31 | Two planner tests tolerate the rounding of a jax point release |

@@ -270,9 +270,10 @@ def test_no_parameter_duplicating_field_on_system_params():
     ``actuator`` each action node's kernel, which the environment draws from, and
     ``durations`` a round's length per level of the one control node that sets the clock,
     and ``precision`` the policy precision, a scalar no declaration holds, and ``parameters`` the
-    named tables that readers refer to (``references`` is the positional view's record of which
-    readers do, ``emission`` the kernels of the System's outputs, and ``parts`` each leaf's own
-    habit, precision, durations and scoring parameters in a splice). Which
+    named tables and noises that readers refer to (``references`` and ``noise_references`` are
+    the positional view's record of which readers do, ``emission`` the kernels of the System's
+    outputs, and ``parts`` each leaf's own habit, precision, durations and scoring parameters in
+    a splice). Which
     *group* each field belongs to is ``test_scoring_slot.py``'s membership test."""
     fields = {f.name for f in dataclasses.fields(SystemParams)}
     assert fields == {
@@ -291,6 +292,7 @@ def test_no_parameter_duplicating_field_on_system_params():
         "precision",
         "parameters",
         "references",
+        "noise_references",
         "readings",
         "emission",
         "parts",

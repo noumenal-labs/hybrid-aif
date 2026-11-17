@@ -9,11 +9,16 @@ mode (weighted by the parents' post-transition belief) and is reduced back to
 ``mixture_k`` components. A mixture-family belief always carries exactly
 ``mixture_k`` components, padded with dead components on entry to planning. A
 nonlinear transition propagates each Gaussian (or mixture component) to first order
-or by the unscented transform, at the step's own belief.
+or by the unscented transform, at the step's own belief. A table learned within the plan
+(``System.plan_learning``) is read and absorbed through working counts the carry holds, and a
+closed pair (a tabular factor reading through a cell the mixture that switches on it) is read
+jointly over the mixture's components.
 
-Design: docs/design/hybrid-system.md D1–D4; docs/design/nonlinear-transitions.md N2–N4
+Design: docs/design/hybrid-system.md D1–D4; docs/design/nonlinear-transitions.md N2–N4;
+docs/design/parameters-within-the-plan.md D1, D2
 """
 
+import math
 from collections.abc import Callable, Mapping
 from typing import NamedTuple
 
@@ -23,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from hybrid_aif.cells import Grid, with_cell_parents
+from hybrid_aif.cells import Grid, cell_mass, component_cell_mass, with_cell_parents
 from hybrid_aif.controls import (
     LEVEL,
     ControlLayout,
@@ -34,6 +39,7 @@ from hybrid_aif.controls import (
     SensedNodes,
     action_node_beliefs,
     control_read,
+    declared_parents,
     has_control_axes,
     is_belief,
     is_distribution,
@@ -62,6 +68,7 @@ from hybrid_aif.factors import (
     TabularPrior,
     TabularTransition,
     lg_point,
+    transition_point,
 )
 from hybrid_aif.inference.emission import is_emission
 from hybrid_aif.inference.linear_gaussian import DiagonalNoise, condition_on_expected, predict
@@ -123,19 +130,6 @@ MIXTURE = "mixture"
 Belief = Categorical | Gaussian | MixtureGaussian
 
 
-def refuse_switching_nonlinear(B_f, parents: tuple[int, ...], state_names, f: int) -> None:
-    """Raise for a :class:`NonlinearGaussianTransition` with discrete state parents."""
-    if isinstance(B_f, NonlinearGaussianTransition) and parents:
-        raise NotImplementedError(
-            f"factor {state_names[f]!r}: a NonlinearGaussianTransition with discrete "
-            f"state parent(s) {[state_names[g] for g in parents]} is switching "
-            "dynamics, which would need f to take the mode, or one f per mode; that is "
-            "not built (design: nonlinear-transitions.md N4). Drop the state parents, "
-            "read the mode through a discrete control node, or declare a "
-            "LinearGaussianTransition with per-mode F"
-        )
-
-
 def factor_families(
     B: tuple,
     D: tuple,
@@ -178,11 +172,12 @@ def factor_families(
                 )
             fams.append(CATEGORICAL)
         elif isinstance(B_f, NonlinearGaussianTransition):
-            refuse_switching_nonlinear(B_f, B_deps[f], state_names, f)
+            # discrete state parents switch f (the mode reaches it as a level), so the
+            # factor is carried as a mode-aligned mixture, as a switching linear one is
             if isinstance(D_f, MixtureGaussian):
                 fams.append(MIXTURE)
             elif isinstance(D_f, Gaussian):
-                fams.append(GAUSSIAN)
+                fams.append(MIXTURE if B_deps[f] else GAUSSIAN)
             else:
                 raise ValueError(
                     f"factor {state_names[f]!r}: NonlinearGaussianTransition requires a "
@@ -318,7 +313,7 @@ def _check_mlp_parents(
 
 def _validate_nonlinear(
     decl: NonlinearGaussianTransition,
-    D_f: Gaussian | MixtureGaussian,
+    D: tuple,
     f: int,
     name: str,
     table: ControlTable,
@@ -326,17 +321,27 @@ def _validate_nonlinear(
     sizes: tuple[int, ...],
 ) -> None:
     """Check a nonlinear transition against its factor: the innovations' parent axes are the
-    factor's discrete control nodes, its dimension the prior's, and ``f`` (by
-    ``jax.eval_shape``) maps the ``(d,)`` state and the factor's control entries (an int32
-    level per discrete node, a float vector per continuous one) to a ``(d,)`` float mean."""
-    parents = table.control_parents[f]
-    discrete = [k for k, _ in parents if not kinds or kinds[k] == LEVEL]
-    expected = tuple(sizes[k] for k in discrete) or (1,)
+    factor's discrete parents in declared (``B_deps``) order, its discrete state parents (the
+    modes that switch it) and its discrete control nodes, its dimension the prior's, and ``f``
+    (by ``jax.eval_shape``) maps the ``(d,)`` state and the factor's parent entries in declared
+    order (an int32 level per discrete state parent or discrete node, a float vector per
+    continuous one) to a ``(d,)`` float mean."""
+    D_f = D[f]
+    declared = declared_parents(table, f)
+
+    def discrete(what: str, i: int) -> bool:
+        return what == "state" or not kinds or kinds[i] == LEVEL
+
+    def levels(what: str, i: int) -> int:
+        return D[i].num_levels if what == "state" else sizes[i]
+
+    expected = tuple(levels(what, i) for what, i in declared if discrete(what, i)) or (1,)
     got = decl.innovations.parent_shape
     if got != expected:
         raise ValueError(
             f"factor {name!r}: innovations parent_shape {got} != {expected} (expected one axis "
-            "per discrete control node, in declared order, or (1,) for a factor with none)"
+            "per discrete parent, the discrete state parents that switch it and its discrete "
+            "control nodes, in declared (B_deps) order, or (1,) for a factor with none)"
         )
     d = decl.dim
     if D_f.dim != d:
@@ -346,17 +351,18 @@ def _validate_nonlinear(
         )
     layout = tuple(
         jax.ShapeDtypeStruct((), jnp.int32)
-        if not kinds or kinds[k] == LEVEL
-        else jax.ShapeDtypeStruct((sizes[k],), jnp.float32)
-        for k, _ in parents
+        if discrete(what, i)
+        else jax.ShapeDtypeStruct((sizes[i],), jnp.float32)
+        for what, i in declared
     )
-    entries = [
-        f"int32 level of {table.control_names[k]!r}"
-        if not kinds or kinds[k] == LEVEL
-        else f"float[{sizes[k]}] {table.control_names[k]!r}"
-        for k, _ in parents
-    ]
-    described = "(" + ", ".join(entries) + ")"
+
+    def entry(what: str, i: int) -> str:
+        label = table.state_names[i] if what == "state" else table.control_names[i]
+        if what == "state":
+            return f"int32 mode level of {label!r}"
+        return f"int32 level of {label!r}" if discrete(what, i) else f"float[{sizes[i]}] {label!r}"
+
+    described = "(" + ", ".join(entry(what, i) for what, i in declared) + ")"
     x = jax.ShapeDtypeStruct((d,), decl.innovations.loc.dtype)
     try:
         out = jax.eval_shape(lambda x, controls: decl.f(x, controls), x, layout)
@@ -470,9 +476,6 @@ def validate_structure(
                 "transition slot's parent order, amortization.md A1/A9)",
             )
             continue
-        if isinstance(B[f], NonlinearGaussianTransition):
-            _validate_nonlinear(B[f], D[f], f, facs[f], table, kinds, sizes)
-            continue
         deps = B_deps[f]
         wrong_family = [facs[d] for d in deps if families[d] != CATEGORICAL]
         if wrong_family:
@@ -490,6 +493,9 @@ def validate_structure(
                 "declaration order and a continuous factor's discrete parents must "
                 f"precede it. A valid declaration order is: ({order})."
             )
+        if isinstance(B[f], NonlinearGaussianTransition):
+            _validate_nonlinear(B[f], D, f, facs[f], table, kinds, sizes)
+            continue
         read = lg_read(table, kinds, f)
         expected = tuple(D[i].num_levels if what == "state" else sizes[i] for what, i in read.axes)
         expected = expected or (1,)
@@ -1246,8 +1252,9 @@ def _lg_inputs(B_f: LinearGaussianTransition, read, entries: dict[int, object]) 
     ``read`` is the factor's :class:`~hybrid_aif.controls.LGRead`; ``entries`` maps each
     control node it reads to that node's entry at this step. A continuous node's entry is its
     value (a clamp) or a Gaussian / truncated Gaussian over it (a belief, read through its
-    first two moments).
+    first two moments). A noise prior is read at its point (:func:`transition_point`).
     """
+    B_f = transition_point(B_f)
     loc, chol, F, G = B_f.innovations.loc, B_f.innovations.chol, B_f.F, B_f.G
     shared = B_f.innovations.shared_chol
     n = len(read.axes)
@@ -1397,10 +1404,10 @@ def _mlp_step(
 
 class _NLInputs(NamedTuple):
     """A nonlinear transition's inputs at one step: the innovation ``(loc, chol)`` at the
-    discrete control levels; ``controls``, one entry per control parent in declared order (an
-    int32 level, a float vector, or ``None`` where a belief sits); and ``beliefs``, each
-    belief-valued continuous entry as ``(position, mean, root)``, ``root`` a factor of its
-    covariance."""
+    discrete parent levels (mode and control); ``controls``, one entry per parent in declared
+    order (an int32 level for a discrete state parent or control node, a float vector, or
+    ``None`` where a belief sits); and ``beliefs``, each belief-valued continuous entry as
+    ``(position, mean, root)``, ``root`` a factor of its covariance."""
 
     loc: Array
     chol: Array
@@ -1413,13 +1420,26 @@ def _nl_inputs(
     parents: tuple[tuple[int, int], ...],
     kinds: tuple[str, ...],
     entries: dict[int, object],
+    modes: tuple[tuple[int, Array], ...] = (),
 ) -> _NLInputs:
-    """Read ``B_f``'s control parents (``(node, position)`` pairs in declared order) at this
-    step's ``entries``: a discrete node indexes the innovations and reaches ``f`` as its
-    level; a continuous node's clamp reaches ``f`` as its value, and a Gaussian or truncated
-    Gaussian belief over it through its first two moments."""
+    """Read ``B_f``'s parents at this step: its control parents (``(node, position)`` pairs)
+    at ``entries`` and its discrete state parents at the mode levels ``modes`` (``(position,
+    level)`` pairs), merged in declared order. A discrete parent, mode or control node, indexes
+    the innovations and reaches ``f`` as its level; a continuous node's clamp reaches ``f`` as
+    its value, and a Gaussian or truncated Gaussian belief over it through its first two
+    moments."""
+    slots = sorted(
+        [(pos, "control", k) for k, pos in parents] + [(pos, "mode", lvl) for pos, lvl in modes],
+        key=lambda slot: slot[0],
+    )
     levels, controls, beliefs = [], [], []
-    for pos, (k, _) in enumerate(parents):
+    for at, (_, what, value) in enumerate(slots):
+        if what == "mode":
+            level = jnp.asarray(value, jnp.int32)
+            levels.append(level)
+            controls.append(level)
+            continue
+        k = value
         entry = entries[k]
         if kinds[k] == LEVEL:
             level = jnp.asarray(entry, jnp.int32)
@@ -1428,11 +1448,11 @@ def _nl_inputs(
         elif is_distribution(entry):
             root = entry.chol if isinstance(entry, Gaussian) else jnp.linalg.cholesky(entry.cov)
             mean = jnp.asarray(entry.mean(), jnp.float32)
-            beliefs.append((pos, mean, jnp.asarray(root, jnp.float32)))
+            beliefs.append((at, mean, jnp.asarray(root, jnp.float32)))
             controls.append(None)
         else:
             controls.append(jnp.asarray(entry, jnp.float32))
-    noise = B_f.innovations.condition_on(tuple(levels) or (0,))
+    noise = transition_point(B_f).innovations.condition_on(tuple(levels) or (0,))
     return _NLInputs(noise.loc, noise.chol, tuple(controls), tuple(beliefs))
 
 
@@ -1477,22 +1497,56 @@ def _nonlinear_step(q: Gaussian, B_f: NonlinearGaussianTransition, inputs: _NLIn
 def _nonlinear_mixture_step(
     q: MixtureGaussian,
     B_f: NonlinearGaussianTransition,
-    inputs: _NLInputs,
+    read: Callable[[tuple[Array, ...]], _NLInputs],
+    mode_shape: tuple[int, ...],
+    parent_beliefs: tuple[Categorical, ...],
     k: int,
     schedule: str,
-) -> MixtureGaussian:
-    """A mixture-carried factor through a nonlinear transition: each component through
-    :func:`_nonlinear_step` at its own moments, its weight kept, then reduced to ``k`` as
-    :func:`_mixture_step` reduces (one mode)."""
+    *,
+    log_weights: Array | None = None,
+    aux=None,
+):
+    """A mixture-carried factor through a nonlinear transition, switched by its discrete state
+    parents: each of the ``K`` components through :func:`_nonlinear_step` once per joint mode
+    ``j`` of the ``M = prod(mode_shape)`` (``read`` gives the step's inputs at the mode's
+    parent levels: ``f`` takes them, the innovations are conditioned on them), weighted by the
+    component's weight times the mode's belief (:func:`_mode_log_weights`), then reduced to
+    ``k`` as :func:`_mixture_step` reduces. The grown mixture is component-major (slot
+    ``k M + j``), :func:`~hybrid_aif.inference.mixture_rollout.propagate`'s layout, so the
+    mode-aligned reduction keeps each mode's slots. With no state parent ``M = 1`` and the step
+    is the per-component one. ``log_weights`` and ``aux`` are :func:`_mixture_step`'s. Design:
+    docs/design/nonlinear-transitions.md N4 (amended 2026-11-15)."""
+    M = math.prod(mode_shape)
+    if log_weights is not None:
+        logw = log_weights
+    else:
+        logw = _mode_log_weights(parent_beliefs) if parent_beliefs else jnp.zeros((M,))
 
-    def one(mean: Array, chol: Array) -> Gaussian:
-        return _nonlinear_step(Gaussian(loc=mean, chol=chol), B_f, inputs)
+    def mode(j: Array) -> Gaussian:
+        levels = jnp.unravel_index(j, mode_shape) if mode_shape else ()
+        inputs = read(tuple(levels))
 
-    stepped = jax.vmap(one)(q.means, q.chols)
-    grown = MixtureGaussian(log_weights=q.log_weights, means=stepped.loc, chols=stepped.chol)
+        def one(mean: Array, chol: Array) -> Gaussian:
+            return _nonlinear_step(Gaussian(loc=mean, chol=chol), B_f, inputs)
+
+        return jax.vmap(one)(q.means, q.chols)
+
+    stepped = jax.vmap(mode)(jnp.arange(M))  # (M, K, ...)
+    K, d = q.num_components, q.dim
+    means = jnp.swapaxes(stepped.loc, 0, 1).reshape((K * M, d))
+    chols = jnp.swapaxes(stepped.chol, 0, 1).reshape((K * M, d, d))
+    log_w = (q.log_weights[:, None] + logw).reshape((K * M,))
+    grown = MixtureGaussian(log_weights=log_w, means=means, chols=chols)
+    return _reduce_grown(grown, k, schedule, M, aux)
+
+
+def _reduce_grown(grown: MixtureGaussian, k: int, schedule: str, M: int, aux=None):
+    """The reduce half of grow and reduce, under ``schedule``; with ``aux`` (a per-component
+    side statistic of the grown mixture) ``(mixture, aux)``, the statistic merged by the
+    assignment that merges the moments."""
     if schedule == "mode_aligned":
-        return grown.reduce_mode_aligned(k, 1)
-    return grown.reduce(k)
+        return grown.reduce_mode_aligned(k, M, aux=aux)
+    return grown.reduce(k, aux=aux)
 
 
 def _step_pair(
@@ -1541,12 +1595,20 @@ def _mixture_step(
     inputs: _LGInputs,
     k: int,
     schedule: str,
-) -> MixtureGaussian:
+    *,
+    log_weights: Array | None = None,
+    aux=None,
+):
     """The switching composition: exact grow through all modes, then reduce(k).
 
     ``schedule`` is ``"runnalls"`` (merge anywhere) or ``"mode_aligned"`` (Runnalls
     within each producing mode's group, so slots stay mode-owned). The modes are the discrete
     state parents; the control input enters each mode's offset (and innovation, for a belief).
+    ``log_weights`` replaces the modes' joint log belief (``(M,)``) by given weights, ``(M,)``
+    or per component ``(K, M)`` (the joint read of a closed pair,
+    parameters-within-the-plan.md D2); ``aux`` is a per-component side statistic of the grown
+    mixture (``(K M, ...)``, component-major) merged through the reduce, and the step then
+    returns ``(mixture, aux)``.
     """
     d = B_f.dim
     bs = inputs.loc.reshape((-1, d))
@@ -1556,7 +1618,10 @@ def _mixture_step(
         if inputs.shared
         else inputs.chol.reshape((-1, d, d))
     )
-    logw = _mode_log_weights(parent_beliefs) if parent_beliefs else jnp.zeros((M,))
+    if log_weights is not None:
+        logw = log_weights
+    else:
+        logw = _mode_log_weights(parent_beliefs) if parent_beliefs else jnp.zeros((M,))
     F = inputs.F
     Fs = jnp.broadcast_to(F, (M, d, d)) if F.ndim == 2 else F.reshape((-1, d, d))
     if inputs.u_mean is not None:
@@ -1565,9 +1630,7 @@ def _mixture_step(
         Gs = jnp.broadcast_to(G, (M, d, du)) if G.ndim == 2 else G.reshape((-1, d, du))
         bs, Q_chols = _push_input(bs, Q_chols, Gs, inputs.u_mean, inputs.u_root)
     grown = propagate(q, Fs, bs, Q_chols, logw)
-    if schedule == "mode_aligned":
-        return grown.reduce_mode_aligned(k, M)
-    return grown.reduce(k)
+    return _reduce_grown(grown, k, schedule, M, aux)
 
 
 _NO_PROCESS_NOISE = (
@@ -1584,7 +1647,9 @@ def _with_process_noise(
 ) -> LinearGaussianTransition | NonlinearGaussianTransition:
     """``B_f`` for propagating beliefs: refused when its process noise is singular on a
     dimension (a zero diagonal entry of its factor), at once for a concrete factor and when
-    the computation runs for a traced one."""
+    the computation runs for a traced one. A noise prior is lowered to its point first
+    (:func:`~hybrid_aif.factors.transition_point`)."""
+    B_f = transition_point(B_f)
     chol = B_f.innovations.chol
     if not isinstance(chol, jax.core.Tracer):
         if np.any(np.diagonal(np.asarray(chol), axis1=-2, axis2=-1) == 0.0):
@@ -1593,6 +1658,245 @@ def _with_process_noise(
     singular = jnp.any(jnp.diagonal(chol, axis1=-2, axis2=-1) == 0.0)
     guarded = eqx.error_if(chol, singular, _NO_PROCESS_NOISE)
     return eqx.tree_at(lambda b: b.innovations.chol, B_f, guarded)
+
+
+# ------------------------------------------------- parameters learned within the plan
+
+
+class WorkingTable(NamedTuple):
+    """One table a plan learns within the plan (design: parameters-within-the-plan.md D1): its
+    key in the carry (``transition:<factor>``, ``likelihood:<modality>`` or
+    ``parameter:<name>``), the ``readers`` that read it and absorb into it (``("transition",
+    f)`` or ``("likelihood", m)``), and whether its counts carry a leading component axis, one
+    working table per component of the mixture a closed pair's reader reads (``components``,
+    D2)."""
+
+    key: str
+    readers: tuple[tuple[str, int], ...]
+    components: bool = False
+
+
+class WorkingCarry(NamedTuple):
+    """The planning carry of a plan that learns tables within the plan (built by
+    ``system.core._carry_learning`` and :func:`~hybrid_aif.objectives.compiled.make_learning`):
+    the belief tuple, the working counts after the step's absorption, and the counts the step
+    read (before it), which its novelty and every other step leaf read. Keyed as
+    ``System.plan_learning`` resolves its tables. On the fused all-tabular path ``reads``
+    keeps, per learned reader (``"<slot>:<index>"``), what a branch needs to absorb its outcome
+    in place of the step's expected statistic: a transition's parents as the step read them, a
+    likelihood's reading count (:func:`~hybrid_aif.objectives.compiled.make_learning`); empty on
+    the hybrid path. Design: parameters-within-the-plan.md D1, A3.
+    """
+
+    beliefs: tuple
+    counts: dict
+    before: dict
+    reads: dict = {}  # noqa: RUF012 (a NamedTuple default, never mutated)
+
+
+class PlanLearning(NamedTuple):
+    """The tables a plan carries as working counts (:attr:`System.plan_learning` resolved), and
+    the closed pairs (categorical factor to the mixture-carried factor it reads through a cell
+    and switches), whose reads are joint over the mixture's components (D2)."""
+
+    tables: tuple[WorkingTable, ...]
+    pairs: tuple[tuple[int, int], ...] = ()
+
+    def of(self, slot: str, i: int) -> WorkingTable | None:
+        """The working table reader ``(slot, i)`` reads, or ``None`` (it reads frozen)."""
+        return next((t for t in self.tables if (slot, i) in t.readers), None)
+
+    def seed(self, A: tuple, B: tuple, k: int | None) -> dict[str, Array]:
+        """The working counts a plan starts from: each table's concentration, the posterior
+        the plan starts from, broadcast to ``k`` components for a closed pair's table."""
+        out = {}
+        for t in self.tables:
+            slot, i = t.readers[0]
+            n = (A if slot == "likelihood" else B)[i].concentration
+            out[t.key] = jnp.broadcast_to(n, (k, *n.shape)) if t.components else n
+        return out
+
+
+def closed_pairs(
+    B: tuple,
+    B_deps: tuple[tuple[int, ...], ...],
+    families: tuple[str, ...],
+    cells: dict[int, Grid] | None,
+) -> dict[int, int]:
+    """The closed pairs: a tabular factor ``f`` reading exactly one mixture-carried factor ``g``
+    through a cell, where ``g``'s (linear or nonlinear Gaussian) transition switches on ``f``.
+    Maps ``f`` to ``g``. Design: parameters-within-the-plan.md D2."""
+    cells = cells or {}
+    out = {}
+    for f, fam in enumerate(families):
+        if fam != CATEGORICAL or f >= len(B_deps):
+            continue
+        gs = [
+            g
+            for g in B_deps[f]
+            if g in cells
+            and g < len(families)
+            and families[g] == MIXTURE
+            and f in B_deps[g]
+            and isinstance(B[g], LinearGaussianTransition | NonlinearGaussianTransition)
+        ]
+        if len(gs) == 1:
+            out[f] = gs[0]
+    return out
+
+
+def make_plan_learning(
+    resolved: tuple[tuple[str, tuple[tuple[str, int], ...]], ...],
+    A: tuple,
+    B: tuple,
+    A_deps: tuple[tuple[int, ...], ...],
+    B_deps: tuple[tuple[int, ...], ...],
+    families: tuple[str, ...],
+    cells: dict[int, Grid] | None,
+    *,
+    modality_names: tuple[str, ...],
+    state_names: tuple[str, ...],
+) -> PlanLearning:
+    """The :class:`PlanLearning` of ``System._plan_learning``'s resolved tables, its closed
+    pairs found (:func:`closed_pairs`). Refused with a sentence: a likelihood learned within the
+    plan whose modality reads anything but categorical state factors, and a parameter variable
+    read in a closed pair by one reader and learned within the plan by another (D2)."""
+    pairs = closed_pairs(B, B_deps, families, cells)
+    tables = []
+    for key, readers in resolved:
+        components = any(slot == "transition" and i in pairs for slot, i in readers)
+        if components and len(readers) > 1:
+            names = [
+                f"{slot}:{(state_names if slot == 'transition' else modality_names)[i]}"
+                for slot, i in readers
+            ]
+            raise NotImplementedError(
+                f"plan_learning: {key!r} is read by {names}, and one of them reads it in a closed "
+                "pair (a categorical factor reading a mixture-carried factor through a cell that "
+                "switches on it), where the working counts are kept per component of the "
+                "mixture; a table shared between such a reader and another reader learned within "
+                "the plan is not built (design: parameters-within-the-plan.md D2); learn one of "
+                "them within the plan, or declare the readers' tables apart"
+            )
+        for slot, m in readers:
+            if slot != "likelihood":
+                continue
+            bad = [g for g in A_deps[m] if g >= len(families) or families[g] != CATEGORICAL]
+            if bad or A[m].parent_ndims != len(A_deps[m]):
+                raise NotImplementedError(
+                    f"plan_learning: likelihood:{modality_names[m]} is learned within the plan "
+                    "from the expected observation over its parents' predicted beliefs, which "
+                    "is built for a modality reading categorical state factors alone; this one "
+                    "reads an action node or a continuous factor (design: "
+                    "parameters-within-the-plan.md D1)"
+                )
+        tables.append(WorkingTable(key, tuple(readers), components))
+    return PlanLearning(tuple(tables), tuple(sorted(pairs.items())))
+
+
+def _with_counts(decl, counts: Array):
+    """``decl`` (a ``ConditionalDirichlet``) holding ``counts`` as its concentration."""
+    return eqx.tree_at(lambda d: d.concentration, decl, counts)
+
+
+def _log_mean(counts: Array, parent_ndims: int) -> Array:
+    """The log posterior-mean table of a child-first count table (leading axes batch)."""
+    return jnp.log(counts / counts.sum(axis=-(parent_ndims + 1), keepdims=True))
+
+
+def _outer(vectors: tuple[Array, ...]) -> Array:
+    """The outer product of probability vectors, in order."""
+    out = vectors[0]
+    for v in vectors[1:]:
+        out = out[..., None] * v
+    return out
+
+
+def expected_joint(counts: Array, parent_ndims: int, parents: tuple[Array, ...]) -> Array:
+    """The expected count statistic of a step whose child is not observed: the model's joint
+    over child and parents, ``mean(counts)[c | p] · Π q(p_i)`` (child-first, the parents in
+    table order). The exact expectation of ``onehot(c) ⊗ onehot(p)`` under the table's mean and
+    the parent beliefs; the product ``q(c) ⊗ Π q(p_i)`` ``learn`` absorbs from beliefs differs
+    from it wherever child and parents are dependent (their KL is the mutual information) (design:
+    parameters-within-the-plan.md D1, resolved 2026-11-17)."""
+    mean = counts / counts.sum(axis=-(parent_ndims + 1), keepdims=True)
+    return mean * _outer(parents)
+
+
+def _table_parents(
+    decl,
+    f: int,
+    state_probs: tuple[Array, ...],
+    action: object,
+    table: ControlTable,
+    layout: ControlLayout | None,
+) -> tuple[Array, ...]:
+    """Factor ``f``'s parent vectors in its table's axis order, the count statistic's
+    parents as ``learn`` forms them: the state parents' probabilities (``B_deps`` order), a
+    control axis as the step's level one-hot (a belief-valued step's probability vector), and
+    the size-1 axis of a table with no control parent as a one-hot."""
+    states = iter(state_probs)
+    out: list[Array] = []
+    dtype = decl.concentration.dtype
+    for what, k in declared_parents(table, f):
+        if what == "state":
+            out.append(next(states))
+            continue
+        entry = node_entry(action, k, layout)
+        size = decl.parent_shape[len(out)]
+        out.append(
+            jnp.asarray(entry, dtype)
+            if is_belief(entry)
+            else jax.nn.one_hot(jnp.asarray(entry, jnp.int32), size, dtype=dtype)
+        )
+    if decl.parent_ndims == len(out) + 1:
+        out.append(jax.nn.one_hot(0, decl.parent_shape[-1], dtype=dtype))
+    return tuple(out)
+
+
+class PairRead(NamedTuple):
+    """A closed pair's tabular factor read per component of the mixture it reads (D2):
+    ``child`` the per-component child beliefs ``(K, L)``, ``parents`` the per-component state
+    parent probabilities in ``B_deps`` order (``(K, ·)`` each, the cell parent the component's
+    cell mass), ``weights`` the components' normalized weights ``(K,)``."""
+
+    child: Array
+    parents: tuple[Array, ...]
+    weights: Array
+
+
+def pair_read(
+    log_table: Array,
+    parent_ndims: int,
+    f: int,
+    g: int,
+    B_deps: tuple[tuple[int, ...], ...],
+    read: tuple[Belief, ...],
+    mixture: MixtureGaussian,
+    grid: Grid,
+    index,
+) -> PairRead:
+    """Factor ``f`` read per component of ``g``'s pre-step ``mixture``: component ``i`` has cell
+    mass ``c_i`` and child belief ``q_i = table_i · c_i`` (the other parents read as ``read``
+    holds them). ``log_table`` is ``(L, *parents)``, or ``(K, L, *parents)`` per component;
+    ``index`` is the step's control read of ``f`` (``()`` without one)."""
+    masses = component_cell_mass(mixture, grid)  # (K, cells)
+    K = masses.shape[0]
+    shared = tuple(
+        None if h == g else jnp.broadcast_to(read[h].probs, (K, read[h].probs.shape[-1]))
+        for h in B_deps[f]
+    )
+    parents = tuple(masses if p is None else p for p in shared)
+
+    def one(lt: Array, ps: tuple[Array, ...]) -> Array:
+        beliefs = tuple(Categorical.from_probs(jnp.maximum(q, 1e-30)) for q in ps)
+        return _categorical_step(
+            ConditionalCategorical(log_table=lt, parent_ndims=parent_ndims), beliefs, index
+        ).probs
+
+    per = log_table.ndim > parent_ndims + 1
+    child = jax.vmap(one, in_axes=(0 if per else None, 0))(log_table, parents)
+    return PairRead(child, parents, jax.nn.softmax(mixture.log_weights, axis=-1))
 
 
 def make_transition(
@@ -1608,6 +1912,9 @@ def make_transition(
     present: Presence | None = None,
     sensed: SensedNodes | None = None,
     cells: dict[int, Grid] | None = None,
+    learning: PlanLearning | None = None,
+    A: tuple = (),
+    A_deps: tuple[tuple[int, ...], ...] = (),
 ):
     """Family-dispatched one-step transition over distribution-object beliefs.
 
@@ -1633,8 +1940,22 @@ def make_transition(
     the observed action nodes). A tabular factor reads a parent in ``cells`` (factor index to
     :class:`~hybrid_aif.cells.Grid`) as the mass of its belief in each cell
     (:func:`~hybrid_aif.cells.cell_mass`).
+
+    A closed pair (:func:`closed_pairs`: a tabular factor reading through a cell the
+    mixture-carried factor that switches on it) is read jointly over the mixture's components:
+    component ``i`` (its pre-step belief) has cell mass ``c_i`` and child belief ``q_i``, the
+    switching factor grows with the per-component weights ``w_i q_i[j]``, and the tabular
+    factor's belief is the marginal ``Σ_i w_i q_i`` (design: parameters-within-the-plan.md D2).
+
+    With ``learning`` (:class:`PlanLearning`) the closure is ``transition(qs, action, working)
+    -> (qs, working)``: a table learned within the plan is read through the working counts'
+    mean, and each of its readers absorbs the step's expected joint (:func:`expected_joint`;
+    ``A`` and ``A_deps`` are the likelihoods and their parents, for a learned likelihood); a
+    closed pair's counts are per component, absorb ``onehot(j) ⊗ c_i`` into the grow's ``(i,
+    j)`` child and merge through the reduce by the moments' assignment (D1, D2).
     """
     cells = cells or {}
+    declared = B
     B = tuple(b.point() if isinstance(b, Learnable) else b for b in B)
     B = tuple(
         _with_process_noise(b)
@@ -1651,8 +1972,13 @@ def make_transition(
         for f, b in enumerate(B)
         if isinstance(b, LinearGaussianTransition)
     }
+    pairs = closed_pairs(declared, B_deps, families, cells)
+    tables = learning.tables if learning is not None else ()
 
-    def transition(qs: tuple[Belief, ...], action: Array) -> tuple[Belief, ...]:
+    def table_of(slot: str, i: int) -> WorkingTable | None:
+        return None if learning is None else learning.of(slot, i)
+
+    def step(qs: tuple[Belief, ...], action: Array, working: dict) -> tuple:
         if not isinstance(action, ControlStep):
             action = jnp.asarray(action) if layout is not None else jnp.asarray(action, jnp.int32)
 
@@ -1671,14 +1997,46 @@ def make_transition(
 
         new = list(qs)
         read = cell_view(qs, cells)
+        absorbed: dict[str, Array] = {}  # a plain working table's summed statistics
+        merged: dict[str, Array] = {}  # a closed pair's counts after the grow and reduce
+        joint: dict[int, tuple] = {}  # g -> (f, its PairRead, working table or None, index)
+
+        def absorb(key: str, stats: Array) -> None:
+            absorbed[key] = stats if key not in absorbed else absorbed[key] + stats
+
         for f, fam in enumerate(families):
             if fam == CATEGORICAL:
-                parents = tuple(read[i] for i in B_deps[f])
                 if has_control_axes(table, f, B[f].parent_ndims):
                     index = control_read(action, f, table)
                 else:
                     index = ()
-                new[f] = _categorical_step(B[f], parents, index)
+                wt = table_of("transition", f)
+                if f in pairs:
+                    g = pairs[f]
+                    pn = B[f].parent_ndims
+                    log_table = _log_mean(working[wt.key], pn) if wt is not None else B[f].log_probs
+                    pr = pair_read(log_table, pn, f, g, B_deps, read, qs[g], cells[g], index)
+                    new[f] = Categorical.from_probs(jnp.sum(pr.weights[:, None] * pr.child, 0))
+                    joint[g] = (f, pr, wt)
+                    continue
+                parents = tuple(read[i] for i in B_deps[f])
+                B_f = B[f] if wt is None else _with_counts(declared[f], working[wt.key]).point()
+                new[f] = _categorical_step(B_f, parents, index)
+                if wt is not None:
+                    held = predictive_beliefs(qs)
+                    state_probs = tuple(
+                        cell_mass(held[i], cells[i]) if i in cells else qs[i].probs
+                        for i in B_deps[f]
+                    )
+                    decl = declared[f]
+                    absorb(
+                        wt.key,
+                        expected_joint(
+                            working[wt.key],
+                            decl.parent_ndims,
+                            _table_parents(decl, f, state_probs, action, table, layout),
+                        ),
+                    )
             elif isinstance(B[f], MLPConditional):
                 given = entries(f)
                 inputs = tuple(
@@ -1694,20 +2052,15 @@ def make_transition(
                     present_t,
                     at_step,
                 )
-            elif isinstance(B[f], NonlinearGaussianTransition):
+            elif isinstance(B[f], NonlinearGaussianTransition) and fam == GAUSSIAN:
                 inputs = _nl_inputs(B[f], table.control_parents[f], kinds, entries(f))
-                if fam == GAUSSIAN:
-                    new[f] = _step_pair(
-                        qs[f],
-                        lambda q, B_f=B[f], inputs=inputs: _nonlinear_step(q, B_f, inputs),
-                        conditioners_of.get(f, ()),
-                        present_t,
-                        at_step,
-                    )
-                else:
-                    new[f] = _nonlinear_mixture_step(
-                        qs[f], B[f], inputs, mixture_k, mixture_schedule
-                    )
+                new[f] = _step_pair(
+                    qs[f],
+                    lambda q, B_f=B[f], inputs=inputs: _nonlinear_step(q, B_f, inputs),
+                    conditioners_of.get(f, ()),
+                    present_t,
+                    at_step,
+                )
             elif fam == GAUSSIAN:
                 inputs = _lg_inputs(B[f], lg_reads[f], entries(f))
                 new[f] = _step_pair(
@@ -1718,18 +2071,118 @@ def make_transition(
                     at_step,
                 )
             else:
-                parents = tuple(new[i] for i in B_deps[f])
-                new[f] = _mixture_step(
-                    qs[f],
-                    B[f],
-                    parents,
-                    _lg_inputs(B[f], lg_reads[f], entries(f)),
-                    mixture_k,
-                    mixture_schedule,
-                )
-        return tuple(new)
+                mode_shape = tuple(new[i].probs.shape[-1] for i in B_deps[f])
+                extra: dict = {}
+                if f in joint:
+                    h, pr, wt = joint[f]
+                    mode_beliefs = tuple(
+                        Categorical.from_probs(jnp.maximum(pr.child, 1e-30)) if i == h else new[i]
+                        for i in B_deps[f]
+                    )
+                    extra["log_weights"] = _mode_log_weights(mode_beliefs)  # (K, M)
+                    if wt is not None:
+                        extra["aux"] = _pair_grown_counts(
+                            working[wt.key],
+                            declared[h],
+                            h,
+                            pr,
+                            B_deps[f].index(h),
+                            mode_shape,
+                            action,
+                            table,
+                            layout,
+                        )
+                if isinstance(B[f], NonlinearGaussianTransition):
+                    states = tuple(
+                        pos
+                        for pos, (what, _) in enumerate(declared_parents(table, f))
+                        if what == "state"
+                    )
+                    given = entries(f)
 
-    return transition
+                    def nl_read(levels, f=f, states=states, given=given) -> _NLInputs:
+                        return _nl_inputs(
+                            B[f],
+                            table.control_parents[f],
+                            kinds,
+                            given,
+                            tuple(zip(states, levels, strict=True)),
+                        )
+
+                    out = _nonlinear_mixture_step(
+                        qs[f],
+                        B[f],
+                        nl_read,
+                        mode_shape,
+                        tuple(new[i] for i in B_deps[f]),
+                        mixture_k,
+                        mixture_schedule,
+                        **extra,
+                    )
+                else:
+                    out = _mixture_step(
+                        qs[f],
+                        B[f],
+                        tuple(new[i] for i in B_deps[f]),
+                        _lg_inputs(B[f], lg_reads[f], entries(f)),
+                        mixture_k,
+                        mixture_schedule,
+                        **extra,
+                    )
+                if "aux" in extra:
+                    out, merged[joint[f][2].key] = out
+                new[f] = out
+        for t in tables:
+            for slot, m in t.readers:
+                if slot != "likelihood":
+                    continue
+                parents = tuple(new[g].probs for g in A_deps[m])
+                absorb(t.key, expected_joint(working[t.key], A[m].parent_ndims, parents))
+        after = dict(working)
+        for key, stats in absorbed.items():
+            after[key] = working[key] + stats
+        after.update(merged)
+        return tuple(new), after
+
+    if learning is None or not tables:
+
+        def transition(qs: tuple[Belief, ...], action: Array) -> tuple[Belief, ...]:
+            return step(qs, action, {})[0]
+
+        return transition
+
+    def learned_transition(qs: tuple[Belief, ...], action: Array, working: dict) -> tuple:
+        return step(qs, action, working)
+
+    return learned_transition
+
+
+def _pair_grown_counts(
+    counts: Array,
+    decl,
+    f: int,
+    pr: PairRead,
+    pos: int,
+    mode_shape: tuple[int, ...],
+    action: object,
+    table: ControlTable,
+    layout: ControlLayout | None,
+) -> Array:
+    """A closed pair's working counts on the grown mixture, component-major ``(K M, ...)``:
+    the grow's ``(i, j)`` child holds component ``i``'s counts plus ``onehot(l_j) ⊗ c_i`` (and
+    the other parents, the control axes' one-hots), ``l_j`` the tabular factor's level in joint
+    mode ``j`` (its position ``pos`` among the switching factor's mode parents). Design:
+    parameters-within-the-plan.md D2."""
+    M = math.prod(mode_shape)
+    levels = jnp.unravel_index(jnp.arange(M), mode_shape)[pos]
+    onehots = jax.nn.one_hot(levels, decl.num_levels, dtype=counts.dtype)  # (M, L)
+    outer = jax.vmap(lambda ps: _outer(_table_parents(decl, f, ps, action, table, layout)))(
+        pr.parents
+    )  # (K, *parents)
+    P = outer.ndim - 1
+    stats = onehots[None, :, :, *([None] * P)] * outer[:, None, None]  # (K, M, L, *parents)
+    grown = counts[:, None] + stats
+    return grown.reshape((counts.shape[0] * M, *counts.shape[1:]))
 
 
 # --------------------------------------------------------------------- term closures
@@ -1775,6 +2228,7 @@ def make_step_terms(
     sensed: SensedNodes | None = None,
     cells: dict[int, Grid] | None = None,
     pooled: Pooled | None = None,
+    learning: PlanLearning | None = None,
 ):
     """Per-step term evaluator over distribution-object beliefs.
 
@@ -1837,7 +2291,49 @@ def make_step_terms(
     factors a tabular factor reads as a parent: ``StepContext.qs_prev_cells`` holds the previous
     step's beliefs with each such factor's mass over its cells, which the transition leaves read
     as a categorical parent; ``qs_prev`` keeps the Gaussian or mixture.
+
+    With ``learning`` (:class:`PlanLearning`) the closure is ``step_terms(qs, action, t,
+    qs_prev=None, working=None)``, ``working`` the working counts before the step's absorption:
+    every reader of a table learned within the plan reads their posterior (prediction through
+    its mean, novelty through its weights, an occupancy row likewise), the one closure built
+    here handed those declarations per step (``StepContext.working``, and the tabular
+    modalities' reads); a closed pair's table is read per component of the
+    mixture's pre-step belief, its leaves the weight-average of the components' own
+    (``components``, :class:`~hybrid_aif.objectives.registry.ComponentTable` by factor; design:
+    parameters-within-the-plan.md D1, D2).
     """
+    if learning is not None and learning.tables:
+        return _learned_step_terms(
+            A,
+            B,
+            A_deps,
+            B_deps,
+            families,
+            obs_targets,
+            state_targets,
+            learning,
+            dict(
+                decomposition=decomposition,
+                state_infogain_modalities=state_infogain_modalities,
+                param_infogain_modalities=param_infogain_modalities,
+                param_infogain_factors=param_infogain_factors,
+                modality_names=modality_names,
+                state_names=state_names,
+                mounts=mounts,
+                channel_selection=channel_selection,
+                factor_dims=factor_dims,
+                control_deps=control_deps,
+                present=present,
+                scoring=scoring,
+                branching=branching,
+                cross_entropy_targets=cross_entropy_targets,
+                c_deps=c_deps,
+                layout=layout,
+                sensed=sensed,
+                cells=cells,
+                pooled=pooled,
+            ),
+        )
     options = dict(
         decomposition=decomposition,
         state_infogain_modalities=state_infogain_modalities,
@@ -1868,12 +2364,12 @@ def make_step_terms(
             A, B, A_deps, B_deps, families, obs_targets, state_targets, **options
         )
 
-        def contracting_step_terms(qs, action, t, qs_prev=None):
+        def contracting_step_terms(qs, action, t, qs_prev=None, **step):
             extended = (
                 *qs,
                 *(Categorical.from_probs(p) for p in action_node_beliefs(action, sensed)),
             )
-            return inner(extended, action, t, qs_prev)
+            return inner(extended, action, t, qs_prev, **step)
 
         return contracting_step_terms
     trimmed = tuple(deps[:1] if m in selecting else deps for m, deps in enumerate(A_deps))
@@ -1881,7 +2377,7 @@ def make_step_terms(
         None if m in selecting else mask for m, mask in enumerate(channel_selection)
     )
 
-    def step_terms(qs, action, t, qs_prev=None):
+    def step_terms(qs, action, t, qs_prev=None, **step):
         extended = (
             *qs,
             *(Categorical.from_probs(p) for p in action_node_beliefs(action, sensed)),
@@ -1913,7 +2409,67 @@ def make_step_terms(
         inner = _make_step_terms(
             A_t, B, trimmed, B_deps, families, obs_targets, state_targets, **options
         )
-        return inner(extended, action, t, qs_prev)
+        return inner(extended, action, t, qs_prev, **step)
+
+    return step_terms
+
+
+def _learned_step_terms(
+    A: tuple,
+    B: tuple,
+    A_deps: tuple[tuple[int, ...], ...],
+    B_deps: tuple[tuple[int, ...], ...],
+    families: tuple[str, ...],
+    obs_targets: dict[str, Distribution],
+    state_targets: dict[str, Distribution],
+    learning: PlanLearning,
+    options: dict,
+):
+    """:func:`make_step_terms` over the working counts of the tables learned within the plan:
+    at each step the readers read the counts the step reads (before its absorption), handed to
+    the one closure built here as per-step declarations (``tables``), and a closed pair's table
+    is read per component of the pre-step mixture (:func:`pair_read`, ``components``). Design:
+    parameters-within-the-plan.md D1, D2."""
+    pairs = dict(learning.pairs)
+    cells = options["cells"] or {}
+    table = options["control_deps"]
+    inner = make_step_terms(A, B, A_deps, B_deps, families, obs_targets, state_targets, **options)
+
+    def step_terms(qs, action, t, qs_prev=None, working=None):
+        if working is None:
+            raise ValueError(
+                "this step-term closure reads tables learned within the plan, so it needs the "
+                "step's working counts (working=); drive it through the planning carry "
+                "System.planner_context builds"
+            )
+        tables = {}
+        components = {}
+        prev = None if qs_prev is None else predictive_beliefs(qs_prev)
+        for wt in learning.tables:
+            for slot, i in wt.readers:
+                if not wt.components:
+                    held = A if slot == "likelihood" else B
+                    tables[slot, i] = _with_counts(held[i], working[wt.key])
+                    continue
+                if prev is None:  # no leaf reads the parents: nothing to read per component
+                    continue
+                g, pn = pairs[i], B[i].parent_ndims
+                index = control_read(action, i, table) if has_control_axes(table, i, pn) else ()
+                pr = pair_read(
+                    _log_mean(working[wt.key], pn),
+                    pn,
+                    i,
+                    g,
+                    B_deps,
+                    cell_view(prev, cells),
+                    prev[g],
+                    cells[g],
+                    index,
+                )
+                components[i] = registry.ComponentTable(
+                    working[wt.key], pr.weights, pr.child, pr.parents
+                )
+        return inner(qs, action, t, qs_prev, components=components or None, tables=tables or None)
 
     return step_terms
 
@@ -1946,7 +2502,11 @@ def _make_step_terms(
     cells: dict[int, Grid] | None = None,
     pooled: Pooled | None = None,
 ):
-    """:func:`make_step_terms` over declarations every channel reads whole."""
+    """:func:`make_step_terms` over declarations every channel reads whole. Its closure takes
+    two per-step keywords from :func:`_learned_step_terms`: ``components`` (factor index to the
+    :class:`~hybrid_aif.objectives.registry.ComponentTable` of a closed pair's working table) and
+    ``tables`` (``(slot, index)`` to the declaration holding a reader's working counts), so the
+    closure is built once and the step reads the working posterior at run time."""
     mods, facs = modality_names, state_names
     # the channels no plan step observes: their leaves are zeros, with nothing computed for them
     absent = static_absent(present)
@@ -2129,6 +2689,9 @@ def _make_step_terms(
         action: Array,
         t: Array,
         qs_prev: tuple[Belief, ...] | None = None,
+        *,
+        components: dict | None = None,
+        tables: dict | None = None,
     ) -> TermTree:
         paired = any(isinstance(q, BeliefPair) for q in qs)
         qs_in = qs
@@ -2159,7 +2722,11 @@ def _make_step_terms(
             use = epistemic and qs_epistemic is not None and families[f] == GAUSSIAN
             return neural_model(A[m], qs_epistemic[f] if use else qs[f])
 
-        A_t = tuple(read_at(m) if m in neural_mods else a for m, a in enumerate(A))
+        # a tabular modality learned within the plan reads its working posterior (D1)
+        A_t = tuple(
+            read_at(m) if m in neural_mods else tables.get(("likelihood", m), a) if tables else a
+            for m, a in enumerate(A)
+        )
         # the risk and utility leaves read the predictive belief; the two reads differ only
         # under the quadrature rule, whose model depends on the belief's spread
         A_p = tuple(
@@ -2333,6 +2900,8 @@ def _make_step_terms(
                 action=action,
                 qs_prev=qs_prev,
                 qs_prev_cells=qs_prev_cells,
+                components=components,
+                working=tables,
                 t=t,
                 qs_epistemic=qs_epistemic,
                 qs_conditioned=qs_conditioned,

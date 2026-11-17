@@ -761,22 +761,30 @@ def test_the_declaration_and_the_return_must_agree():
 
 
 def test_the_refusals_of_a_nonlinear_transition_apply_unchanged():
-    """Switching dynamics, a zero process noise and a merge that slices ``f``'s inputs are
-    refused with the plain map's sentences."""
+    """A zero process noise and a merge that slices ``f``'s inputs are refused with the plain
+    map's sentences; switching dynamics, once refused, are carried as a mode mixture for the
+    scaled map too (nonlinear-transitions.md N4, amended 2026-11-15), the scale read per mode."""
     f = AffineScale(F2, B_OFF, C2, BS)
-    system = System(B_deps=((1,), ()), state_names=("x", "mode"), policy_len=1)
+    system = System(
+        B_deps=((0,), (0,)),
+        state_names=("mode", "x"),
+        policy_len=1,
+        mixture_k=2,
+        mixture_schedule="mode_aligned",
+    )
     params = SystemParams(
         transition={
-            "x": _scaled(f, jnp.broadcast_to(Q2, (2, 2, 2)), loc=jnp.zeros((2, 2))),
             "mode": ConditionalCategorical(log_table=jnp.zeros((2, 2)), parent_ndims=1),
+            "x": _scaled(f, jnp.broadcast_to(Q2, (2, 2, 2)), loc=jnp.zeros((2, 2))),
         },
         initial_state_prior={
-            "x": Gaussian(loc=jnp.zeros(2), chol=jnp.eye(2)),
             "mode": Categorical(logits=jnp.zeros(2)),
+            "x": Gaussian(loc=jnp.zeros(2), chol=jnp.eye(2)),
         },
     )
-    with pytest.raises(NotImplementedError, match="switching dynamics"):
-        system.update_empirical_prior(params, system.initial_priors(params), {})
+    prior = system.update_empirical_prior(params, system.initial_priors(params), {})
+    assert isinstance(prior["x"], MixtureGaussian) and prior["x"].num_components == 2
+    assert np.all(np.isfinite(np.asarray(prior["x"].chols)))
     noiseless = _scaled(f, jnp.diag(jnp.asarray([0.1, 0.0])))
     lone = System(B_deps=((),), state_names=("x",), policy_len=1)
     lone_params = SystemParams(

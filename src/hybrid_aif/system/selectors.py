@@ -21,8 +21,9 @@ from typing import TYPE_CHECKING, NamedTuple
 import jax.numpy as jnp
 from jax import Array
 
-from hybrid_aif.distributions import MLPConditional
+from hybrid_aif.distributions import ConditionalDirichlet, MLPConditional
 from hybrid_aif.factors import (
+    GaussianTransition,
     LGObservation,
     LinearGaussianObservation,
     LinearGaussianObservationMNIW,
@@ -59,6 +60,8 @@ def _param_blocks(decl) -> tuple[str, ...]:
             for block, learnable in (("noise", decl.learnable_noise), ("head", decl.learnable_head))
             if learnable
         )
+    if isinstance(decl, GaussianTransition):  # the noise prior (process-noise-learning.md D1)
+        return ("noise",) if decl.learnable_noise else ()
     return ()
 
 
@@ -349,6 +352,13 @@ def _resolve_rates(
     readers = {
         f"{slot}:{names_of[slot][i]}": home for slot, i, home in getattr(params, "references", ())
     }
+    for slot, i, home in getattr(params, "noise_references", ()):
+        # a reader of a noise variable: its noise block answers to the variable's key, and so
+        # does its group key when the noise is its only posterior
+        key = f"{slot}:{names_of[slot][i]}"
+        readers[f"{key}:noise"] = home
+        if _param_blocks(getattr(params, slot)[i]) == ("noise",):
+            readers[key] = home
     homes = {
         f"parameter:{name}": ("parameter", name, decl) for name, decl in params.parameters.items()
     }
@@ -466,6 +476,97 @@ def _resolve_rates(
     return resolved
 
 
+def _plan_learning(system: System, params: SystemParams) -> tuple[tuple[str, tuple], ...]:
+    """``System.plan_learning`` resolved: one ``(key, readers)`` per working table, in
+    declaration order, ``readers`` the ``(slot, index)`` positions (``"transition"`` a state
+    factor, ``"likelihood"`` a modality) that read it. A table's key is its reader's
+    (``transition:<factor>``, ``likelihood:<modality>``), or ``parameter:<name>`` for the readers
+    of a parameter variable learned within the plan, which share one working table. ``True``
+    resolves every learnable table; a key naming no learnable table is refused with a sentence.
+    Design: docs/design/parameters-within-the-plan.md D1.
+    """
+    sel = system.plan_learning
+    if sel is False or sel == ():
+        return ()
+    mods, facs = system.modality_names, system._facs
+    where = system._plan_learning_label
+    names_of = {"transition": facs, "likelihood": mods}
+    homes_of = {(slot, i): home for slot, i, home in getattr(params, "references", ())}
+    decl_of = {("transition", f): b for f, b in enumerate(params.transition)} | {
+        ("likelihood", m): a for m, a in enumerate(params.likelihood)
+    }
+    learnable = [pos for pos, decl in decl_of.items() if isinstance(decl, ConditionalDirichlet)]
+
+    def known() -> list[str]:
+        keys = {f"{slot}:{names_of[slot][i]}" for slot, i in learnable} | {
+            f"parameter:{homes_of[pos]}" for pos in learnable if pos in homes_of
+        }
+        return sorted(keys)
+
+    if sel is True:
+        chosen = list(learnable)
+    else:
+        chosen = []
+        for key in sel:
+            kind, _, name = key.partition(":")
+            if "*" in key:
+                raise ValueError(
+                    f"{where}: {key!r} is a pattern; plan_learning names its tables by "
+                    f"literal keys (or True for every learnable table), and the learnable tables "
+                    f"here are {known()}"
+                )
+            if kind == "parameter":
+                if name not in params.parameters:
+                    raise ValueError(
+                        f"{where}: unknown parameter variable {key!r}; the declared "
+                        f"variables are {sorted(params.parameters)}"
+                    )
+                readers = [pos for pos, home in homes_of.items() if home == name]
+                if not isinstance(params.parameters[name], ConditionalDirichlet) or not readers:
+                    raise ValueError(
+                        f"{where}: {key!r} is not a learnable table read by this System (a "
+                        "ConditionalDirichlet some transition or likelihood reads); the learnable "
+                        f"tables here are {known()}"
+                    )
+                chosen.extend(readers)
+                continue
+            if kind not in names_of or name not in names_of[kind]:
+                raise ValueError(
+                    f"{where}: unknown key {key!r}; a key is 'transition:<factor>', "
+                    "'likelihood:<modality>' or 'parameter:<name>', and the learnable tables here "
+                    f"are {known()}"
+                )
+            pos = (kind, names_of[kind].index(name))
+            if pos not in learnable:
+                raise ValueError(
+                    f"{where}: {key!r} is a {type(decl_of[pos]).__name__}, not a learnable "
+                    "table: a plan carries working counts of a tabular conjugate declaration "
+                    "(a ConditionalDirichlet) alone, and the learnable tables here are "
+                    f"{known()}"
+                )
+            chosen.append(pos)
+    chosen = sorted(set(chosen), key=lambda pos: (pos[0] != "transition", pos[1]))
+    tables: dict[str, list[tuple[str, int]]] = {}
+    for slot, i in chosen:
+        key = (
+            f"parameter:{homes_of[(slot, i)]}"
+            if (slot, i) in homes_of
+            else f"{slot}:{names_of[slot][i]}"
+        )
+        tables.setdefault(key, []).append((slot, i))
+    return tuple((key, tuple(readers)) for key, readers in tables.items())
+
+
+def _transition_noise_novelty(key: str) -> NotImplementedError:
+    return NotImplementedError(
+        f"epistemic: {key} names a Gaussian transition's noise prior, which has no novelty term "
+        "in this build: the expected information about the process noise Q from a planned step "
+        "is the transition-side twin of the matrix-normal inverse-Wishart estimator "
+        "(parameter-learning.md D10) and can follow (process-noise-learning.md D3). Leave it out "
+        "of the selection, or pass a tuple naming the other variables."
+    )
+
+
 def _switching_mniw_refusal(key: str) -> NotImplementedError:
     return NotImplementedError(
         f"epistemic: {key} is a matrix-normal inverse-Wishart emission with discrete parents, "
@@ -514,6 +615,9 @@ def _resolve_param_novelty(
         and registry.novelty_estimator(slot, decl) is None
     )
     if sel is True:
+        noisy = [k for k in unregistered if isinstance(table[k][2], GaussianTransition)]
+        if noisy and planning:
+            raise _transition_noise_novelty(noisy[0])
         if unregistered and planning:
             neural = tuple(k for k in unregistered if isinstance(table[k][2], MLPConditional))
             hint = (
@@ -580,6 +684,8 @@ def _resolve_param_novelty(
                 "is the ensemble_disagreement row, A10 disposition 3). Select "
                 "likelihood/transition slots only."
             )
+        if slot == "transition" and isinstance(decl, GaussianTransition):
+            raise _transition_noise_novelty(key)
         if registry.novelty_estimator(slot, decl) is None:
             raise NotImplementedError(
                 f"epistemic: {key} names a {registry.param_family(decl)} parameter "

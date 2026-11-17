@@ -63,6 +63,13 @@ def compose(kernel: LinearGaussianTransition, n: int) -> LinearGaussianTransitio
     """
     if not isinstance(n, int) or isinstance(n, bool) or n < 1:
         raise ValueError(f"compose: n must be a positive int, got {n!r}")
+    if kernel.noise_prior is not None:
+        raise ValueError(
+            "compose: the kernel's noise is learned (noise_prior), and the composed noise "
+            "Q_n = sum F^i Q F^iᵀ is no inverse-Gamma or inverse-Wishart variable a learn step "
+            "could update; compose its point form, hybrid_aif.factors.transition_point(kernel), "
+            "or learn the noise of the composed kernel itself"
+        )
     inn = kernel.innovations
     shape = inn.parent_shape
     d = inn.dim

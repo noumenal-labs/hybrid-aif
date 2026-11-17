@@ -209,6 +209,7 @@ def replay(
     lr: float | Array = 1.0,
     prior: SystemParams | None = None,
     support_floor: float = SUPPORT_FLOOR,
+    lr_by_slot: Mapping[str, float | Array] | None = None,
 ) -> Replay:
     """Drive ``(system, params)`` through a recorded trace (design: ``replay.md`` R1–R7).
 
@@ -236,7 +237,10 @@ def replay(
     killed level to; ``None`` takes ``params``, right when the replay starts from the prior and
     wrong when ``params`` were already learned. ``lr`` is the learning rate: a nonzero Python
     number is passed to the compiled scan as a float32 array, so a schedule of rates compiles
-    once, and a Python ``0.0`` is static (it skips learning at trace time).
+    once, and a Python ``0.0`` is static (it skips learning at trace time). ``lr_by_slot`` is
+    :meth:`System.learn`'s per-slot rates, passed to every tick's learn step as given (a Python
+    ``0.0`` freezes a slot at trace time; ``{"transition:z:noise": 1.0}`` learns one factor's
+    process noise alone, with ``lr=0.0`` for the rest).
     ``metrics=False`` drops the per-tick term trees. On the amortized path the
     belief half is the per-tick faces (``infer_states``,
     ``update_empirical_prior``).
@@ -336,6 +340,7 @@ def replay(
         learn=learn,
         lr=_traced_rate(lr) if learn else None,
         support_floor=support_floor,
+        lr_by_slot=None if not learn or lr_by_slot is None else dict(lr_by_slot),
     )
     #  the control nodes' entries, one per tick: never inferred, each tick's is the prior
     nodes = jax.tree_util.tree_map(
@@ -383,6 +388,7 @@ def _replay_core(
     learn: bool,
     lr,
     support_floor: float,
+    lr_by_slot=None,
 ) -> Replay:
     """The scan behind :func:`replay`, compiled once per static configuration.
 
@@ -442,6 +448,7 @@ def _replay_core(
                 prev_beliefs,
                 prev_action,
                 lr=lr,
+                lr_by_slot=lr_by_slot,
                 learn_state=ls_t,
                 face="replay",
                 present=mask_t,

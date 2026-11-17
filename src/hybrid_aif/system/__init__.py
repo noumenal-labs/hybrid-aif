@@ -26,6 +26,7 @@ from hybrid_aif.system.core import (
     Subsystem,
     System,
     SystemParams,
+    WorkingCarry,
     _carry_prev,
 )
 from hybrid_aif.system.selectors import (
@@ -46,6 +47,7 @@ __all__ = [
     "Subsystem",
     "System",
     "SystemParams",
+    "WorkingCarry",
 ]
 
 #   The private names below ``__all__`` are re-exported because

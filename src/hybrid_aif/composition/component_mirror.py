@@ -69,6 +69,7 @@ from hybrid_aif.factors import (
     LinearGaussianTransition,
     Parameter,
     TabularPrior,
+    map_noise_modes,
 )
 from hybrid_aif.reads import Emission
 from hybrid_aif.system import keyed
@@ -136,7 +137,10 @@ def _move_gaussian(decl: LinearGaussianTransition, order: Sequence[int]):
     F = moved(decl.F, 2) if decl.F.ndim > 2 else decl.F
     G = decl.G if decl.G is None or decl.G.ndim <= 2 else moved(decl.G, 2)
     return LinearGaussianTransition(
-        F=F, innovations=ConditionalGaussian(loc=loc, chol=chol, parent_ndims=pn), G=G
+        F=F,
+        innovations=ConditionalGaussian(loc=loc, chol=chol, parent_ndims=pn),
+        G=G,
+        noise_prior=map_noise_modes(decl.noise_prior, moved),
     )
 
 

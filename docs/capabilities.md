@@ -1144,6 +1144,88 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   the runner's `--settings` picks the scheduler over the rover or the rover alone. It records the
   project page's replay.
 
+- **v0.21.0**: **switching nonlinear dynamics.** A
+  `NonlinearGaussianTransition` may name discrete state factors in `B_deps`, as a
+  `LinearGaussianTransition` with per-mode `F_j` does: the mode reaches `f` as an integer level
+  in its declared place among `controls` (one entry per parent in `B_deps` order; a factor with
+  no state parent is unchanged) and the innovations take one axis per discrete parent in that
+  order. The factor is carried as a mixture: each component is pushed through `f` once per joint
+  mode, to first order or unscented, weighted by the mode's belief, and reduced mode-aligned or
+  by Runnalls as the linear bank is; a fix on the factor sends mode evidence to the parents,
+  `as_env` steps `f` at the sampled mode, and `describe`/`build` round-trip it. An affine `f` per
+  mode equals the linear bank to float tolerance. Was refused with "switching dynamics";
+  `objectives.hybrid.refuse_switching_nonlinear` is removed. Design:
+  `design/nonlinear-transitions.md` N4, amendment of 2026-11-15.
+
+- **v0.21.0**: **parameters learned within a plan.**
+  `System(plan_learning=...)` names the learnable tables a plan reads as learned within it, in
+  the grammar of `learn`'s rates (`"transition:<factor>"`, `"likelihood:<modality>"`,
+  `"parameter:<name>"` for every reader of a parameter variable) or `True` for every one; the
+  default `()` is today's frozen reading. Each named table rides the planning carry as working
+  counts (`system.WorkingCarry`), seeded from the posterior the plan starts from and absorbing
+  every imagined step's expected count statistic, the model's joint over child and parents
+  (the working mean times the parents' beliefs; the product of marginals `learn` absorbs from
+  an observed step differs where child and parents are dependent), so a later read of a row
+  predicts through the counts the plan has imagined (the Pólya urn: the mean moves where the
+  plan conditions on a drawn child, in a branch or a closed pair's modes) and its novelty is
+  that of the counts before the step; readers of one parameter variable
+  share one working table. A closed pair (a tabular factor reading through a cell the
+  mixture-carried factor that switches on it) is read jointly over the mixture's components,
+  learned or not: each component reads its own cell, the switching factor grows with the
+  per-component weights `w_i q_i[j]`, and the tabular factor's belief is their marginal; a
+  learned table read there keeps working counts per component, merged through the reduce by the
+  assignment that merges the moments (`MixtureGaussian.reduce(k, aux=)` and
+  `reduce_mode_aligned(k, M, aux=)` return `(mixture, aux)`, the moments bitwise as without),
+  and its novelty is the components' weight-average. An inference setting: `describe` writes it
+  under `configuration.inference`, `build` reads it back, and `merge` unions and `subsystem`
+  narrows its keys. The fused all-tabular path carries the same working counts (A3): each
+  learned table's mean, entropy and novelty are re-read from the counts at every step and every
+  other table stays hoisted; a reader whose readings are pooled (`System.readings`) absorbs its
+  statistic `n` times, as its novelty leaf counts `n`; and under the sophisticated planner each
+  `branch_on` branch absorbs its own outcome, the exact conjugate update `onehot(o) ⊗ q(s_P | o)`
+  for a learned likelihood of the branched modality and the expected statistic under the
+  branch's beliefs for every other learned table (`branching.make_branch_fn(evidence=True)`
+  returns the per-outcome statistic). Without a key the fused path is bitwise as before.
+  Refused with a sentence: a key naming no learnable table, the amortized path (it hoists its
+  tables; its transitions are networks), a parameter variable read in a closed pair and by
+  another reader learned within the plan, a learned likelihood under `present=`, and on the
+  hybrid path a learned likelihood under `branch_on`. A grid axis of one cell now has a cell
+  mass (it raised). `System(sophisticated=...)` declares both halves of sophisticated planning
+  in one tuple of `epistemic`'s selector keys: an `"obs:<modality>"` key branches on that
+  modality (the state half, `branch_on`) and a `"transition:"`, `"likelihood:"` or
+  `"parameter:"` key carries that table's counts within the plan (the parameter half,
+  `plan_learning`); construction lowers it into those two canonical fields, which every face
+  reads and every document carries (`sophisticated` never appears in one), and declaring it
+  beside `branch_on` or `plan_learning` is refused. Design:
+  `design/parameters-within-the-plan.md` D1, D2, A3, A1.
+
+- **v0.21.0**: **learnable process noise.** `LinearGaussianTransition` and
+  `NonlinearGaussianTransition` take `noise_prior=`, an `InverseGamma` or `InverseWishart` over
+  the innovations' covariance `Q`, shared across the modes or one per mode (leading axes
+  `innovations.parent_shape`). Every consumer reads `chol(Ψ/ν)` (`diag(sqrt(β/α))`), the
+  expected-precision point, through `factors.transition_point` (prediction, planning, the
+  closed loop, `as_env`, which lowers it or draws it under `param_key`); the declared
+  `innovations.chol` keeps only its shape. `learn` absorbs the exact pairwise residual scatter
+  `E_q[(x' − F x − G u − b)(·)ᵀ]` from the one-step smoother over `(prev_beliefs, beliefs)`,
+  cross-covariance included (`conjugate_stats.pairwise_scatter`), under the rate key
+  `transition:<factor>:noise`; a discrete control node selects the mode (the taken level's
+  one-hot), a continuous one enters through `G u`, and a nonlinear map is linearised at the
+  previous mean (a per-coordinate scale standardises the residual). The evidence has the noise
+  priors' closed form (`System.log_evidence`, which now also reports `parameter:<name>`),
+  `describe` writes the innovations' Cholesky factor as a learned variable under its prior and
+  `build` reads it back, and the description length prices it as an emission's noise prior;
+  `carry` and `merge` carry it. A noise is also a **parameter variable**: `SystemParams.parameters`
+  may hold an `InverseGamma` or `InverseWishart` that transitions read as
+  `noise_prior=Parameter(name)` and linear-Gaussian observations as `noise=Parameter(name)`
+  (`R` and `Q` one mechanism); `learn` sums the readers' statistics into one update under
+  `parameter:<name>`, the document records the variable once under `parameters` and each
+  reader's field as `{"parameter": <name>}`, and it is priced once. `merge` namespaces and
+  `Identify` joins noise variables, `subsystem` and `write_back` carry them. `replay` takes
+  `lr_by_slot=`. Refused with a sentence: a mixture-carried factor, the unscented rule, the
+  noise under `epistemic` (no novelty term yet), `plan_learning` on it (not a table), one prior
+  object under two readers, `durations.compose` of a learned noise. Design:
+  `design/process-noise-learning.md` D1–D4 and its As built.
+
 ## In the field / in flight
 
 - **Observing a variable (v0.20.0)**: `System.observes` names, per modality, the variable it observes, an action node or an emission of the System, and

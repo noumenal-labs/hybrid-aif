@@ -53,6 +53,7 @@ from hybrid_aif.distributions import (
 from hybrid_aif.distributions.neural import LearnedVector, PredictorHead
 from hybrid_aif.factors import (
     Deterministic,
+    GaussianTransition,
     LinearGaussianObservation,
     LinearGaussianObservationMNIW,
     NonlinearGaussianTransition,
@@ -171,6 +172,14 @@ class StepContext(NamedTuple):
     qs_conditioned: tuple | None = None  # the same after this step's expected observations
     qs_prev_cells: tuple | None = None  # ``qs_prev`` with each continuous factor a tabular
     #   factor reads through a grid replaced by a Categorical over its cells; ``None`` without cells
+    components: dict | None = None  # factor index -> its ComponentTable, for a transition table
+    #   learned within the plan and read per component of a closed pair's mixture (D2)
+    working: dict | None = None  # (slot, index) -> the declaration holding the working counts
+    #   the step reads, for a table learned within the plan outside a closed pair (D1); a
+    #   reader absent from it reads the hoisted declaration (design: parameters-within-the-plan.md)
+    tables: object | None = None  # the fused path's CompiledTables at this step when the plan
+    #   learns a table within it (the working posterior's mean, entropy and novelty in place of
+    #   the hoisted ones); None reads the hoisted tables (design: parameters-within-the-plan.md A3)
     readings: dict | None = None  # channel index -> its ``infogain`` Interval, evaluated once
     #   per Gaussian-carried factor from one factorisation of the stacked predictive covariance
     #   (:func:`~hybrid_aif.objectives.continuous.linear_gaussian_readings`); a channel absent
@@ -178,6 +187,21 @@ class StepContext(NamedTuple):
 
 
 Step = Callable[[StepContext], dict[str, Interval]]
+
+
+class ComponentTable(NamedTuple):
+    """A transition table learned within the plan and read in a closed pair, per component of
+    the mixture its reader reads (design: parameters-within-the-plan.md D2): the working
+    ``counts`` before the step's absorption, ``(K, L, *parents)``, each component on its own;
+    the components' normalized ``weights`` ``(K,)``; each component's ``child`` belief ``(K,
+    L)``; and its state ``parents`` in ``B_deps`` order, ``(K, ·)`` each (the cell parent the
+    component's cell mass). The table's leaves are the weight-average of the per-component
+    leaves."""
+
+    counts: Array
+    weights: Array
+    child: Array
+    parents: tuple[Array, ...]
 
 
 class Mount(NamedTuple):
@@ -362,6 +386,14 @@ def _prev_tabular(ctx: StepContext) -> tuple:
     return ctx.qs_prev if ctx.qs_prev_cells is None else ctx.qs_prev_cells
 
 
+def _held(ctx: StepContext, slot: str, index: tuple[int, ...], hoisted: tuple) -> tuple:
+    """The tables a step reads: each reader's working declaration where the plan learns its
+    table within the plan (``ctx.working``), the hoisted declaration otherwise."""
+    if not ctx.working:
+        return hoisted
+    return tuple(ctx.working.get((slot, i), d) for i, d in zip(index, hoisted, strict=True))
+
+
 def _needs_prev(qs_prev) -> None:
     if qs_prev is None:
         raise ValueError(
@@ -388,7 +420,8 @@ def _state_categorical(st: Statics) -> Step:
     masks = _channel_masks(st)
 
     def step(ctx: StepContext) -> dict[str, Interval]:
-        return discrete.state_info_gain(ctx.qs, A, deps, names, selected=masks)[INFOGAIN]
+        A_t = _held(ctx, "likelihood", st.index, A)
+        return discrete.state_info_gain(ctx.qs, A_t, deps, names, selected=masks)[INFOGAIN]
 
     return step
 
@@ -472,8 +505,9 @@ def _param_likelihood(st: Statics) -> Step:
     names = _sub(st.modality_names, st.index)
 
     def step(ctx: StepContext) -> dict[str, Interval]:
-        q_obs = discrete.expected_obs(ctx.qs, A, deps)
-        return discrete.param_info_gain(A, ctx.qs, q_obs, deps, names)[INFOGAIN]
+        A_t = _held(ctx, "likelihood", st.index, A)
+        q_obs = discrete.expected_obs(ctx.qs, A_t, deps)
+        return discrete.param_info_gain(A_t, ctx.qs, q_obs, deps, names)[INFOGAIN]
 
     return step
 
@@ -485,11 +519,43 @@ def _param_transition(st: Statics) -> Step:
 
     def step(ctx: StepContext) -> dict[str, Interval]:
         _needs_prev(ctx.qs_prev)
-        return discrete.transition_param_info_gain(
-            B, ctx.qs, _prev_tabular(ctx), ctx.action, index, deps, names, st.B_control_deps
+        B_t = _held(ctx, "transition", index, B)
+        leaves = discrete.transition_param_info_gain(
+            B_t, ctx.qs, _prev_tabular(ctx), ctx.action, index, deps, names, st.B_control_deps
         )[INFOGAIN]
+        for f, name, B_f, d in zip(index, names, B, deps, strict=True):
+            if ctx.components and f in ctx.components:
+                a_f = _action_of(ctx.action, f, B_f, d, st.B_control_deps)
+                leaves[discrete.param_key("transition", name)] = Interval.exact(
+                    _component_average(
+                        ctx.components[f],
+                        lambda table, child, parents, a_f=a_f: discrete.transition_novelty_leaf(
+                            table, child, parents, a_f
+                        ),
+                        B_f.parent_ndims,
+                    )
+                )
+        return leaves
 
     return step
+
+
+def _action_of(action, f: int, B_f, deps, control_deps):
+    """Factor ``f``'s control read at the step, ``None`` when its table has no control axis."""
+    has_control = B_f.parent_ndims == len(deps) + num_control_axes(control_deps, f)
+    return control_read(action, f, control_deps) if has_control else None
+
+
+def _component_average(ct: ComponentTable, leaf, parent_ndims: int) -> Array:
+    """``Σ_i w_i leaf_i`` over a :class:`ComponentTable`'s components, ``leaf(table, child,
+    parents)`` evaluated on each component's own counts (D2)."""
+
+    def one(counts, child, parents):
+        table = ConditionalDirichlet(concentration=counts, parent_ndims=parent_ndims)
+        return leaf(table, child, parents)
+
+    per = jax.vmap(one)(ct.counts, ct.child, ct.parents)
+    return jnp.sum(ct.weights * per, axis=-1)
 
 
 def _param_likelihood_mniw(st: Statics) -> Step:
@@ -534,10 +600,11 @@ def _param_likelihood_compiled(st: Statics) -> Step:
     index, mods, wA = st.index, st.modality_names, st.tables.wA
 
     def step(ctx: StepContext) -> dict[str, Interval]:
+        w_A = wA if ctx.tables is None else ctx.tables.wA
         return {
             discrete.param_key("likelihood", mods[m]): Interval.exact(
                 jnp.sum(
-                    ctx.q_obs[m] * discrete.contract_probs(wA[m], ctx.parents[m], keep_child=True),
+                    ctx.q_obs[m] * discrete.contract_probs(w_A[m], ctx.parents[m], keep_child=True),
                     axis=-1,
                 )
             )
@@ -557,9 +624,10 @@ def _param_transition_compiled(st: Statics) -> Step:
 
     def step(ctx: StepContext) -> dict[str, Interval]:
         _needs_prev(ctx.qs_prev)
+        w_B = wB if ctx.tables is None else ctx.tables.wB
         leaves = {}
         for f, ctl in zip(index, has_control, strict=True):
-            w = take_controls(wB[f], control_read(ctx.action, f, cdeps)) if ctl else wB[f]
+            w = take_controls(w_B[f], control_read(ctx.action, f, cdeps)) if ctl else w_B[f]
             fd = discrete.contract_probs(
                 w, tuple(_prev_tabular(ctx)[g] for g in B_deps[f]), keep_child=True
             )
@@ -591,15 +659,25 @@ def _occupancy_transition(st: Statics) -> Step:
 
     def step(ctx: StepContext) -> dict[str, Interval]:
         _needs_prev(ctx.qs_prev)
-        return {
-            discrete.param_key("transition", name): Interval.exact(
-                discrete.transition_occupancy_leaf(
-                    B_f,
-                    tuple(_prev_tabular(ctx)[g] for g in d),
-                    control_read(ctx.action, f, cdeps) if ctl else None,
+
+        def leaf(f, B_f, d, ctl):
+            a_f = control_read(ctx.action, f, cdeps) if ctl else None
+            if ctx.components and f in ctx.components:  # per component, D2
+                return _component_average(
+                    ctx.components[f],
+                    lambda table, _child, parents: discrete.transition_occupancy_leaf(
+                        table, parents, a_f
+                    ),
+                    B_f.parent_ndims,
                 )
+            return discrete.transition_occupancy_leaf(
+                B_f, tuple(_prev_tabular(ctx)[g] for g in d), a_f
             )
-            for f, name, B_f, d, ctl in zip(index, names, B, deps, has_control, strict=True)
+
+        B_t = _held(ctx, "transition", index, B)
+        return {
+            discrete.param_key("transition", name): Interval.exact(leaf(f, B_f, d, ctl))
+            for f, name, B_f, d, ctl in zip(index, names, B_t, deps, has_control, strict=True)
         }
 
     return step
@@ -614,11 +692,10 @@ def _occupancy_transition_compiled(st: Statics) -> Step:
 
     def step(ctx: StepContext) -> dict[str, Interval]:
         _needs_prev(ctx.qs_prev)
+        held = B_probs if ctx.tables is None else ctx.tables.B_probs
         leaves = {}
         for f, ctl in zip(index, has_control, strict=True):
-            table = (
-                take_controls(B_probs[f], control_read(ctx.action, f, cdeps)) if ctl else B_probs[f]
-            )
+            table = take_controls(held[f], control_read(ctx.action, f, cdeps)) if ctl else held[f]
             h = -xlogy(table, table).sum(axis=-(len(B_deps[f]) + 1))
             leaves[discrete.param_key("transition", facs[f])] = Interval.exact(
                 discrete.contract_probs(
@@ -864,6 +941,8 @@ def param_family(decl) -> str:
         if isinstance(decl.noise, InverseWishart):
             return INVERSE_WISHART
         return MATRIX_NORMAL
+    if isinstance(decl, GaussianTransition) and decl.learnable_noise:
+        return INVERSE_GAMMA if isinstance(decl.noise_prior, InverseGamma) else INVERSE_WISHART
     if isinstance(decl, ConditionalDirichlet | Dirichlet):
         return DIRICHLET
     return type(decl).__name__

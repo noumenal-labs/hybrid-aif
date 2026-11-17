@@ -73,10 +73,31 @@
         {
           "type": "object",
           "additionalProperties": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/reference"
+              }
+            ]
           }
         }
       ]
+    },
+    "reference": {
+      "description": "A field read from a named noise variable (a likelihood's noise, a transition's innovations.chol): the variable's name under 'parameters'.",
+      "type": "object",
+      "required": [
+        "parameter"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "parameter": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
     },
     "leaf": {
       "type": "object",
@@ -1615,7 +1636,7 @@
         },
         "parameters": {
           "type": "object",
-          "description": "Named parameter variables, each held once and read by every factor record that names it in its 'parameter' key.",
+          "description": "Named parameter variables, each held once: a table, read by every factor record that names it in its 'parameter' key, or a noise prior (InverseGamma, InverseWishart), read by every record whose noise field is {'parameter': <name>}.",
           "additionalProperties": {
             "type": "object",
             "required": [
@@ -1818,6 +1839,20 @@
                   "enum": [
                     "runnalls",
                     "mode_aligned"
+                  ]
+                },
+                "plan_learning": {
+                  "anyOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
                   ]
                 }
               }

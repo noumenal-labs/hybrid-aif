@@ -308,9 +308,32 @@ A reader's record carries its own `parents` (and `options`) and
 `"parameter"` in place of `family` and `parameters`; a record that writes both is refused. Each
 reader's table shape is checked against the variable's, as against its own table. A transition
 or likelihood record that holds its own table keeps the form above, with no `parameters` entry,
-so a document without shared tables is unchanged. Only tabular families are accepted as
-variables. The variable's own parameters are named `P_<name>` by default (section 10), and its
-learned prior is written once, under that name.
+so a document without shared tables is unchanged. The variable's own parameters are named
+`P_<name>` by default (section 10), and its learned prior is written once, under that name.
+
+A variable may instead be a noise: an `InverseGamma` or `InverseWishart` prior over a Gaussian
+noise covariance, its hyperparameters clamped variables. A reader names it in one field, not as
+its whole record: a linear-Gaussian likelihood's `noise`, a Gaussian transition's
+`innovations.chol`, each `{"parameter": "<name>"}`. One noise may be read by likelihoods and
+transitions alike (process-noise-learning.md D4):
+
+```json
+"parameters": {
+  "N": {"family": "InverseWishart", "parameters": {"Psi": "P_N_Psi", "nu": "P_N_nu"}}
+},
+"factors": {
+  "z": {"transition": {"family": "LinearGaussianTransition", "parents": ["z"],
+                       "parameters": {"F": "z_transition_F", "innovations": {
+                         "loc": "z_transition_innovations_loc", "chol": {"parameter": "N"}}}}},
+  "y": {"likelihood": {"family": "LinearGaussianObservation", "parents": ["z"],
+                       "parameters": {"head": "y_likelihood_head", "noise": {"parameter": "N"}}}}
+}
+```
+
+A transition's own noise prior is written as a likelihood's is: its innovations' `chol` a
+variable with no clamp and a `prior` record (`InverseGamma` or `InverseWishart`) under it; the
+transition then reads the prior's expected-precision point. Other families are not accepted as
+variables.
 
 **A read.** A modality takes its datum from a belief of the model by observing an emission of it,
 a variable with a record of its own. The likelihood record names the variable with `observes`,

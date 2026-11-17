@@ -42,10 +42,14 @@ from hybrid_aif.objectives import closed_loop as _closed_loop
 from hybrid_aif.objectives import continuous as _continuous
 from hybrid_aif.objectives import hybrid as _hybrid
 from hybrid_aif.objectives.compiled import (
+    FusedLearning,
     compile_tables,
+    make_learning,
+    make_learning_branch,
     make_step_terms,
     make_terminal_terms,
     make_transition,
+    pooled_readers,
 )
 from hybrid_aif.objectives.presence import LevelEntry, Presence
 from hybrid_aif.planning.base import (
@@ -67,7 +71,15 @@ from hybrid_aif.planning.enumerate import (
 from hybrid_aif.planning.gradient import PlanPosterior
 from hybrid_aif.planning.habit import habit_action
 from hybrid_aif.system import keyed
-from hybrid_aif.system.core import AmortizedScoring, Belief, System, SystemParams, _carry_prev
+from hybrid_aif.system.core import (
+    AmortizedScoring,
+    Belief,
+    System,
+    SystemParams,
+    WorkingCarry,
+    _carry_learning,
+    _carry_prev,
+)
 
 
 def _gamma(system, params: SystemParams):
@@ -437,6 +449,7 @@ def _context_without_control_risk(
     ``validated`` says the caller has already validated ``params``."""
     if system._is_amortized(params):
         _refuse_feedback_amortized(system, face)
+        _refuse_plan_learning(system, params, face, "the amortized path")
         if system.planning_belief == "posterior" or present is not None:
             raise NotImplementedError(
                 f'{face}: planning_belief="posterior" and present= are built on the '
@@ -483,6 +496,39 @@ def _context_without_control_risk(
         families = system._families(params)
         mods, facs = (system.modality_names, system._facs)
         space = system._space(params)
+        learning = _hybrid.make_plan_learning(
+            system._plan_learning(params),
+            tuple(params.likelihood),
+            tuple(params.transition),
+            A_deps,
+            system._B,
+            families,
+            system._cell_parents(),
+            modality_names=mods,
+            state_names=facs,
+        )
+        if not learning.tables:
+            learning = None
+        elif present_mask is not None and any(
+            slot == "likelihood" for t in learning.tables for slot, _ in t.readers
+        ):
+            raise NotImplementedError(
+                f"{face}: present= names the modalities a plan observes, and a likelihood learned "
+                "within the plan absorbs an expected observation at every step; the two together "
+                "are not built (design: parameters-within-the-plan.md D1); plan without present= "
+                "or read the likelihood frozen"
+            )
+        if learning is not None and system.branch_on:
+            learned = [
+                mods[m] for t in learning.tables for slot, m in t.readers if slot == "likelihood"
+            ]
+            branched = sorted(set(system.branch_on) & set(learned))
+            if branched:
+                raise NotImplementedError(
+                    f"{face}: branch_on names {branched}, whose likelihood is learned within the "
+                    "plan; a branch on an outcome would absorb the outcome drawn rather than the "
+                    "expected one, which is not built (design: parameters-within-the-plan.md D1)"
+                )
         # a modality no step observes conditions nothing
         never = _hybrid.static_absent(present_mask)
         conditioners = (
@@ -525,6 +571,9 @@ def _context_without_control_risk(
             present=present_mask,
             sensed=sensed,
             cells=system._cell_parents(),
+            learning=learning,
+            A=tuple(params.likelihood),
+            A_deps=A_deps,
         )
         step_terms_fn = _hybrid.make_step_terms(
             params.likelihood,
@@ -553,6 +602,7 @@ def _context_without_control_risk(
             sensed=sensed,
             cells=system._cell_parents(),
             pooled=system._pooled(params),
+            learning=learning,
         )
         terminal_terms_fn = _hybrid.make_terminal_terms(
             params.terminal_targets,
@@ -567,6 +617,14 @@ def _context_without_control_risk(
         init_beliefs = _hybrid.prepare_beliefs(beliefs, families, system.mixture_k)
         if system.planning_belief == "posterior":
             init_beliefs = _hybrid.pair_beliefs(init_beliefs, families, conditioners)
+        if learning is not None:
+            transition_fn, step_terms_fn, terminal_terms_fn, init_beliefs = _carry_learning(
+                transition_fn,
+                step_terms_fn,
+                terminal_terms_fn,
+                init_beliefs,
+                learning.seed(tuple(params.likelihood), tuple(params.transition), system.mixture_k),
+            )
         if carry_prev:
             transition_fn, step_terms_fn, terminal_terms_fn, init_beliefs = _carry_prev(
                 transition_fn, step_terms_fn, terminal_terms_fn, init_beliefs
@@ -584,11 +642,11 @@ def _context_without_control_risk(
                     space=space,
                     horizon=system.policy_len if horizon is None else int(horizon),
                     present=present_mask,
-                    beliefs_of=(lambda carry: carry[0]) if carry_prev else (lambda c: c),
+                    beliefs_of=_beliefs_of(carry_prev, learning is not None),
                 )
             )
         return PlannerContext(
-            branch_fn=_branch_fn(system, params, families, carry_prev),
+            branch_fn=_branch_fn(system, params, families, carry_prev, learning is not None),
             transition_fn=transition_fn,
             step_terms_fn=step_terms_fn,
             terminal_terms_fn=terminal_terms_fn,
@@ -637,12 +695,19 @@ def _context_without_control_risk(
         tables, num_factors, system._facs, system._effective_H_deps(), branching=branching
     )
     init_beliefs = tuple(b.probs for b in beliefs)
+    fused = _fused_learning(system, params, present_mask, face)
+    if fused is not None:
+        transition_fn, step_terms_fn, terminal_terms_fn, init_beliefs = make_learning(
+            tables, fused, transition_fn, step_terms_fn, terminal_terms_fn, init_beliefs
+        )
     if carry_prev:
         transition_fn, step_terms_fn, terminal_terms_fn, init_beliefs = _carry_prev(
             transition_fn, step_terms_fn, terminal_terms_fn, init_beliefs
         )
     return PlannerContext(
-        branch_fn=_branch_fn(system, params, None, carry_prev),
+        branch_fn=_branch_fn(
+            system, params, None, carry_prev, fused=None if fused is None else (tables, fused)
+        ),
         transition_fn=transition_fn,
         step_terms_fn=step_terms_fn,
         terminal_terms_fn=terminal_terms_fn,
@@ -824,13 +889,90 @@ def _habit_fn(
     return habit
 
 
+def _beliefs_of(carry_prev: bool, learning: bool) -> Callable[[object], tuple]:
+    """The belief tuple of a planning carry: under :func:`_carry_prev` its first member, under
+    :func:`_carry_learning` a :class:`WorkingCarry`'s ``beliefs``."""
+
+    def beliefs_of(carry):
+        inner = carry[0] if carry_prev else carry
+        return inner.beliefs if learning else inner
+
+    return beliefs_of
+
+
+def _refuse_plan_learning(system, params: SystemParams, face: str, path: str) -> None:
+    """Refuse ``plan_learning`` with a sentence on a path that hoists its tables."""
+    resolved = system._plan_learning(params)
+    if resolved:
+        raise NotImplementedError(
+            f"{face}: plan_learning names {[key for key, _ in resolved]}, and this System plans "
+            f"on {path}, which hoists its tables once per plan and so reads every table frozen "
+            "within it; working counts are carried on the hybrid and fused all-tabular paths, "
+            "and on this path set plan_learning=() (design: parameters-within-the-plan.md A3)"
+        )
+
+
+def _fused_learning(
+    system, params: SystemParams, present_mask: Presence | None, face: str
+) -> FusedLearning | None:
+    """The fused path's :class:`~hybrid_aif.objectives.compiled.FusedLearning`, or ``None``
+    when ``plan_learning`` names no learnable table. A likelihood learned within the plan under
+    ``present=`` is refused with a sentence, as on the hybrid path (design:
+    parameters-within-the-plan.md D1, A3)."""
+    resolved = system._plan_learning(params)
+    if not resolved:
+        return None
+    mods, facs = system.modality_names, system._facs
+    A_deps = system._engine_A_deps
+    learning = _hybrid.make_plan_learning(
+        resolved,
+        tuple(params.likelihood),
+        tuple(params.transition),
+        A_deps,
+        system._B,
+        (_hybrid.CATEGORICAL,) * len(system._B),
+        None,
+        modality_names=mods,
+        state_names=facs,
+    )
+    if not learning.tables:
+        return None
+    if present_mask is not None and any(
+        slot == "likelihood" for t in learning.tables for slot, _ in t.readers
+    ):
+        raise NotImplementedError(
+            f"{face}: present= names the modalities a plan observes, and a likelihood learned "
+            "within the plan absorbs an expected observation at every step; the two together "
+            "are not built (design: parameters-within-the-plan.md D1); plan without present= "
+            "or read the likelihood frozen"
+        )
+    return FusedLearning(
+        tables=learning.tables,
+        A=tuple(params.likelihood),
+        B=tuple(params.transition),
+        A_deps=A_deps,
+        B_deps=system._B,
+        control=system._table,
+        pooled=pooled_readers(system._pooled(params), mods, facs),
+    )
+
+
 def _branch_fn(
-    system, params: SystemParams, families: tuple[str, ...] | None, carry_prev: bool
+    system,
+    params: SystemParams,
+    families: tuple[str, ...] | None,
+    carry_prev: bool,
+    learning: bool = False,
+    fused: "tuple[object, FusedLearning] | None" = None,
 ) -> "Callable[[object], tuple[Array, object]] | None":
     """The ``branch_on`` modalities' outcome closure over the planning carry
     (:func:`hybrid_aif.planning.branching.make_branch_fn`), or ``None``
     without any. ``families`` is the hybrid path's (``None``: all tabular).
-    Refuses a modality it cannot branch on, with a sentence."""
+    Refuses a modality it cannot branch on, with a sentence. Under ``learning`` the carry
+    holds a :class:`WorkingCarry`, whose counts each branch keeps. Under ``fused`` (the fused
+    path's tables and :class:`~hybrid_aif.objectives.compiled.FusedLearning`) the carry holds a
+    :class:`WorkingCarry` too, and each branch absorbs its own outcome
+    (:func:`~hybrid_aif.objectives.compiled.make_learning_branch`)."""
     params = system._p(params)
     if not system.branch_on:
         return None
@@ -841,8 +983,8 @@ def _branch_fn(
     for name in system.branch_on:
         if name not in mods:
             raise ValueError(
-                f"branch_on names {name!r}, which is not a modality; the modalities are "
-                f"{list(mods)}"
+                f"{system._branch_on_label} names {name!r}, which is not a modality; the "
+                f"modalities are {list(mods)}"
             )
         m = mods.index(name)
         A = likelihoods[m]
@@ -854,33 +996,53 @@ def _branch_fn(
         ]
         if nodes:
             raise ValueError(
-                f"branch_on names {name!r}, which observes action node(s) {nodes}; a branch "
-                "reads the state beliefs alone, and an action node's belief comes from the "
-                "step's action, which a branch does not have"
+                f"{system._branch_on_label} names {name!r}, which observes action node(s) "
+                f"{nodes}; a branch reads the state beliefs alone, and an action node's belief "
+                "comes from the step's action, which a branch does not have"
             )
         continuous = [
             facs[f] for f in parents if families is not None and families[f] != "categorical"
         ]
         if not isinstance(A, ConditionalCategorical) or continuous:
             raise ValueError(
-                f"branch_on names {name!r}, and only a categorical modality over "
+                f"{system._branch_on_label} names {name!r}, and only a categorical modality over "
                 "categorical factors can be branched on (its outcomes are finite and the "
                 "belief after each is exact over its parents)"
                 + (f"; it observes {continuous}" if continuous else "")
             )
         likelihoods[m] = A
         indices.append(m)
+    if fused is not None:
+        branch = make_learning_branch(*fused, tuple(likelihoods), system.A_deps, tuple(indices))
+        if not carry_prev:
+            return branch
+
+        def fused_branch(carry):
+            p, after = branch(carry[0])
+            return p, (
+                after,
+                jax.tree_util.tree_map(
+                    lambda x: jnp.broadcast_to(x, (p.shape[0], *x.shape)), carry[1]
+                ),
+            )
+
+        return fused_branch
     branch = make_branch_fn(likelihoods, system.A_deps, indices)
-    if not carry_prev:
+    if not carry_prev and not learning:
         return branch
 
     def wrapped(carry):
-        qs, prev = carry
-        p, after = branch(qs)
-        return p, (
-            after,
-            jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (p.shape[0], *x.shape)), prev),
-        )
+        inner = carry[0] if carry_prev else carry
+        p, after = branch(inner.beliefs if learning else inner)
+
+        def spread(tree):
+            return jax.tree_util.tree_map(
+                lambda x: jnp.broadcast_to(x, (p.shape[0], *x.shape)), tree
+            )
+
+        if learning:
+            after = WorkingCarry(after, spread(inner.counts), spread(inner.before))
+        return p, ((after, spread(carry[1])) if carry_prev else after)
 
     return wrapped
 

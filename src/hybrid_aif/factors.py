@@ -6,9 +6,10 @@ structure is static). :class:`Deterministic` is a pure-map node; :class:`Recogni
 :class:`DerivedInitial` are the structural declarations of the amortized path.
 
 Design: docs/design/hybrid-system.md D1; docs/design/parameter-learning.md D3, D7, D8;
-docs/design/amortization.md A1, A2, A10, A11
+docs/design/amortization.md A1, A2, A10, A11; docs/design/process-noise-learning.md D1, D4
 """
 
+import dataclasses
 import itertools
 import math
 from typing import Literal, NamedTuple
@@ -104,9 +105,67 @@ class Parameter(eqx.Module):
             raise ValueError(f"Parameter takes a non-empty name, got {self.name!r}")
 
 
-#: The declarations a parameter variable may hold in this build: a tabular conditional (a point
-#: table or a Dirichlet over one), child-first as a transition or likelihood table is.
+#: The tabular declarations a parameter variable may hold: a conditional (a point table or a
+#: Dirichlet over one), child-first as a transition or likelihood table is, read by a whole
+#: ``transition`` or ``likelihood`` entry.
 TabularHome = ConditionalCategorical | ConditionalDirichlet
+#: The noise declarations a parameter variable may hold: a conjugate prior over a Gaussian noise
+#: covariance, read by one field of a declaration (a Gaussian transition's ``noise_prior``, a
+#: :class:`LinearGaussianObservation`'s ``noise``). Design: process-noise-learning.md D4.
+NoiseHome = InverseGamma | InverseWishart
+#: Every kind of declaration a parameter variable (``SystemParams.parameters``) may hold.
+ParameterHome = TabularHome | NoiseHome
+
+
+def _noise_batch(prior: InverseGamma | InverseWishart) -> tuple[int, ...]:
+    """A noise prior's leading (mode) axes."""
+    if isinstance(prior, InverseGamma):
+        return tuple(prior.alpha.shape[:-1])
+    return tuple(prior.Psi.shape[:-2])
+
+
+def _check_noise_prior(owner: str, prior: object, innovations: ConditionalGaussian) -> None:
+    """Refuse a transition's ``noise_prior`` that is not a prior over its innovations'
+    covariance: the family, the dimension, and the leading axes (none, one prior shared by every
+    mode, or the innovations' parent shape, one prior per mode)."""
+    if prior is None or isinstance(prior, Parameter):
+        return
+    if not isinstance(prior, InverseGamma | InverseWishart):
+        raise TypeError(
+            f"{owner}: noise_prior is an InverseGamma or InverseWishart prior over the "
+            f"innovations' covariance (or Parameter(name) naming one), got a "
+            f"{type(prior).__name__}"
+        )
+    d = innovations.dim
+    if prior.obs_dim != d:
+        raise ValueError(
+            f"{owner}: noise_prior is over a {prior.obs_dim}-dimensional noise and the "
+            f"innovations are {d}-dimensional"
+        )
+    batch, modes = _noise_batch(prior), tuple(innovations.parent_shape)
+    if batch not in ((), modes, tuple(innovations.batch_shape) + modes):
+        raise ValueError(
+            f"{owner}: noise_prior has leading axes {batch}; give none (one prior shared by "
+            f"every mode) or the innovations' parent shape {modes} (one prior per mode)"
+        )
+
+
+def _lowered_innovations(
+    innovations: ConditionalGaussian, prior: InverseGamma | InverseWishart
+) -> ConditionalGaussian:
+    """The innovations with their Cholesky factor lowered from ``prior``: the expected-precision
+    point (``chol(Ψ/ν)``, ``diag(sqrt(β/α))``), shared or per mode as the prior is."""
+    return ConditionalGaussian(
+        loc=innovations.loc, chol=prior.point(), parent_ndims=innovations.parent_ndims
+    )
+
+
+def _unresolved(owner: str, name: str) -> ValueError:
+    return ValueError(
+        f"{owner} reads the noise of parameter variable {name!r} (Parameter({name!r})), which "
+        "only a System's faces resolve, against SystemParams.parameters; read the lowered "
+        "declaration through a face, or resolve it with system.to_positional('params', params)"
+    )
 
 
 class LinearGaussianTransition(eqx.Module):
@@ -129,10 +188,29 @@ class LinearGaussianTransition(eqx.Module):
     #: concatenated in declared order: ``(d, du)`` shared, or ``(*parent_shape, d, du)`` per mode
     #: on the rule ``F`` follows; ``None`` when the state factor reads no continuous node.
     G: Array | None = None
+    #: A conjugate prior over the innovations' covariance ``Q``
+    #: (:class:`~hybrid_aif.distributions.InverseGamma`, per-dimension variances, or
+    #: :class:`~hybrid_aif.distributions.InverseWishart`, a full covariance), shared across the
+    #: modes or with leading axes ``innovations.parent_shape`` (one prior per mode); or
+    #: ``Parameter(name)``, reading a noise held in ``SystemParams.parameters``. When set, every
+    #: consumer reads the innovations' Cholesky factor lowered from the prior's expected-precision
+    #: point (:func:`transition_point`) and the declared ``innovations.chol`` is ignored (only its
+    #: shape is a declaration); ``learn`` updates the prior from the pairwise residual scatter,
+    #: under the rate key ``transition:<factor>:noise``. ``None``: ``Q`` is declared, not learned.
+    #: Design: process-noise-learning.md D1, D4.
+    noise_prior: "InverseGamma | InverseWishart | Parameter | None" = None
+
+    def __check_init__(self) -> None:
+        _check_noise_prior("LinearGaussianTransition", self.noise_prior, self.innovations)
 
     @property
     def dim(self) -> int:
         return self.F.shape[-1]
+
+    @property
+    def learnable_noise(self) -> bool:
+        """Capability, per-field: the process noise is a posterior (``noise_prior`` holds one)."""
+        return isinstance(self.noise_prior, InverseGamma | InverseWishart)
 
 
 #: The moment propagations a :class:`NonlinearGaussianTransition` declares.
@@ -150,24 +228,36 @@ class NonlinearGaussianTransition(eqx.Module):
     ``(mean, scale)`` and ``eps ~ N(loc_j, diag(s) chol_j chol_jᵀ diag(s))``, ``s`` the scale at
     the previous state and the controls, so the process noise depends on both.
 
-    A state factor declaring this transition has no discrete state parents; it is
-    Gaussian-carried, or mixture-carried when its prior is a
-    :class:`~hybrid_aif.distributions.MixtureGaussian`.
-    Design: docs/design/nonlinear-transitions.md N1–N5 and the amendment of 2026-11-13.
+    A state factor declaring this transition is Gaussian-carried, or mixture-carried when its
+    prior is a :class:`~hybrid_aif.distributions.MixtureGaussian` or when it has discrete state
+    parents. Discrete state parents in ``B_deps`` switch it, as they switch a
+    :class:`LinearGaussianTransition`: the mode reaches ``f`` as an integer level in the
+    parent's declared place among ``controls``, and the innovations take one axis for it, so
+    ``x' = f(x, (j, ...)) + eps_j``. One ``f`` reads every mode (a per-mode table inside ``f``,
+    indexed by the level, writes one map per mode). The predicted next state is a mode-aligned
+    mixture: each component is pushed through ``f`` once per joint mode, weighted by the mode's
+    belief, and reduced as the linear switching path reduces.
+    Design: docs/design/nonlinear-transitions.md N1–N5, the amendment of 2026-11-13, and N4's
+    amendment of 2026-11-15 (switching).
     """
 
     #: An :class:`equinox.Module` called as ``f(x, controls)``: ``x`` the state factor's ``(d,)``
-    #: state, ``controls`` a tuple with one entry per control parent in declared order (a discrete
-    #: node's integer level, a continuous node's float vector); it returns the ``(d,)`` mean of
-    #: the next state, or under ``noise_scale="per_coordinate"`` the tuple ``(mean, scale)`` of
-    #: two ``(d,)`` float arrays. Its numeric fields are pytree leaves and its code is static
-    #: structure. ``f`` is not learned.
+    #: state, ``controls`` a tuple with one entry per parent in declared (``B_deps``) order: a
+    #: discrete state parent's integer mode level, a discrete control node's integer level, a
+    #: continuous node's float vector (a factor with no state parent has control entries only,
+    #: as before switching was built); it returns the ``(d,)`` mean of the next state, or under
+    #: ``noise_scale="per_coordinate"`` the tuple ``(mean, scale)`` of two ``(d,)`` float
+    #: arrays. A level may be traced (the propagation maps over the modes), so ``f`` indexes by
+    #: it with array operations (``table[level]``, ``jnp.take``), not Python control flow. Its
+    #: numeric fields are pytree leaves and its code is static structure. ``f`` is not learned.
     f: eqx.Module
     #: A :class:`ConditionalGaussian` added to ``f``'s output, ``eps ~ N(loc_j, chol_j chol_jᵀ)``,
-    #: whose parent axes are the state factor's discrete control nodes in declared order (the
-    #: trivial ``(1,)`` for none); its Cholesky factor's diagonal must be positive for beliefs to
-    #: be propagated. Under ``noise_scale="per_coordinate"`` its Cholesky factor is
-    #: ``diag(scale) chol_j`` and its offset ``loc_j`` is not scaled.
+    #: whose parent axes are the state factor's discrete parents in declared (``B_deps``) order,
+    #: its discrete state parents (the modes) and its discrete control nodes, the
+    #: :class:`LinearGaussianTransition` convention (the trivial ``(1,)`` for none); its
+    #: Cholesky factor's diagonal must be positive for beliefs to be propagated. Under
+    #: ``noise_scale="per_coordinate"`` its Cholesky factor is ``diag(scale) chol_j`` and its
+    #: offset ``loc_j`` is not scaled.
     innovations: ConditionalGaussian
     #: How a belief is pushed through ``f`` (static): ``"first_order"`` linearises ``f`` at the
     #: belief's mean, ``"unscented"`` pushes ``2n + 1`` sigma points through it (``n`` the state's
@@ -190,8 +280,15 @@ class NonlinearGaussianTransition(eqx.Module):
     #: from a start at rest; guard it as ``sqrt(1 - rho**2 + eps)``, or with a double ``where``
     #: that keeps the root's argument away from zero on the branch not taken.
     noise_scale: Literal["per_coordinate"] | None = eqx.field(static=True, default=None)
+    #: A conjugate prior over the innovations' covariance, or ``Parameter(name)``: the
+    #: :class:`LinearGaussianTransition` field of the same name. Under
+    #: ``noise_scale="per_coordinate"`` it is a prior over the unscaled ``chol_j cholᵀ_j``.
+    #: Learned at first order (``f`` linearised at the previous mean); the unscented rule is
+    #: refused by ``learn``. Design: process-noise-learning.md D1, D2.
+    noise_prior: "InverseGamma | InverseWishart | Parameter | None" = None
 
     def __check_init__(self) -> None:
+        _check_noise_prior("NonlinearGaussianTransition", self.noise_prior, self.innovations)
         if not isinstance(self.f, eqx.Module) or not callable(self.f):
             raise TypeError(
                 "NonlinearGaussianTransition: f must be a callable equinox.Module, "
@@ -213,6 +310,11 @@ class NonlinearGaussianTransition(eqx.Module):
     @property
     def dim(self) -> int:
         return self.innovations.dim
+
+    @property
+    def learnable_noise(self) -> bool:
+        """Capability, per-field: the process noise is a posterior (``noise_prior`` holds one)."""
+        return isinstance(self.noise_prior, InverseGamma | InverseWishart)
 
     @property
     def _scaled(self) -> bool:
@@ -243,6 +345,45 @@ class NonlinearGaussianTransition(eqx.Module):
     def _mean(self, x: Array, controls: tuple) -> Array:
         """The next state's mean, ``f``'s first output under either ``noise_scale``."""
         return self._mean_and_scale(x, controls)[0]
+
+
+GaussianTransition = LinearGaussianTransition | NonlinearGaussianTransition
+
+
+def transition_point(decl):
+    """The point form of a Gaussian transition: with a ``noise_prior``, the innovations' Cholesky
+    factor lowered from the prior's expected-precision point and the prior dropped; any other
+    declaration as is. Every consumer that reads the process noise reads it through this
+    (prediction, planning, ``as_env``, the closed loop). Design: process-noise-learning.md D1."""
+    prior = getattr(decl, "noise_prior", None)
+    if prior is None or not isinstance(decl, GaussianTransition):
+        return decl
+    if isinstance(prior, Parameter):
+        raise _unresolved(f"{type(decl).__name__}.noise_prior", prior.name)
+    return dataclasses.replace(
+        decl, innovations=_lowered_innovations(decl.innovations, prior), noise_prior=None
+    )
+
+
+def map_noise_modes(prior, fn):
+    """``prior`` with ``fn(array, core)`` applied to each of its fields, ``core`` the field's
+    trailing non-mode axes (an inverse-Gamma's ``alpha``/``beta`` 1, an inverse-Wishart's
+    ``Psi`` 2 and ``nu`` 0); a shared prior (no mode axes), ``None`` or a ``Parameter`` as is.
+    How a rewrite of a transition's mode axes (slicing, permuting) carries its noise prior."""
+    if not isinstance(prior, InverseGamma | InverseWishart) or not _noise_batch(prior):
+        return prior
+    cores = (
+        {"alpha": 1, "beta": 1, "alpha0": 1, "beta0": 1}
+        if isinstance(prior, InverseGamma)
+        else {"Psi": 2, "Psi0": 2, "nu": 0, "nu0": 0}
+    )
+    return dataclasses.replace(
+        prior,
+        **{
+            name: None if getattr(prior, name) is None else fn(getattr(prior, name), core)
+            for name, core in cores.items()
+        },
+    )
 
 
 class NoiseMap(eqx.Module):
@@ -401,8 +542,10 @@ class LinearGaussianObservation(eqx.Module):
     #: A point ``R_chol`` (lower triangular ``(d_obs, d_obs)``, or ``(*parent_shape, d_obs,
     #: d_obs)`` per mode), or the conjugate posterior over ``R``
     #: (:class:`~hybrid_aif.distributions.InverseGamma`,
-    #: :class:`~hybrid_aif.distributions.InverseWishart`), which makes it learnable and samplable.
-    noise: Array | InverseGamma | InverseWishart
+    #: :class:`~hybrid_aif.distributions.InverseWishart`), which makes it learnable and samplable;
+    #: or ``Parameter(name)``, reading a noise held in ``SystemParams.parameters`` (one noise
+    #: several modalities or transitions read; design: process-noise-learning.md D4).
+    noise: "Array | InverseGamma | InverseWishart | Parameter"
 
     def __init__(self, head=None, noise=None, *, H=None, c=None):
         if head is None:
@@ -448,6 +591,8 @@ class LinearGaussianObservation(eqx.Module):
         read it at a mean with :meth:`R_chol_at`."""
         if isinstance(self.noise, InverseGamma | InverseWishart):
             return self.noise.point()
+        if isinstance(self.noise, Parameter):
+            raise _unresolved("LinearGaussianObservation.noise", self.noise.name)
         if _is_noise_map(self.noise):
             raise TypeError(
                 "this observation's noise is a map over the observed state, so it has no one "

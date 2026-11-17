@@ -489,7 +489,8 @@ def test_a_python_float_leaf_describes_the_same_after_a_rebuild():
 
 
 def test_a_nonlinear_transition_reading_another_state_is_refused():
-    """Its record reads its own previous value and control nodes only."""
+    """Its record reads its own previous value, control nodes and categorical latents (the
+    modes that switch ``f``) only; a continuous latent is refused."""
     register_transition("drive.steered", SteeredUnicycle)
     robot, rp = _steered(_steered_nonlinear(), policy_len=1)
     twin, tp = _steered(_steered_nonlinear(), policy_len=1)
@@ -497,5 +498,7 @@ def test_a_nonlinear_transition_reading_another_state_is_refused():
     document = json.loads(json.dumps(describe(composite, cp).document))
     record = document["factors"]["robot.pose"]["transition"]
     record["parents"] = [record["parents"][0], "twin.pose", *record["parents"][1:]]
-    with pytest.raises(DescriptionError, match="own previous value and control nodes only"):
+    with pytest.raises(
+        DescriptionError, match="categorical latents .* only, not the continuous latent 'twin.pose'"
+    ):
         build(document)

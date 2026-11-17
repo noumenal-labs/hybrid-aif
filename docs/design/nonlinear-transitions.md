@@ -94,6 +94,9 @@ A Gaussian-carried factor, and a mixture-carried one whose mixture comes from it
 component is propagated through the same `f`, then the mixture is reduced as on the linear
 path. A nonlinear transition with discrete *state* parents (switching dynamics) is refused: it
 would need `f` to take the mode, or one `f` per mode, an API with no consumer yet.
+*2026-11-15: built, with `f` taking the mode, for a consumer (the survey rover's position
+switched by its terrain, `terrain-field.md`); see "Amendment 2026-11-15" below. The refusal
+above stood until then.*
 
 ## N5 — the surface (Alex)
 
@@ -371,3 +374,66 @@ alone), `envs/_process.py` (the draw), `description/__init__.py` (the option),
 whose world's speed noise grows with the speed covers the true speed in its 90 % interval 0.885
 to 0.902 of the time at commanded speeds 0 to 3; the constant-noise model, right at speed 1.5,
 covers 1.000 at rest and 0.605 at speed 3.
+
+## Amendment 2026-11-15: switching dynamics (N4)
+
+*Status. Built in a background step for the survey rover (`terrain-field.md`: "x: position and
+velocity, a mode-aligned mixture switched by terrain"); the API choice below is the builder's
+and awaits the owner's confirmation.*
+
+A state factor whose `NonlinearGaussianTransition` names discrete state parents in `B_deps` is
+switched by them, as a `LinearGaussianTransition` with per-mode `F_j` is.
+
+- **How `f` receives the mode** **(builder's choice).** The mode reaches `f` as an integer
+  level in the parent's declared place among `controls`: `controls` has one entry per parent in
+  declared (`B_deps`) order, a discrete state parent's level, a discrete control node's level, a
+  continuous node's value. The innovations' parent axes are the factor's discrete parents in
+  the same order, the linear transition's convention (`innovations: ... its discrete state
+  parents and any discrete control node, each a mode index j`). A factor with no state parent
+  sees exactly the `controls` it saw before, so no existing map changes. Two alternatives were
+  weighed. *One `f` per mode* (a tuple of modules, or a stacked module vmapped over a mode
+  axis) reads naturally for a bank of unrelated maps, but costs a second declaration form for
+  one family (a tuple of `f`s in the factor, in validation, in `describe` and in `merge`'s
+  binding refusal), forces every mode to share one class and static structure anyway (a vmap
+  over modes needs it), and cannot express the common case in which the modes share the map's
+  form and differ in a coefficient (the rover's per-terrain speed), which one `f` indexing a
+  table by the level writes in one line; a bank of unrelated maps is still one `f` that
+  switches by `lax.switch` on the level. *The modes as leading entries of `controls`, ahead of
+  the control nodes* (the order the build was first offered) agrees with the declared order
+  whenever the state parents are listed first, which is the common case, but splits the
+  innovations' axis order from the linear transition's when a control node is declared before
+  a mode, and the control space's reading of a reader's level axis
+  (`controls._level_axis`) counts axes in declared order for every innovations-carrying family;
+  the declared order needs no change there.
+- **Propagation.** Each of the `K` components is pushed through `f` once per joint mode `j`
+  (the `M` levels of the state parents, row-major over `B_deps`), to first order or unscented
+  as declared, the innovations conditioned on `(mode, controls)` in declared order; the grown
+  component's log weight is the component's plus the mode's (the parents' post-transition
+  belief, `_mode_log_weights`, as the linear bank reads it); the `K M` components are laid
+  out component-major, `propagate`'s layout, and reduced by `reduce_mode_aligned(k, M)` under
+  `mixture_schedule="mode_aligned"` or Runnalls otherwise. With no state parent `M = 1` and the
+  step is the per-component one it replaced. An affine `f` per mode reproduces the per-mode
+  linear bank to float tolerance under both rules and both schedules (the unscented rule is
+  exact for an affine map).
+- **Family.** A Gaussian prior on a switched factor makes it mixture-carried, as on the linear
+  path; `mixture_k` must be set, and a multiple of `M` under `"mode_aligned"`. The parents must
+  be categorical and declared earlier (the linear path's within-step ordering refusal).
+- **Inference, information gain, planning.** Nothing of their own: the mode evidence a channel
+  on the factor sends to its parents (`infer_states`), the Kolchinsky–Tracey bracket of a
+  mixture-carried factor's information gain, and every planner read the mixture family and
+  `B_deps`, not the transition's class. `feedback="linear_quadratic"` still refuses a
+  mixture-carried factor (L4).
+- **Sampling.** `as_env` reads the parent's level sampled at this step (the linear path's
+  ancestral order) and steps `f` at it.
+- **The record.** `describe` writes the factor's parents as for any transition; the reader
+  admits a categorical latent as a nonlinear transition's parent (the mode) and refuses a
+  continuous one, which remains not built (cross-factor continuous parents).
+- **Refusals that stay:** a neural (`MLPConditional`) transition with discrete parents; a
+  `merge` binding that removes a control node `f` reads. The 2026-11-13 amendment's list of
+  refusals that apply to a scaled map loses "discrete state parents (switching dynamics)": a
+  scaled map is switched the same way, its scale read per mode.
+
+As built: `factors.py` (docstring), `objectives/hybrid.py` (`factor_families`,
+`_validate_nonlinear`, `_nl_inputs`'s `modes`, `_nonlinear_mixture_step`, `make_transition`;
+`refuse_switching_nonlinear` removed), `system/core.py` (`_space`), `envs/_process.py`,
+`description/__init__.py` (the parent check); `tests/test_nonlinear_switching.py`.

@@ -68,10 +68,11 @@ from hybrid_aif.factors import (
     Deterministic,
     LinearGaussianObservation,
     LinearGaussianTransition,
+    NoiseHome,
     NonlinearGaussianTransition,
     Parameter,
+    ParameterHome,
     Recognition,
-    TabularHome,
     TabularObservation,
     TabularPrior,
     TabularTransition,
@@ -137,6 +138,19 @@ class _Unreadable(_Derived):
         return f"<unreadable: {self.message}>"
 
 
+class _Lowered(tuple):
+    """A canonical ``branch_on`` or ``plan_learning`` value lowered from ``sophisticated=``: a
+    ``dataclasses.replace`` passes it back to the constructor, which recognises it as the lowering
+    (not a second declaration) and lowers ``sophisticated`` afresh."""
+
+    __slots__ = ()
+
+
+#: The first segments of a ``sophisticated`` key that carry a table's counts within the plan
+#: (``plan_learning``'s grammar); ``obs`` branches on a modality (``branch_on``).
+_SOPHISTICATED_TABLES = ("transition", "likelihood", "parameter")
+
+
 #: The :class:`LearnState` address of a **policy module** in ``policy_prior``: a bare key,
 #: since ``policy_prior`` is not one of the five parameter slots. It is not rate-addressable;
 #: the actor's trainer takes its optimizer as an argument.
@@ -189,6 +203,23 @@ def _refuse_aliases(values: Mapping[str, object]) -> None:
                     "Parameter(name)"
                 )
             seen[id(decl)] = label
+    for container, field in (("transition", "noise_prior"), ("likelihood", "noise")):
+        tree = values.get(container)
+        if not isinstance(tree, Mapping):
+            continue
+        for key, decl in tree.items():
+            prior = getattr(decl, field, None)
+            if not isinstance(prior, NoiseHome):
+                continue
+            label = f"{container}[{key!r}].{field}"
+            if id(prior) in seen:
+                raise ValueError(
+                    f"{seen[id(prior)]} and {label} hold one noise prior object; sharing by "
+                    "object aliasing would fork the noise at the first update. Declare a named "
+                    "parameter variable (SystemParams.parameters) and give each reader "
+                    "Parameter(name) in that field"
+                )
+            seen[id(prior)] = label
 
 
 def _precision_in(value):
@@ -395,12 +426,20 @@ class SystemParams(eqx.Module):
     #: an entry that is itself a table is that state factor's or modality's own variable. Every
     #: reader of one name reads one table; :meth:`System.learn` sums the readers' count statistics
     #: and updates the named table once, under the rate key ``parameter:<name>``. The faces return
-    #: the references, never copies of the table. Design: docs/design/shared-parameters.md.
-    parameters: dict[str, TabularHome] = eqx.field(default_factory=dict, converter=_strong)
+    #: the references, never copies of the table. A variable may instead hold a noise prior (an
+    #: ``InverseGamma`` or ``InverseWishart``), read by one field of a declaration: a Gaussian
+    #: transition's ``noise_prior`` or a ``LinearGaussianObservation``'s ``noise`` holding
+    #: ``Parameter(name)``; its readers' residual statistics sum into one update the same way.
+    #: Design: docs/design/shared-parameters.md; process-noise-learning.md D4.
+    parameters: dict[str, ParameterHome] = eqx.field(default_factory=dict, converter=_strong)
     #: The positional view's record of which reader positions hold a resolved reference, as
     #: ``(slot, index, parameter name)`` triples; empty in the keyed form every face takes and
     #: returns, where the entries are the ``Parameter`` tokens themselves.
     references: tuple[tuple[str, int, str], ...] = eqx.field(default=(), static=True)
+    #: The positional view's record of which readers hold a resolved noise variable in one field
+    #: (a transition's ``noise_prior``, a likelihood's ``noise``), as ``(slot, index, parameter
+    #: name)`` triples; empty in the keyed form, where the field holds the ``Parameter`` token.
+    noise_references: tuple[tuple[str, int, str], ...] = eqx.field(default=(), static=True)
     #: The kernel of each emission (an output the System draws from its state factors,
     #: :attr:`System.emissions`), keyed by emission name: a likelihood of any family (a table, a
     #: linear-Gaussian or neural conditional, a learnable form, or a ``Parameter`` reference to a
@@ -506,6 +545,32 @@ def _carry_prev(transition_fn, step_terms_fn, terminal_terms_fn, init_beliefs):
 
     terminal = None if terminal_terms_fn is None else (lambda carry: terminal_terms_fn(carry[0]))
     return transition, step_terms, terminal, (init_beliefs, init_beliefs)
+
+
+WorkingCarry = _hybrid.WorkingCarry  # defined beside PlanLearning; exported here
+
+
+def _carry_learning(transition_fn, step_terms_fn, terminal_terms_fn, init_beliefs, counts):
+    """Wrap the hybrid planning closures so the scan carry is a :class:`WorkingCarry` seeded with
+    ``counts``: ``transition_fn(qs, action, working) -> (qs, working)`` and
+    ``step_terms_fn(qs, action, t, qs_prev, working=)`` are the learning closures of
+    :func:`~hybrid_aif.objectives.hybrid.make_transition` and
+    :func:`~hybrid_aif.objectives.hybrid.make_step_terms`. The layer sits inside
+    :func:`_carry_prev`, whose ``qs_prev`` is then the previous :class:`WorkingCarry`; every
+    planner treats the carry as opaque."""
+
+    def transition(carry, action):
+        qs, after = transition_fn(carry.beliefs, action, carry.counts)
+        return WorkingCarry(qs, after, carry.counts)
+
+    def step_terms(carry, action, t, qs_prev=None):
+        prev = None if qs_prev is None else qs_prev.beliefs
+        return step_terms_fn(carry.beliefs, action, t, prev, working=carry.before)
+
+    terminal = (
+        None if terminal_terms_fn is None else (lambda carry: terminal_terms_fn(carry.beliefs))
+    )
+    return transition, step_terms, terminal, WorkingCarry(init_beliefs, counts, counts)
 
 
 class AmortizedScoring(NamedTuple):
@@ -683,9 +748,10 @@ class System(eqx.Module, metaclass=_SystemMeta):
       ``controlled`` and ``B_control_deps``;
     - names: ``state_names``, ``control_names``, ``modality_names``, ``dims``;
     - planning and the objective: ``policy_len``, ``planner``, ``gamma``, ``decomposition``,
-      ``epistemic``, ``terms``, ``scoring``, ``branch_on``, ``planning_belief``, ``feedback``;
-    - inference: ``num_iters``, ``mixture_k``, ``mixture_schedule``, ``recognition``,
-      ``external_inputs``;
+      ``epistemic``, ``terms``, ``scoring``, ``branch_on``, ``planning_belief``, ``feedback``,
+      and ``sophisticated`` (the alternative syntax for ``branch_on`` and ``plan_learning``);
+    - inference: ``num_iters``, ``mixture_k``, ``mixture_schedule``, ``plan_learning``,
+      ``recognition``, ``external_inputs``;
     - learning: ``readings``, ``reduction_period``, ``reduction_pairs``;
     - provenance: ``subsystems``.
 
@@ -760,6 +826,21 @@ class System(eqx.Module, metaclass=_SystemMeta):
     mixture_schedule: Literal["runnalls", "mode_aligned"] = eqx.field(
         static=True, default="runnalls"
     )
+    #: The learnable tables a plan reads as learned within the plan: carried through the planning
+    #: scan as working counts, seeded from the posterior the plan starts from and absorbing each
+    #: imagined step's expected count statistic (the model's joint over child and parents), so a
+    #: later read of a row predicts through the counts the plan has imagined and its novelty
+    #: declines (the Pólya urn). A tuple of keys in the grammar of ``learn``'s rates:
+    #: ``transition:<factor>``,
+    #: ``likelihood:<modality>`` (a ``ConditionalDirichlet``, directly or as the reader of a
+    #: parameter variable) and ``parameter:<name>`` (every reader of the variable); or ``True``,
+    #: every learnable table. Readers of one parameter variable learned within the plan share one
+    #: working table. ``()`` (the default) reads every table frozen at its posterior mean within a
+    #: plan, pymdp's convention. An inference setting, as ``mixture_schedule`` is; carried on the
+    #: hybrid and the fused all-tabular paths (on the fused path a ``branch_on`` branch absorbs
+    #: its own outcome), refused on the amortized path. Design:
+    #: docs/design/parameters-within-the-plan.md D1, D2, A3.
+    plan_learning: bool | tuple[str, ...] = eqx.field(static=True, default=())
     #: Hierarchical conditional priors: the parent state factors of each state factor's initial
     #: prior (``None``: all unconditional). Ancestral: parents must be earlier, of tabular
     #: families.
@@ -852,6 +933,18 @@ class System(eqx.Module, metaclass=_SystemMeta):
     #: on (:mod:`hybrid_aif.planning.sophisticated`): each categorical, over categorical parents
     #: only. Empty for every other planner, which never reads it.
     branch_on: tuple[str, ...] = eqx.field(static=True, default=())
+    #: The alternative syntax for the two halves of sophisticated planning, in ``epistemic``'s
+    #: selector grammar: ``"obs:<modality>"`` branches the plan on that modality's outcomes (the
+    #: state half, ``branch_on``), and ``"transition:<factor>"``, ``"likelihood:<modality>"`` and
+    #: ``"parameter:<name>"`` carry that table's counts within the plan (the parameter half,
+    #: ``plan_learning``). ``sophisticated=("obs:fix", "transition:terrain")`` is exactly
+    #: ``branch_on=("fix",), plan_learning=("transition:terrain",)``. The two fields are the
+    #: canonical form: construction lowers this tuple into them, every face reads them, and a
+    #: description writes them alone; this field keeps what was written. A tuple of literal keys
+    #: (``plan_learning=True`` carries every table); declaring it beside a ``branch_on`` or
+    #: ``plan_learning`` of one's own is refused. ``None`` (the default): not used. Design:
+    #: docs/design/parameters-within-the-plan.md A1.
+    sophisticated: tuple[str, ...] | None = eqx.field(static=True, default=None)
     #: Which belief a plan's information-gain leaves read on a Gaussian-carried state factor:
     #: ``"prior"``, the predictive belief (predict only); ``"posterior"``, a second chain that
     #: conditions on the observations expected along the plan, so a linear-Gaussian modality's
@@ -1003,6 +1096,68 @@ class System(eqx.Module, metaclass=_SystemMeta):
         self.emissions = self._normalized_emissions()
         self.observes = self._normalized_observes()
         self.black_box = self._normalized_black_box()
+        self._lower_sophisticated()
+
+    def _lower_sophisticated(self) -> None:
+        """Lower ``sophisticated=`` into the canonical ``branch_on`` and ``plan_learning``.
+
+        A canonical value lowered here is marked (:class:`_Lowered`), so a ``dataclasses.replace``
+        that passes it back, with ``sophisticated`` unchanged or replaced, lowers afresh; a value
+        of the caller's own beside ``sophisticated`` is the second syntax, refused."""
+        soph = self.sophisticated
+        if soph is None:
+            for name in ("branch_on", "plan_learning"):
+                value = getattr(self, name)
+                if isinstance(value, _Lowered):
+                    setattr(self, name, tuple(value))
+            return
+        if isinstance(soph, bool):
+            raise ValueError(
+                f"sophisticated={soph!r}: sophisticated takes a tuple of keys "
+                "('obs:<modality>' to branch on, 'transition:<factor>', 'likelihood:<modality>' or "
+                "'parameter:<name>' to carry a table's counts); to carry every learnable table "
+                "within the plan declare plan_learning=True instead"
+            )
+        if not isinstance(soph, tuple) or not all(isinstance(k, str) for k in soph):
+            raise ValueError(
+                f"sophisticated must be a tuple of keys ('obs:<modality>', "
+                f"'transition:<factor>', 'likelihood:<modality>', 'parameter:<name>'), got "
+                f"{soph!r}; write sophisticated=(...) with one key per entry"
+            )
+        mine = [
+            name
+            for name in ("branch_on", "plan_learning")
+            if not isinstance(getattr(self, name), _Lowered)
+            and getattr(self, name) not in ((), False)
+        ]
+        if mine:
+            raise ValueError(
+                f"sophisticated={soph!r} and {' and '.join(f'{n}=' for n in mine)} both declare "
+                "sophisticated planning: declare one syntax, either sophisticated=... or "
+                "branch_on=/plan_learning=... (a dataclasses.replace of branch_on or plan_learning "
+                "on a System declared through sophisticated= passes sophisticated=None with it)"
+            )
+        branch, tables = [], []
+        for key in soph:
+            kind, _, name = key.partition(":")
+            if "*" in key:
+                raise ValueError(
+                    f"sophisticated: {key!r} is a pattern; sophisticated names its modalities and "
+                    "tables by literal keys (to carry every learnable table within the plan, "
+                    "declare plan_learning=True instead)"
+                )
+            if kind == "obs" and name and ":" not in name:
+                branch.append(name)
+            elif kind in _SOPHISTICATED_TABLES and name:
+                tables.append(key)
+            else:
+                raise ValueError(
+                    f"sophisticated: unknown key {key!r}; a key is 'obs:<modality>' (branch the "
+                    "plan on its outcomes) or 'transition:<factor>', 'likelihood:<modality>' or "
+                    "'parameter:<name>' (carry that table's counts within the plan)"
+                )
+        self.branch_on = _Lowered(branch)
+        self.plan_learning = _Lowered(tables)
 
     @property
     def node_names(self) -> tuple[str, ...]:
@@ -1315,15 +1470,35 @@ class System(eqx.Module, metaclass=_SystemMeta):
                 f"epistemic must be True, False, or a tuple of variable names, got "
                 f"{self.epistemic!r}"
             )
+        if not (
+            isinstance(self.plan_learning, bool)
+            or (
+                isinstance(self.plan_learning, tuple)
+                and all(isinstance(k, str) for k in self.plan_learning)
+            )
+        ):
+            raise ValueError(
+                "plan_learning must be True, False or a tuple of keys "
+                "('transition:<factor>', 'likelihood:<modality>', 'parameter:<name>'), got "
+                f"{self.plan_learning!r}"
+            )
         if not isinstance(self.branch_on, tuple) or not all(
             isinstance(n, str) for n in self.branch_on
         ):
             raise ValueError(f"branch_on must be a tuple of modality names, got {self.branch_on!r}")
         for name in self.branch_on:
-            self._refuse_emission(name, "branch_on")
+            self._refuse_emission(name, self._branch_on_label)
+        if self.sophisticated is not None:
+            unknown = [n for n in self.branch_on if n not in self.modality_names]
+            if unknown:
+                raise ValueError(
+                    f"sophisticated: {[f'obs:{n}' for n in unknown]} name(s) no modality; an "
+                    f"'obs:<modality>' key names one of the modalities {list(self.modality_names)}"
+                )
         if self.branch_on and self.planner is not UNSET and not planner_branches(self.planner):
             raise ValueError(
-                f"branch_on={self.branch_on!r} names modalities to branch on, which only a "
+                f"{self._branch_on_label}={self.branch_on!r} names modalities to branch on, "
+                "which only a "
                 f'branching planner does (the "sophisticated" one, or one registered with '
                 f"branching=True); this System plans with {self.planner!r}"
             )
@@ -1767,6 +1942,21 @@ class System(eqx.Module, metaclass=_SystemMeta):
                     f"{list(table.control_names)}"
                 )
 
+    @property
+    def _branch_on_label(self) -> str:
+        """``branch_on`` as a refusal names it: with where it was declared, when through
+        ``sophisticated=``."""
+        if self.sophisticated is None:
+            return "branch_on"
+        return "branch_on (declared through sophisticated=)"
+
+    @property
+    def _plan_learning_label(self) -> str:
+        """``plan_learning`` as a refusal names it (see :attr:`_branch_on_label`)."""
+        if self.sophisticated is None:
+            return "plan_learning"
+        return "plan_learning (declared through sophisticated=)"
+
     def _refuse_emission(self, name: str, where: str) -> None:
         """Refuse ``name`` at ``where`` when it is an emission: nothing in the model reads or
         scores an output."""
@@ -1828,8 +2018,6 @@ class System(eqx.Module, metaclass=_SystemMeta):
         (:func:`~hybrid_aif.controls.control_space`): a node with a box in ``params.control`` is
         continuous, its readers' widths checked against it; readers that disagree raise."""
         params = self._p(params)
-        for f, parents in enumerate(self._B):  # switching dynamics, before any layout reading
-            _hybrid.refuse_switching_nonlinear(params.transition[f], parents, self._facs, f)
         mods = self.modality_names
         targets = []
         for key, parents in self.C_deps:
@@ -2649,7 +2837,7 @@ class System(eqx.Module, metaclass=_SystemMeta):
         mean, parameter variables dissolved into the tables their readers hold."""
         params = self._params_in(params, "sample_step")
         lowered = self._lower_learnable(params, None)
-        lowered = dataclasses.replace(lowered, parameters={}, references=())
+        lowered = dataclasses.replace(lowered, parameters={}, references=(), noise_references=())
         process, pp = self._forward(lowered)
         names = self._names(params)._replace(
             modalities=tuple(name for name, _ in self._kernelled(lowered)),
@@ -3595,6 +3783,11 @@ class System(eqx.Module, metaclass=_SystemMeta):
     def _dim_selections(self, params: SystemParams) -> tuple[tuple[int, ...] | None, ...]:
         params = self._p(params)
         return selectors._dim_selections(self, params)
+
+    def _plan_learning(self, params: SystemParams) -> tuple[tuple[str, tuple], ...]:
+        """The engine: :func:`hybrid_aif.system.selectors._plan_learning`."""
+        params = self._p(params)
+        return selectors._plan_learning(self, params)
 
     def _resolve_param_novelty(
         self,

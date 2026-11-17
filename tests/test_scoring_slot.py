@@ -50,6 +50,7 @@ GROUPS: dict[str, frozenset[str]] = {
             "durations",
             "parameters",
             "references",
+            "noise_references",
             "readings",
             "emission",
         }
