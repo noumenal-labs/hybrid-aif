@@ -109,6 +109,11 @@ def test_run_is_the_closed_system_form_and_the_other_forms_are_gone_from_the_pub
         "tick_order",
         "carries",
         "record_carries",
+        "batch",
+        "record",
+        "chunk",
+        "replicas_per_pass",
+        "per_replica",
     ]
     assert list(inspect.signature(couple).parameters) == ["components", "bindings", "fixed"]
     assert "emitted" not in MindCarry._fields

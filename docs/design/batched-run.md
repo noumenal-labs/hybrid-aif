@@ -361,3 +361,173 @@ The survey's tick time is the scan's execution over its rounds, compile excluded
 (`survey_run.run_seconds`): 0.112 / 0.115 s on the run above (scan 22.3 / 22.9 s over 199
 rounds; compile, trace included, 8.0 / 8.5 s), where the run timed whole gave 0.214 / 0.196 s.
 `timed` is gone and the rover's parts are still timed apart by `timing`.
+
+## As built (Phase B, 2026-11-17)
+
+*Built under the delegation of the opening note; no commit. R9 (async under `batch=`), R10, R11
+and R12, and pins 2–5 and 7 of R13. Docs, the capabilities entry and the rollout retirement
+(R14, Phase C) are not touched.*
+
+**R3, settled: the concrete rounds are vmapped as they are (option a).** Under `batch=` the
+reset and the rounds run on concrete values before the scan (round 0, and up to `_SETTLE = 3`
+more while the state's shapes change) are `eqx.filter_vmap` calls of the same round body over
+the pass's replicas; the scan is `jax.jit(jax.vmap(lax.scan(body)))`. Structure-change
+detection is the unbatched one: lowering the vmapped scan traces the body on one replica's
+abstract shapes, and `_Unsettled` sends one more vmapped concrete round, as unbatched. Fixed
+carries (option b) were not built, for Phase A's reasons (round 0 hands a custom step `None`
+for a variable with no value; a mixture belief grows after round 0), and because (a) proved
+clean: three adjustments, all local. (1) Round 0 always decides: under vmap a clocked node's
+count is traced, so `t == 0` is read off the Python round index. (2) The async switch passes the
+round index by closure, not as an operand, so round 0 stays a Python int inside every branch.
+(3) An async round 0 under `batch=` dispatches by a traced switch whose branches can read a
+variable before or after it has a value (`None` in one order, a value in another): `_alike`
+gives every branch the record of one structure, absent reads as zeros with a per-replica
+presence flag (`present`), every fault label in every branch. The carry's dtype normalisation
+keys on a `scanned` flag of the round rather than on a traced key, since every key is traced
+under `batch=`. The concrete rounds are not jitted: each is a different program and a jitted
+round of the survey costs the scan's ~8 s compile; eager vmap compiles only the steps' own
+jitted ticks under vmap (round 0 of the one-level survey: 10.2 s unbatched, 16.7 s at
+`batch=10`, compiles included).
+
+**What was built.** `run(..., *, batch=None, record=None, chunk=None, replicas_per_pass=None,
+per_replica=())` (keyword-only; `run`'s and the module's docstrings state it).
+
+- *Keys (R10).* Replica `b` runs under `fold_in(key, b)`; a stack of `B` keys is used as
+  given (so identical keys give identical replicas, pin 2's second half).
+- *The record (R11).* Every array leads with the replica axis (`decided`, `present`, `faults`,
+  `start`, the final `carry` and a written-back `params` included); `carries` stays a tuple over
+  rounds whose carries' arrays lead with it (round 0's carry and later ones differ in
+  structure, so a single stacked array is impossible). `batch=None` is unchanged in form,
+  `batch=1` has an axis of one. A run in which no step wrote back returns the params handed in.
+- `record=` names the stacked fields from `received` (with `present`), `emitted`, `intended`,
+  `carries`; default all but `carries`, which `record_carries=True` adds; `decided` and `faults`
+  always; an unrecorded field is `None` at every node, and the scan does not stack it.
+- `chunk=`: a host loop over one compiled program of `chunk` rounds; a last chunk shorter than
+  `chunk` runs padded rounds under a mask (`where(t < ticks, new, old)` on the state) whose
+  records are dropped, so there is one program, not two. `Trajectory.timing`: `compile` (once),
+  `scan` (all chunks and passes), `scanned`, `concrete`, `concrete_seconds` (resets and
+  concrete rounds, step compiles included), `chunks` (each chunk's `pass`, `start`, `rounds`,
+  `seconds`), `passes`, `replicas_per_pass`. `chunk=` works unbatched too.
+- *Passes.* A host loop over passes of `replicas_per_pass` (my call over `lax.map`: it composes
+  with the concrete rounds and the chunk loop, and times each pass). The last pass is filled with
+  copies of the last replica (dropped), so one compiled program serves every pass. No sizing
+  from `branching_tree_memory` was built (optional).
+- *Async (R9).* Per-replica permutations of the sources (`state.sweep` is per replica) and the
+  Phase A switch over distinct derived orders, lowered to a select under vmap. Refused under
+  `batch=` above four source units (a group is one unit).
+- *Groups (R12).* A tuple key of `steps`. The members' views are one view up to their names, so
+  one trace cannot take both as they are: each member's keys, observations, carry, view params
+  and option are renamed to the first member's names (`_swapper`: the swap of the two prefixes in
+  every dict key and string, the parameter variables both views share left as they are), stacked,
+  stepped by one `eqx.filter_vmap` of the turn (step, checks, decide-or-hold), unstacked and
+  renamed back. The structure check is the one `plan()` makes to share a program, applied up to
+  the names: the renamed first view's System treedef (all its fields are static) equals the
+  member's, and the params' structure and shapes match. The members read the round-start home
+  (sequential/async: the home as the group's turn began); their write-backs are combined by
+  `_at_the_boundary` (Dirichlet deltas summed) at the round's boundary or at the group's turn's
+  end. Two `plan()` learners of a non-counts variable in one group are refused under every order.
+- *Parallel replicas (added).* Where several local devices exist and divide the pass (a CPU host
+  given `XLA_FLAGS=--xla_force_host_platform_device_count=N`, or several accelerators) the scan's
+  state is sharded over them on the replica axis (`_spread`); with one device nothing changes.
+  This was added because of pin 4, below.
+
+**Changed from the proposal, and why.**
+
+1. *Per-replica inputs are named (`per_replica=`), not detected.* Telling a leaf with a replica
+   axis from a shared one needs its unbatched shape, and none is at hand: every table of the
+   three-level pusher pair leads with 3, so at `batch=3` shared params look batched. `per_replica`
+   names `"params"` (every array with the axis: `broadcast_params`, then the differing leaves
+   replaced) and nodes whose `carries` seed has it; everything else is shared. Per-replica
+   durations or actuator kernels are refused (they are the structure pass's).
+2. *Round 0's value refusals are recorded faults under `batch=`*, since round 0 is traced there
+   (unbatched it still refuses). Pin 5 shows a replica faulting in round 0.
+3. *Async replica parity is to float32 rounding, not bitwise*; simultaneous and sequential are
+   bitwise on the fixtures. The vmapped switch is a select over all branches and XLA fuses the
+   batched program differently (largest deviation on the pusher pair 4.8e-7 in a belief logit).
+4. *Pin 4 does not hold on one CPU device* (numbers below): the survey tick is compute-bound,
+   so vmap amortises nothing; it holds once the replicas are spread over host devices.
+5. *A group under simultaneous must be contiguous among the driven nodes too*, not only under
+   sequential (a driven group steps at one turn); a group may not mix driven and undriven nodes.
+
+**Refusals added**, each a sentence naming the fix: `batch`, `chunk`, `replicas_per_pass` not
+positive integers; `replicas_per_pass`/`per_replica` without `batch`; `per_replica` naming an
+input without the leading axis ("give every array of it a leading replica axis
+(envs.generative.broadcast_params(tree, batch) for the shared ones, then replace those that
+differ), or drop it from per_replica to share it") or naming nothing; per-replica durations or
+actuator kernels; a key that is neither one key nor a stack of `B`; `record` naming no field;
+async above the ceiling ("this System has 5 sources, up to 120 orders, above the ceiling of 4
+sources (24 orders): run it under "sequential" or "simultaneous", group identical sources into
+one node (steps={(a, b): step}), or run the replicas one call each without batch="); a group key
+that is not a tuple of two or more distinct names; a node named twice; a group's views differing
+beyond their names; a group mixing driven and undriven, or clocked and unclocked, nodes, or
+clocked on different durations; a group not contiguous in the sequential, driven or an async
+order (naming the nodes between); a group whose members are handed values of different
+structure in a round; under `batch=`, a clocked node with level-dependent durations whose carry
+still changes form while replicas disagree on deciding; and the R8 host-code refusal now also
+covers the reset under `batch=` (every call is traced).
+
+**Tests.** `tests/test_batched_run.py` (20 tests); `test_run.py`'s signature pin gains the five
+keywords. No other test changed.
+
+**Measurements** (this machine, CPU, 16 cores, 128 GB; one configuration per process).
+
+- *Pin 2.* Pusher pair (`wire()`), 6 ticks, `batch=3`: every replica bitwise its unbatched run
+  under simultaneous and sequential (carries included); async to ≤4.8e-7. Clocked robots
+  (durations 4/2/4), 20 ticks, `batch=4`: bitwise under simultaneous and async. One-level
+  survey, 6 ticks, `batch=2`: max deviation 8.3e-7 (3 of 10 record leaves bitwise); the closed
+  loop amplifies this over long runs as Phase A's re-pin describes. Identical keys: identical
+  replicas.
+- *Pin 3.* Shared-Dirichlet leaves with `plan(learn=True)`, grouped vs ungrouped simultaneous:
+  bitwise (record, carries, learned home), unbatched and at `batch=2`; the pusher pair grouped:
+  bitwise. Two survey rovers sharing the field: equal to `rtol=1e-4` (test).
+- *Pin 4.* One-level survey, 200 ticks, sequential, `record_carries`: unbatched 0.112 s/tick
+  (compile 7.8 s, round 0 10.2 s); `batch=10` on one device 0.991 s/tick (8.9×; compile 9.9 s,
+  concrete 17.7 s), linear in B (B=1,2,4: 0.116, 0.211, 0.420). With
+  `--xla_force_host_platform_device_count=10`: unbatched 0.115, `batch=10` 0.195 s/tick
+  (1.7×, within 3×; compile 12.4 s, concrete 16.7 s; wall 71 s against ~45 s for one run).
+  Peak RSS 1.32 GB unbatched, 1.75 GB (`batch=10`, one device), 1.89 GB (ten devices).
+- *Pin 5.* Holds differ per replica and match the unbatched runs bitwise; the non-positive sum
+  is a per-replica fault (`[[F,T,T,T],[F,F,F,T],[T,T,T,T]]`), the run continuing.
+- *Pin 7.* Two-tier survey, 800 ticks, `batch=10`, traces recorded. One device: 1.00 s/tick
+  for the ten replicas, 842 s wall, peak RSS 4.1 GB (`chunk=100`: the same speed in eight even
+  chunks, 4.5 GB, no second compile; chunking frees nothing on a CPU host, where the chunks'
+  records are kept and joined). Ten host devices: 0.21 s/tick, 214 s wall, 4.4 GB (`chunk=100`:
+  212 s, 4.7 GB). Ten sequential runs: 1099 s, 0.125 s/tick, 2.7 GB. So 5.1× over sequential on
+  ten devices, 1.3× on one. The corridor arena under async with `batch=4` equals four
+  sequential runs exactly (3.6 s against 3.9 s); the two survey rovers grouped are bitwise equal
+  to the ungrouped run on all 37 leaves. The device-scaling section below has the curve.
+
+## Device scaling on the CPU host (measured 2026-11-17, after Phase B)
+
+One-level survey, 200 ticks, replica-ticks per second of scan execution (unbatched: 8.1/s,
+one replica keeping about 1.7 cores busy). Independent processes, one replica each, give the
+machine's ceiling for this workload (an M3 Max, 16 cores):
+
+| configuration | replica-ticks/s | against one replica |
+|---|---|---|
+| 8 processes | 57.9 | 7.2× |
+| 16 processes | 89.0 | 11.0× |
+| `batch=8` sharded over 8 host devices | 42.8 | 5.3× |
+| `batch=16` sharded over 16 host devices | 52.1 | 6.5× |
+| `batch=16` sharded over 8 host devices | 56.1 | 7.0× |
+| `batch=10` with 16 host devices (16 does not divide 10: one device) | 10.2 | 1.3× |
+
+Two-tier survey, 800 ticks, `batch=10` on 10 devices: 214 s against 1099 s for ten sequential
+runs (5.1×; one device 842 s).
+
+**Reading.** The CPU's ceiling for independent replicas is about 11× at sixteen cores, and the
+sharded scan reaches about 60% of it at every device count; the process-level CPU utilisation of
+the sharded run is 6.5 cores at sixteen devices, so the gap is idle cores, not contention: the
+per-round dispatch and synchronisation of one program whose state is sharded over host devices.
+Nothing crosses replicas inside a round, so the sharded form pays a synchronisation it does not
+need. Two Phase C items follow:
+
+- **Independent per-device scans.** Execute the replica axis as a `shard_map` over the devices
+  with the whole scan inside (each device runs its share's scan to completion, no per-round
+  rendezvous), in place of sharding the state of one scan. Expected to approach the process
+  ceiling. Two replicas per device beat one (7.0× against 6.5×), so the per-device share need not
+  be one.
+- **The divisibility trap.** `_spread` shards only when the device count divides the pass;
+  otherwise it silently runs on one device (`batch=10` on 16 devices: 1.3×). Use the largest
+  device count that divides the pass, or pad the pass to a multiple of the device count and drop
+  the padding, and report the device count in `Trajectory.timing`.

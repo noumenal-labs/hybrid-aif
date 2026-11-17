@@ -97,10 +97,35 @@ taken every round with its level a traced index (one System serves every level);
 node's decide-or-hold is a ``lax.cond``, its count an int32 array; write-backs are applied by
 arithmetic on the values. A check of a value that fails inside the scan cannot raise: it is
 recorded in ``Trajectory.faults`` (a write-back that was not applied, a level out of range, a
-step that changed its params outside its variables), where round 0 refuses it.
+step that changed its params outside its variables), where round 0 refuses it. While the state's
+shapes still change after round 0 (a mixture belief growing to its cap), up to three more rounds
+run on concrete values before the scan.
+
+**Replicas.** ``run(..., batch=B)`` runs ``B`` replicas of the closed System by one program:
+replica ``b`` under ``fold_in(key, b)`` (or ``key[b]`` for a stack of ``B`` keys), and inside it
+every key derived as above, so a replica is the unbatched run under its key. The reset and the
+rounds before the scan are vmapped calls of the same round body over the replicas, the scan a
+vmapped scan; a step never sees the replica axis (it is handed one replica's view, observations,
+carry and key). Every value is traced under ``batch=``, round 0 included, so a check of a value
+that round 0 refuses unbatched is recorded in ``Trajectory.faults`` there too. Replicas hold
+their options independently: a clocked node whose options last different rounds at different
+levels has a per-replica decide-or-hold, which vmap runs as both branches and a select. Under
+async each replica draws its own order and a switch over the distinct derived orders picks it,
+which vmap runs as every branch and a select: the cost of a batched async round is the number
+of distinct orders times the step work (two sources, two orders), and more than four sources
+(24 orders) are refused under ``batch=``.
+
+**Groups.** A key of ``steps`` may be a tuple of node names, ``steps={("agent.rover1",
+"agent.rover2"): step}``: the named nodes are copies of one node (their views equal up to their
+names) and are stepped by one vmapped call of the step over their stacked views' params,
+observations, carries and keys, each copy handed its own under the first copy's names. The
+copies are simultaneous among themselves: each reads the round-start home (under sequential and
+async, the home as it stood when the group's turn began) and their write-backs are combined as
+simultaneous ones are (Dirichlet counts summed). A group is one node to the order; its record is
+each node's own, under its name.
 
 Design: docs/design/engine-consolidation.md; nesting-and-coupling.md N3, N4, N5; control-states.md
-C13; batched-run.md R1–R9 (the compiled round).
+C13; batched-run.md R1–R12 (the compiled round, replicas, groups).
 """
 
 import dataclasses
@@ -110,7 +135,7 @@ import itertools
 import math
 import numbers
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import Any, Literal, NamedTuple
 
 import equinox as eqx
@@ -533,7 +558,12 @@ class Trajectory(NamedTuple):
     ``emitted``, ``intended`` and ``decided`` have ``ticks``.
 
     ``trajectory["agent.rover"]`` walks the tree by dotted path; a name that is no node is
-    refused, naming the nodes. A node that is planned jointly is a leaf of the tree.
+    refused, naming the nodes. A node that is planned jointly is a leaf of the tree, and the
+    nodes of a group each have their own record.
+
+    Under ``run(..., batch=B)`` every array leads with an axis of the ``B`` replicas, before the
+    rounds; ``carries`` is a tuple over rounds whose carries' arrays lead with it. A field that
+    ``run(record=...)`` did not keep is ``None``.
     """
 
     #: The parameter home after the last round (held at the root).
@@ -1149,7 +1179,8 @@ class _Round:
     values at the round's boundary, the write-backs held for it, each node's record of the round
     and the faults it raised."""
 
-    def __init__(self, state: _State, t):
+    def __init__(self, state: _State, t, scanned: bool = False):
+        self.scanned = scanned
         self.values = dict(state.values)
         self.boundary = dict(state.values)
         self.carries = dict(state.carries)
@@ -1183,10 +1214,13 @@ def _flagged(faults: dict | None, bad, label: str, sentence) -> None:
 
 class _Engine:
     """The round of ``run``: a function ``round(state, t) -> (state, record)`` of the structure
-    pass's static facts (the stepped nodes, the order, the clocks, the action nodes and their
-    kernels), called on concrete values for round 0 and scanned over the rounds after it."""
+    pass's static facts (the stepped nodes, the groups, the order, the clocks, the action nodes
+    and their kernels), called on concrete values for round 0 and scanned over the rounds after
+    it (under ``batch=``, both vmapped over the replicas)."""
 
-    def __init__(self, system, nodes, second, derive, tick_order, kernels, types, clocks):
+    def __init__(
+        self, system, nodes, second, derive, tick_order, kernels, types, clocks, groups=None
+    ):
         self.system = system
         self.nodes = nodes
         self.first = [n for n in nodes if not n.phase_two]
@@ -1199,29 +1233,85 @@ class _Engine:
         self.kernels = kernels
         self.types = types
         self.clocks = clocks
+        #: each group (design batched-run.md R12) by its first member: ``(members, swaps)``,
+        #: ``swaps[i]`` renaming member ``i``'s names to the first member's and back
+        self.groups: dict[str, tuple[list[_Node], list[Callable]]] = dict(groups or {})
+        self.member_of = {m.name: lead for lead, (ms, _) in self.groups.items() for m in ms}
+        #: the units of the order: each node, or a group as one node
+        self.units = self._units(self.first)
         self.sequential = list(derive(self.first))
+        if tick_order == "sequential":
+            self._check_contiguous(self.sequential, "the sequential order")
+        if tick_order == "simultaneous":
+            self._check_contiguous(self.second, "the order of the driven nodes")
         #: whether any turn traced so far wrote back (a fact of the trace, read after the run:
         #: a run in which no step wrote back returns the starting home itself)
         self.wrote = False
-        self.orders, self.permutations, self.order_of = self._async_orders()
+        self.orders, self.permutations, self.order_of = [], None, None
 
-    def _async_orders(self):
-        """Under ``"async"``: every distinct derived order of a permutation of the sources, the
-        permutations, and the index of each permutation's derived order."""
+    def _units(self, nodes: Sequence[_Node]) -> list[list[_Node]]:
+        """``nodes`` as the units of an order: a group's members at its first member's place,
+        every other node on its own."""
+        units = []
+        for node in nodes:
+            lead = self.member_of.get(node.name)
+            if lead is None:
+                units.append([node])
+            elif lead == node.name:
+                units.append(list(self.groups[lead][0]))
+        return units
+
+    def _check_contiguous(self, order: Sequence[_Node], what: str) -> None:
+        """Refuse a group whose members do not step one after another in ``order``."""
+        names = [n.name for n in order]
+        for members, _ in self.groups.values():
+            at = sorted(names.index(m.name) for m in members if m.name in names)
+            if at and at[-1] - at[0] + 1 != len(at):
+                group = tuple(m.name for m in members)
+                between = [names[i] for i in range(at[0], at[-1]) if names[i] not in group]
+                raise ValueError(
+                    f"run: the group {group} is not contiguous in {what} ({names}): "
+                    f"{between} steps between its members, a node one of them drives or that "
+                    "drives one of them; a group steps as one node, its members simultaneous "
+                    "among themselves, so its members must step one after another: step them "
+                    'ungrouped, or run the System under "simultaneous"'
+                )
+
+    def async_orders(self, batch: int | None) -> None:
+        """Under ``"async"``: every distinct derived order of a permutation of the units of the
+        sources (a group is one unit), the permutations, and the index of each permutation's
+        derived order. Under ``batch=`` each replica draws its own order and the switch over
+        the orders runs every branch (vmap lowers it to a select), so more than
+        :data:`_ASYNC_SOURCES` source units are refused (design batched-run.md R9)."""
         if self.tick_order != "async":
-            return [], None, None
+            return
+        units = self.units
+        if batch is not None and len(units) > _ASYNC_SOURCES:
+            raise ValueError(
+                f"run: under batch= the async order is drawn for each replica and dispatched by "
+                "a switch over every distinct derived order, which vmap evaluates in full each "
+                f"round (the cost is the number of orders times the step work); this System has "
+                f"{len(units)} sources, up to {math.factorial(len(units))} orders, above the "
+                f"ceiling of {_ASYNC_SOURCES} sources ({math.factorial(_ASYNC_SOURCES)} orders): "
+                'run it under "sequential" or "simultaneous", group identical sources into '
+                "one node (steps={(a, b): step}), or run the replicas one call each without "
+                "batch="
+            )
         orders: list[list[_Node]] = []
         seen: dict[tuple, int] = {}
         permutations, order_of = [], []
-        for perm in itertools.permutations(range(len(self.first))):
-            derived = self.derive([self.first[i] for i in perm])
+        for perm in itertools.permutations(range(len(units))):
+            derived = self.derive([n for i in perm for n in units[i]])
+            self._check_contiguous(derived, "an async order")
             names = tuple(n.name for n in derived)
             if names not in seen:
                 seen[names] = len(orders)
                 orders.append(derived)
             permutations.append(perm)
             order_of.append(seen[names])
-        return orders, np.asarray(permutations, np.int32), np.asarray(order_of, np.int32)
+        self.orders = orders
+        self.permutations = np.asarray(permutations, np.int32)
+        self.order_of = np.asarray(order_of, np.int32)
 
     # --------------------------------------------------------------------- reads
 
@@ -1242,53 +1332,80 @@ class _Engine:
 
     # --------------------------------------------------------------------- the round
 
-    def round(self, state: _State, t):
-        """Round ``t``: ``(state, record)``. ``t`` is a Python int on round 0, a traced one in
-        the scan."""
+    def round(self, state: _State, t, scanned: bool = False):
+        """Round ``t``: ``(state, record)``. ``t`` is a Python int on the rounds run on concrete
+        values, a traced one in the scan (``scanned``)."""
         key, k_tick = jax.random.split(state.key)
         keys = _round_keys(k_tick, self.count)
         state = state._replace(key=key)
         if self.tick_order == "simultaneous":
-            return self._sweep(state, keys, t, None)
+            return self._sweep(state, keys, t, None, scanned)
         if self.tick_order == "sequential":
-            return self._sweep(state, keys, t, self.sequential)
-        perm = jax.random.permutation(jax.random.fold_in(state.sweep, t), len(self.first))
+            return self._sweep(state, keys, t, self.sequential, scanned)
+        perm = jax.random.permutation(jax.random.fold_in(state.sweep, t), len(self.units))
         if not _traced(perm):
             match = np.all(self.permutations == np.asarray(perm), axis=1)
-            return self._sweep(state, keys, t, self.orders[int(self.order_of[np.argmax(match)])])
+            order = self.orders[int(self.order_of[np.argmax(match)])]
+            return self._sweep(state, keys, t, order, scanned)
         match = jnp.all(jnp.asarray(self.permutations) == perm, axis=1)
         which = jnp.asarray(self.order_of)[jnp.argmax(match)]
-        branches = [functools.partial(self._sweep, order=order) for order in self.orders]
+        branches = [
+            functools.partial(self._sweep, t=t, order=order, scanned=scanned)
+            for order in self.orders
+        ]
         if len(branches) == 1:
-            return branches[0](state, keys, t)
-        return jax.lax.switch(which, branches, state, keys, t)
+            return branches[0](state, keys)
+        if any(v is None for v in state.values.values()):
+            branches = _alike(branches, state, keys)
+        return jax.lax.switch(which, branches, state, keys)
 
-    def _sweep(self, state: _State, keys, t, order):
+    def _turns(self, order: Sequence[_Node]) -> list[list[_Node]]:
+        """``order`` as its turns: a group's members together at its first member's place."""
+        turns = []
+        for node in order:
+            lead = self.member_of.get(node.name)
+            if lead is None:
+                turns.append([node])
+            elif lead == node.name:
+                turns.append(list(self.groups[lead][0]))
+        return turns
+
+    def _sweep(self, state: _State, keys, t, order, scanned=False):
         """One round under ``order`` (``None``: simultaneous)."""
-        r = _Round(state, t)
+        r = _Round(state, t, scanned)
         count = self.count
         if order is None:
             chosen: dict[str, Array] = {}
             flags: dict[str, Any] = {}
-            for node in self.first:
-                picked, decided = self._decide(r, node, keys[node.index])
-                chosen.update(picked)
-                flags.update(dict.fromkeys(picked, decided))
+            for turn in self._turns(self.first):
+                for picked, decided in self._turn_of(r, turn, keys):
+                    chosen.update(picked)
+                    flags.update(dict.fromkeys(picked, decided))
             members = [a for n in self.first for a in n.chosen]
             self._realise(r, keys[2 * count], chosen, flags, members)
-            for node in self.second:
-                picked, decided = self._decide(r, node, keys[node.index])
-                self._realise(
-                    r, keys[count + node.index], picked, dict.fromkeys(picked, decided), node.chosen
-                )
+            for turn in self._turns(self.second):
+                results = self._turn_of(r, turn, keys)
+                for node, (picked, decided) in zip(turn, results, strict=True):
+                    self._realise(
+                        r,
+                        keys[count + node.index],
+                        picked,
+                        dict.fromkeys(picked, decided),
+                        node.chosen,
+                    )
             if r.pending:
                 r.home = _at_the_boundary(self.system, r.round_home, r.pending, t, r.flag)
         else:
-            for node in order:
-                picked, decided = self._decide(r, node, keys[node.index])
-                self._realise(
-                    r, keys[count + node.index], picked, dict.fromkeys(picked, decided), node.chosen
-                )
+            for turn in self._turns(order):
+                results = self._turn_of(r, turn, keys)
+                for node, (picked, decided) in zip(turn, results, strict=True):
+                    self._realise(
+                        r,
+                        keys[count + node.index],
+                        picked,
+                        dict.fromkeys(picked, decided),
+                        node.chosen,
+                    )
         record = dict(
             received=r.received,
             intended=r.intended,
@@ -1298,6 +1415,11 @@ class _Engine:
             faults=r.faults,
         )
         return _State(state.key, r.values, r.carries, r.home, r.held, state.sweep), record
+
+    def _turn_of(self, r: _Round, turn: list[_Node], keys) -> list:
+        if len(turn) == 1 and turn[0].name not in self.member_of:
+            return [self._decide(r, turn[0], keys[turn[0].index])]
+        return self._decide_group(r, turn, keys)
 
     def _realise(self, r: _Round, k, chosen, flags, members) -> None:
         """Realise the intended action nodes ``chosen`` of ``members`` from their kernels with
@@ -1315,15 +1437,16 @@ class _Engine:
                     _select(flags[a], new, r.values[a]) if r.values[a] is not None else new
                 )
 
-    def _decide(self, r: _Round, node: _Node, k):
-        """``node``'s turn: stepped on what it reads, or, a clocked node inside its option,
-        holding (its out-ports keep their values, its count goes one round down); its return
-        checked, its emissions stored and its write-back applied (live) or held for the boundary
-        (simultaneous). Returns the intended action nodes and whether the node decided."""
-        simultaneous = self.tick_order == "simultaneous"
+    def _base(self, r: _Round) -> SystemParams:
+        """The home a turn's view is taken from: the round's start under ``"simultaneous"``, the
+        home as it stands otherwise."""
+        return r.round_home if self.tick_order == "simultaneous" else r.home
+
+    def _prepare(self, r: _Round, node: _Node, base):
+        """What ``node`` reads this turn (recorded), the levels its sliced view is cut at, its
+        view and the observations its step is handed."""
         seen = self.read(node, r.values, r.boundary)
         r.received[node.name] = seen
-        base = r.round_home if simultaneous else r.home
         levels: tuple = ()
         if getattr(node.step, "sliced", False):
             levels = tuple(
@@ -1333,9 +1456,39 @@ class _Engine:
         view, vparams = _take_view(self.system, node, base, levels)
         cut = {s for s, v in node.driven.items() if v in {w for w, _ in levels}}
         obs = {s: x for s, x in seen.items() if s not in cut}
-        carry = r.carries[node.name]
-        standing = {v: r.values[v] for v in node.outs}
+        return view, vparams, levels, obs
+
+    def _decide(self, r: _Round, node: _Node, k):
+        """``node``'s turn: stepped on what it reads, or, a clocked node inside its option,
+        holding (its out-ports keep their values, its count goes one round down); its return
+        checked, its emissions stored and its write-back applied (live) or held for the boundary
+        (simultaneous). Returns the intended action nodes and whether the node decided."""
+        base = self._base(r)
+        view, vparams, levels, obs = self._prepare(r, node, base)
         identity: dict[str, bool] = {}
+        out, stepped, learned, held, decided = self._turn(
+            node,
+            view,
+            r.t,
+            r.scanned,
+            identity,
+            k,
+            obs,
+            r.carries[node.name],
+            vparams,
+            {v: r.values[v] for v in node.outs},
+            r.held.get(node.name),
+        )
+        if identity.get("params"):
+            learned = vparams  # both branches hand back the params they were given
+        chosen = self._finish(r, node, out, stepped, learned, held, decided, view, vparams, levels)
+        return chosen, decided
+
+    def _turn(self, node, view, t, scanned, identity, k, obs, carry, vparams, standing, held):
+        """The step of ``node`` called on its view, or, a clocked node inside its option, its
+        standing values: ``(out, carry, params, held, decided)``, ``held`` the option in force
+        after the turn (``None`` for a node with no clock). A function of its arrays alone, so
+        a group vmaps it over its members."""
 
         def act(k, obs, carry, vparams):
             out, stepped, learned = self._call(node, view, k, obs, carry, vparams)
@@ -1346,54 +1499,125 @@ class _Engine:
                 )
             out = _check_out(node, out, self.types, self.system, False, standing)
             identity["params"] = learned is vparams
-            if _traced(k):
+            if scanned:
                 stepped = _like_tree(_strong(stepped), carry, f"the carry of {node.name!r}")
                 if learned is not vparams:
                     learned = _like_tree(learned, vparams, f"the params of {node.name!r}")
             return out, stepped, learned
 
         clock = self.clocks.get(node.name)
-        decided = True
         if clock is None:
             out, stepped, learned = act(k, obs, carry, vparams)
+            return out, stepped, learned, None, True
+        remaining, action = held
+        if isinstance(t, int) and t == 0:
+            decided = True  # the first round always decides (its count is traced under batch=)
         else:
-            remaining, action = r.held[node.name]
-            decided = (r.t % clock.lockstep == 0) if clock.lockstep else (remaining == 0)
-            if not _traced(decided):
-                decided = bool(decided)
+            decided = (t % clock.lockstep == 0) if clock.lockstep else (remaining == 0)
+        if not _traced(decided):
+            decided = bool(decided)
 
-            def hold(k, obs, carry, vparams):
-                return {**{e: standing[e] for e in node.emissions}, **action}, carry, vparams
+        def hold(k, obs, carry, vparams):
+            return {**{e: standing[e] for e in node.emissions}, **action}, carry, vparams
 
-            if decided is True:
-                out, stepped, learned = act(k, obs, carry, vparams)
-            elif decided is False:
-                out, stepped, learned = hold(k, obs, carry, vparams)
-            else:
+        if decided is True:
+            out, stepped, learned = act(k, obs, carry, vparams)
+        elif decided is False:
+            out, stepped, learned = hold(k, obs, carry, vparams)
+        else:
+            try:
                 out, stepped, learned = jax.lax.cond(decided, act, hold, k, obs, carry, vparams)
-                if identity.get("params"):
-                    learned = vparams  # both branches hand back the params they were given
-            chosen = {a: out[a] for a in node.chosen}
-            level = jnp.asarray(chosen[clock.action], jnp.int32)
-            rounds = jnp.asarray(clock.rounds, jnp.int32)[level]
-            r.held[node.name] = (
-                _select(decided, rounds - 1, remaining - 1).astype(jnp.int32),
-                _select(decided, chosen, action),
-            )
+            except TypeError as error:
+                if scanned:
+                    raise
+                raise ValueError(
+                    f"run: under batch= the clocked node {node.name!r}, whose options last "
+                    f"different rounds at different levels, decides on some replicas and holds "
+                    f"on others at round {t}, while its carry still changes form (its step "
+                    "returns a carry of another structure or shape than it was handed); hold "
+                    "a carry of one form from round 0 on, give its durations one value at every "
+                    "level, or run the replicas one call each without batch="
+                ) from error
+        chosen = {a: out[a] for a in node.chosen}
+        level = jnp.asarray(chosen[clock.action], jnp.int32)
+        rounds = jnp.asarray(clock.rounds, jnp.int32)[level]
+        held = (
+            _select(decided, rounds - 1, remaining - 1).astype(jnp.int32),
+            _select(decided, chosen, action),
+        )
+        return out, stepped, learned, held, decided
+
+    def _finish(
+        self, r, node, out, stepped, learned, held, decided, view, vparams, levels, pending=None
+    ):
+        """A turn's return taken into the round: its levels' ranges checked, its carry, option
+        and emissions stored, its intended actions and decision recorded and its write-back
+        applied or held (``pending``: for the end of a group's turn). Returns the intended
+        action nodes."""
         _check_ranges(node, out, self.types, self.system, r.flag)
         r.carries[node.name] = stepped
+        if held is not None:
+            r.held[node.name] = held
         for e in node.emissions:
             r.values[e] = out[e]
         chosen = {a: out[a] for a in node.chosen}
         r.intended[node.name] = chosen
         r.decided[node.name] = decided
         if learned is not vparams:
-            self._write(r, node, view, vparams, learned, levels, base)
-        return chosen, decided
+            self._write(r, node, view, vparams, learned, levels, self._base(r), pending)
+        return chosen
+
+    def _decide_group(self, r: _Round, members: list[_Node], keys) -> list:
+        """A group's turn (design batched-run.md R12): its members' steps called by one vmapped
+        call of the step over their stacked keys, observations, carries, views' params and
+        options, each member renamed to the first's names (the members' views are one view up
+        to their names, checked in the structure pass). The members read the home as the turn
+        began and their write-backs are summed at its end (Dirichlet counts; at the round's
+        boundary under ``"simultaneous"``), as simultaneous nodes' are. Returns each member's
+        intended action nodes and decision."""
+        lead = members[0]
+        swaps = self.groups[lead.name][1]
+        base = self._base(r)
+        prepared = [self._prepare(r, m, base) for m in members]
+        rows = [
+            swaps[i](
+                (
+                    keys[m.index],
+                    prepared[i][3],
+                    r.carries[m.name],
+                    prepared[i][1],
+                    {v: r.values[v] for v in m.outs},
+                    r.held.get(m.name),
+                )
+            )
+            for i, m in enumerate(members)
+        ]
+        stacked = _stack_members(rows, members, r.t)
+        view = prepared[0][0]
+        identity: dict[str, bool] = {}
+
+        def turn(row):
+            return self._turn(lead, view, r.t, r.scanned, identity, *row)
+
+        outs = eqx.filter_vmap(turn)(stacked)
+        pending: list | None = None if self.tick_order == "simultaneous" else []
+        results = []
+        for i, m in enumerate(members):
+            out, stepped, learned, held, decided = swaps[i](_row_of(outs, i))
+            _, vparams, levels, _ = prepared[i]
+            if identity.get("params"):
+                learned = vparams
+            chosen = self._finish(
+                r, m, out, stepped, learned, held, decided, prepared[i][0], vparams, levels, pending
+            )
+            results.append((chosen, decided))
+        if pending:
+            r.home = _at_the_boundary(self.system, base, pending, r.t, r.flag)
+        return results
 
     def _call(self, node: _Node, view, k, obs, carry, vparams):
-        """The step called; inside the scan a step that calls host-side code on a traced value
-        is refused naming it (design batched-run.md R8)."""
+        """The step called; on traced values (the scan, or any round under ``batch=``) a step
+        that calls host-side code is refused naming it (design batched-run.md R8)."""
         try:
             return node.step(view, k, obs, carry, vparams)
         except _HOST_ERRORS as error:
@@ -1402,48 +1626,293 @@ class _Engine:
             raise ValueError(
                 f"run: the step of {node.name!r} calls host-side code on a traced value "
                 f"({type(error).__name__}); run steps every round after the first inside one "
-                "compiled scan, so a step is a traced function whose outputs are JAX arrays: "
+                "compiled scan (and every call under batch=, vmapped over the replicas), so a "
+                "step is a traced function whose outputs are JAX arrays: "
                 "write it with jax.numpy and lax control flow (no np.asarray, float(), int(), "
                 "bool() or a Python branch on a value), and keep host-side work such as timing "
                 "or logging outside run (record what a step sees in its carry, "
                 "record_carries=True)"
             ) from error
 
-    def _write(self, r: _Round, node, view, vparams, learned, levels, base) -> None:
+    def _write(self, r: _Round, node, view, vparams, learned, levels, base, pending=None) -> None:
         """A learner's write-back: its own learned tables and its parameter variables, applied to
-        the home now (sequential, async) or held for the boundary (simultaneous)."""
+        the home now (sequential, async), held for the boundary (simultaneous), or held for the
+        end of its group's turn (``pending``)."""
         self.wrote = True
         learned, written = _own_slots(view, node, vparams, learned, levels, base, r.flag)
         _check_parameters_only(view, node.name, vparams, learned, r.flag)
         new = _write_back(self.system, base, node.name, vparams, learned, r.flag)
         if self.tick_order == "simultaneous":
             r.pending.append((node.name, new, written))
+        elif pending is not None:
+            pending.append((node.name, new, written))
         else:
             r.home = new if not written else dataclasses.replace(new, **written(new))
 
 
-def _scan_program(engine: _Engine, static, record_carries: bool):
-    """The compiled scan of the rounds after round 0 over the array part of the state (its other
-    leaves, ``static``, the same every round): ``program(dynamic, rounds) -> (dynamic,
-    records)``, ``rounds`` the indices of the rounds it runs."""
+def _alike(branches: list, state, keys) -> list:
+    """The async round's branches (one per derived order) made to return records of one
+    structure, for a switch whose index is traced on a round where a variable has no value yet
+    (round 0 under ``batch=``): a slot one order reads before its variable has a value and
+    another after is recorded as zeros where absent with its presence a flag of the record
+    (``present``), and every branch records every fault label (``False`` where it raised none).
+    """
+    shapes = [eqx.filter_eval_shape(b, state, keys)[1] for b in branches]
+    received: dict[str, dict[str, Any]] = {}
+    for shape in shapes:
+        for node, slots in shape["received"].items():
+            for slot, value in slots.items():
+                held = received.setdefault(node, {})
+                if held.get(slot) is None:
+                    held[slot] = value
+    labels = list(dict.fromkeys(label for shape in shapes for label in shape["faults"]))
+
+    def alike(branch):
+        def call(state, keys):
+            out, record = branch(state, keys)
+            seen, present = {}, {}
+            for node, slots in received.items():
+                seen[node], present[node] = {}, {}
+                for slot, like in slots.items():
+                    value = record["received"][node].get(slot)
+                    present[node][slot] = jnp.asarray(value is not None)
+                    if value is None and like is not None:
+                        value = jnp.zeros(like.shape, like.dtype)
+                    seen[node][slot] = value
+            faults = {
+                label: jnp.asarray(record["faults"].get(label, False), bool) for label in labels
+            }
+            return out, {**record, "received": seen, "present": present, "faults": faults}
+
+        return call
+
+    return [alike(b) for b in branches]
+
+
+#: The most source units ``"async"`` takes under ``batch=`` (design batched-run.md R9): each
+#: replica's order is a switch over the distinct derived orders, all of which vmap runs.
+_ASYNC_SOURCES = 4
+
+
+def _stack_members(rows: list, members: list[_Node], t):
+    """The rows of a group's members, each renamed to the first member's names, stacked on a
+    leading axis: their arrays stacked, their other leaves equal. Refused, naming the members,
+    where the rows differ in structure (a value one member has and another has not yet)."""
+    parts = [eqx.partition(row, eqx.is_array) for row in rows]
+    defs = [jax.tree_util.tree_structure(d) for d, _ in parts]
+    statics = [s for _, s in parts]
+    for i, m in enumerate(members[1:], start=1):
+        same = defs[i] == defs[0] and _same_static(statics[i], statics[0])
+        same = same and all(
+            jnp.shape(a) == jnp.shape(b) and jnp.result_type(a) == jnp.result_type(b)
+            for a, b in zip(
+                jax.tree_util.tree_leaves(parts[i][0]),
+                jax.tree_util.tree_leaves(parts[0][0]),
+                strict=True,
+            )
+        )
+        if not same:
+            raise ValueError(
+                f"run: the group {tuple(n.name for n in members)} steps its members by one "
+                f"vmapped call, and at round {t} what {m.name!r} is handed (its observations, "
+                f"carry, view's params or option) differs in structure or shape from what "
+                f"{members[0].name!r} is handed; a group holds copies of one node that read "
+                "values of one form: give every member the same kind of input (a value present "
+                "for all or none) and carries of one structure, or step them ungrouped"
+            )
+    dynamic = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *[d for d, _ in parts])
+    return eqx.combine(dynamic, statics[0])
+
+
+def _row_of(tree, i: int):
+    """Entry ``i`` of a tree stacked on a leading axis (its other leaves as they are)."""
+    return jax.tree_util.tree_map(lambda x: x[i] if eqx.is_array(x) else x, tree)
+
+
+def _swapper(a: str, b: str, keep: frozenset) -> Callable:
+    """A renaming of every name in a tree from component ``a``'s to ``b``'s and back (the swap
+    of the two prefixes, an involution), the names in ``keep`` (the parameter variables both
+    views share) left as they are: dict keys, string leaves and the strings in a dataclass's or
+    a module's fields, a ``<head>:<name>`` key by its name. Arrays are untouched."""
+    pa, pb = f"{a}{SEPARATOR}", f"{b}{SEPARATOR}"
+
+    def name(s: str) -> str:
+        if s in keep:
+            return s
+        if s == a:
+            return b
+        if s == b:
+            return a
+        if s.startswith(pa):
+            return pb + s[len(pa) :]
+        if s.startswith(pb):
+            return pa + s[len(pb) :]
+        return s
+
+    def string(s: str) -> str:
+        head, colon, rest = s.rpartition(":")
+        return f"{head}{colon}{name(rest)}" if colon else name(s)
+
+    def go(x):
+        if isinstance(x, str):
+            return string(x)
+        if x is None or isinstance(
+            x, jax.core.Tracer | Array | np.ndarray | np.generic | numbers.Number | type
+        ):
+            return x
+        if isinstance(x, tuple) and hasattr(x, "_fields"):
+            return type(x)._make(go(v) for v in x)
+        if isinstance(x, tuple | list):
+            return type(x)(go(v) for v in x)
+        if isinstance(x, dict):
+            return type(x)((go(k), go(v)) for k, v in x.items())
+        if isinstance(x, frozenset | set):
+            return type(x)(go(v) for v in x)
+        if dataclasses.is_dataclass(x) and hasattr(x, "__dict__"):
+            new = object.__new__(type(x))
+            for k, v in vars(x).items():
+                object.__setattr__(new, k, go(v))
+            return new
+        return x
+
+    return go
+
+
+def _same_tree(a, b) -> bool:
+    """Whether two trees have one structure (static leaves included) and arrays of one shape and
+    dtype: the test ``plan()``'s compiled tick makes to share a program."""
+    da, sa = eqx.partition(a, eqx.is_array)
+    db, sb = eqx.partition(b, eqx.is_array)
+    if jax.tree_util.tree_structure(da) != jax.tree_util.tree_structure(db):
+        return False
+    if jax.tree_util.tree_structure(sa) != jax.tree_util.tree_structure(sb):
+        return False
+    return all(
+        jnp.shape(x) == jnp.shape(y) and jnp.result_type(x) == jnp.result_type(y)
+        for x, y in zip(jax.tree_util.tree_leaves(da), jax.tree_util.tree_leaves(db), strict=True)
+    )
+
+
+def _check_groups(system, params, nodes, groups, schedule, tick_order):
+    """The groups of ``steps`` (tuple keys, design batched-run.md R12), checked in the structure
+    pass: members all driven by another node's action or none, all clocked on one schedule or
+    none, and views equal up to their names (the System and the params' structure, the test
+    ``plan()`` makes to share one compiled program); two ``plan()`` learners of a variable that
+    is not counts within one group are refused under every order, since a group's members are
+    simultaneous among themselves. Returns ``{first member: (members, swaps)}``."""
+    by_name = {n.name: n for n in nodes}
+    out = {}
+    for group in groups:
+        members = [by_name[name] for name in group]
+        names = tuple(group)
+        if len({m.phase_two for m in members}) > 1:
+            raise ValueError(
+                f"run: the group {names} mixes nodes a node's action drives with nodes none "
+                "drives; a group steps as one node at one turn of the round, so its members are "
+                "all driven or none: group only copies wired alike"
+            )
+        clocked = [m.name for m in members if m.name in schedule]
+        if clocked and len(clocked) != len(members):
+            raise ValueError(
+                f"run: the group {names} mixes clocked nodes {clocked} with unclocked ones; a "
+                "group decides as one node, so its members all declare durations or none do: "
+                "group the clocked copies apart from the others"
+            )
+        if clocked and len({schedule[c].rounds for c in clocked}) > 1:
+            raise ValueError(
+                f"run: the group {names} holds clocked nodes whose options last different "
+                f"rounds ({ {c: schedule[c].rounds for c in clocked} }); a group's members are "
+                "copies of one node: give them one durations table and one clock, or step them "
+                "ungrouped"
+            )
+        views = [_reset_view(system, m, params) for m in members]
+        lead_view, lead_params = views[0]
+        swaps: list[Callable] = [lambda x: x]
+        for m, (view, vparams) in zip(members[1:], views[1:], strict=True):
+            keep = frozenset(lead_params.parameters) & frozenset(vparams.parameters)
+            swap = _swapper(members[0].name, m.name, keep)
+            same = jax.tree_util.tree_structure(swap(lead_view)) == jax.tree_util.tree_structure(
+                view
+            ) and _same_tree(swap(vparams), lead_params)
+            if not same:
+                raise ValueError(
+                    f"run: the group {names} steps its members by one vmapped call of one step, "
+                    f"and the views of {members[0].name!r} and {m.name!r} differ in static "
+                    "structure beyond their names (their Systems, or their params' forms and "
+                    "shapes, the test plan() makes to share one compiled program); a group "
+                    "holds copies of one node: group only components built alike, or step them "
+                    "ungrouped"
+                )
+            swaps.append(swap)
+        if tick_order != "simultaneous":
+            _check_shared_learning(system, members, params)
+        out[members[0].name] = (members, swaps)
+    return out
+
+
+#: The fields of the record ``record=`` can name (``present`` goes with ``received``; ``decided``
+#: and ``faults`` are always kept).
+_RECORDABLE = ("received", "emitted", "intended", "carries")
+
+
+def _record_fields(record, record_carries: bool) -> frozenset:
+    """The fields of the record stacked over rounds: ``record`` (default ``received``,
+    ``emitted`` and ``intended``) and ``carries`` under ``record_carries``."""
+    if record is None:
+        fields = {"received", "emitted", "intended"}
+    else:
+        if isinstance(record, str) or not isinstance(record, Collection):
+            raise TypeError(
+                f"run: record={record!r}; pass a collection of the fields to stack over rounds, "
+                f"from {list(_RECORDABLE)} (decided and faults are always kept)"
+            )
+        unknown = sorted(set(record) - set(_RECORDABLE))
+        if unknown:
+            raise ValueError(
+                f"run: record names {unknown}, which are no field of the record it stacks; "
+                f"name fields from {list(_RECORDABLE)} (decided and faults are always kept)"
+            )
+        fields = set(record)
+    if record_carries:
+        fields.add("carries")
+    return frozenset(fields)
+
+
+def _kept(record: dict, fields: frozenset) -> dict:
+    """A round's record as the scan stacks it: the fields ``record=`` keeps, a carry's arrays,
+    each node's decision an array."""
+    out = {**record, "decided": {k: jnp.asarray(v) for k, v in record["decided"].items()}}
+    out["carries"] = eqx.filter(record["carries"], eqx.is_array) if "carries" in fields else None
+    for field in ("received", "emitted", "intended"):
+        if field not in fields:
+            out[field] = None
+    return out
+
+
+def _scan_program(engine: _Engine, static, fields: frozenset, batched: bool, last=None):
+    """The compiled scan of the rounds over the array part of the state (its other leaves,
+    ``static``, the same every round): ``program(dynamic, rounds) -> (dynamic, records)``,
+    ``rounds`` the indices of the rounds it runs. Under ``batch=`` it is vmapped over the
+    replicas (the leading axis of ``dynamic``). ``last``: the run's round count, past which a
+    round of a padded last chunk leaves the state as it was."""
 
     def body(dynamic, t):
         state = eqx.combine(dynamic, static)
-        state, record = engine.round(state, t)
+        state, record = engine.round(state, t, scanned=True)
         out, rest = eqx.partition(state, eqx.is_array)
         _check_static(rest, static)
         out = _like_tree(out, dynamic, "the round's state")
-        if not record_carries:
-            record = {**record, "carries": None}
-        else:
-            record = {**record, "carries": eqx.filter(record["carries"], eqx.is_array)}
-        record = {
-            **record,
-            "decided": {k: jnp.asarray(v) for k, v in record["decided"].items()},
-        }
-        return out, record
+        if last is not None:
+            live = t < last
+            out = jax.tree_util.tree_map(lambda new, old: jnp.where(live, new, old), out, dynamic)
+        return out, _kept(record, fields)
 
-    return jax.jit(lambda dynamic, rounds: jax.lax.scan(body, dynamic, rounds))
+    def scan(dynamic, rounds):
+        return jax.lax.scan(body, dynamic, rounds)
+
+    if batched:
+        return jax.jit(jax.vmap(scan, in_axes=(0, None)))
+    return jax.jit(scan)
 
 
 def _same_static(a, b) -> bool:
@@ -1479,14 +1948,20 @@ def _run(
     params: SystemParams,
     ticks: int,
     key: Array,
-    steps: Mapping[str, Callable],
+    steps: Mapping[Any, Callable],
     clocks: Mapping[str, float] | None = None,
     tick_order: TickOrder = "simultaneous",
     carries: Mapping[str, Any] | None = None,
     record_carries: bool = False,
+    batch: int | None = None,
+    record: Collection[str] | None = None,
+    chunk: int | None = None,
+    replicas_per_pass: int | None = None,
+    per_replica: Collection[str] = (),
 ) -> Trajectory:
-    """:func:`~hybrid_aif.composition.runner.run`, the engine: the structure pass, the reset,
-    round 0 on concrete values, and the compiled scan of the rounds after it."""
+    """:func:`~hybrid_aif.composition.runner.run`, the engine: the structure pass, then per pass
+    of replicas the reset, the rounds on concrete values while the state settles, and the
+    compiled scan of the rounds after them in chunks."""
     _check_order(tick_order)
     if not isinstance(system, System):
         raise TypeError(f"run: the first argument is a {type(system).__name__}, not a System")
@@ -1495,11 +1970,27 @@ def _run(
     if isinstance(ticks, bool) or not isinstance(ticks, int | np.integer) or ticks < 0:
         raise ValueError(f"run: ticks={ticks!r} is not a non-negative integer")
     ticks = int(ticks)
-    system._params_in(params, "run")
-    # ---- the structure pass: everything that reads structure, not values (R2)
-    nodes = _structure(system, params, steps)
+    batch = _count(batch, "batch", "the number of replicas run by one program")
+    chunk = _count(chunk, "chunk", "the rounds of one compiled chunk of the scan")
+    per_pass = _count(
+        replicas_per_pass, "replicas_per_pass", "the most replicas one pass of batch= holds"
+    )
+    if batch is None and (per_pass is not None or per_replica):
+        given = "replicas_per_pass" if per_pass is not None else "per_replica"
+        raise ValueError(
+            f"run: {given}= is about the replicas of batch=, and batch is None; pass batch=B, "
+            f"or drop {given}"
+        )
+    fields = _record_fields(record, record_carries)
+    carries = dict(carries or {})
+    shared_params = _check_per_replica(per_replica, params, carries, batch)
+    flat, groups = _flat_steps(steps)
+    # ---- the structure pass: everything that reads structure, not values (R2), on the
+    # params of one replica
+    system._params_in(shared_params, "run")
+    nodes = _structure(system, shared_params, flat)
     names = {n.name for n in nodes}
-    unknown = sorted(set(carries or {}) - names)
+    unknown = sorted(set(carries) - names)
     if unknown:
         raise ValueError(
             f"run: carries names {unknown}, which are no stepped node; the stepped nodes "
@@ -1509,18 +2000,17 @@ def _run(
     _check_black_boxes(system, nodes)
     for node in nodes:
         if getattr(node.step, "sliced", False):
-            floats = [s for s in node.driven if _kind(system, params, s) == FLOAT]
+            floats = [s for s in node.driven if _kind(system, shared_params, s) == FLOAT]
             if floats:
                 raise NotImplementedError(
                     f"run: node {node.name!r} is stepped by plan() and its control node "
                     f"{floats[0]!r} is driven by a continuous variable; a planner holds a driven "
                     "input at one level, so give the node a custom step"
                 )
-    count = len(nodes)
-    kernels = system._actuator(params, "run")
-    ports = system.ports(params)
+    kernels = system._actuator(shared_params, "run")
+    ports = system.ports(shared_params)
     types = dict(ports.outs)
-    declared_by = {n.name: _declared_durations(params, n.name) for n in nodes}
+    declared_by = {n.name: _declared_durations(shared_params, n.name) for n in nodes}
     clocked = {name for name, declared in declared_by.items() if declared}
     scales = _check_clocks(clocks, names, clocked, system._black_boxes)
     for node in nodes:
@@ -1546,66 +2036,51 @@ def _run(
                     "actuator, or drop its durations"
                 )
     schedule = {
-        n.name: _clock_of(system, n, params, scales[n.name]) for n in nodes if n.name in clocked
+        n.name: _clock_of(system, n, shared_params, scales[n.name])
+        for n in nodes
+        if n.name in clocked
     }
     if tick_order == "simultaneous":
-        _check_shared_learning(system, nodes, params)
-    engine = _Engine(system, nodes, second, derive, tick_order, kernels, types, schedule)
+        _check_shared_learning(system, nodes, shared_params)
+    grouped = _check_groups(system, shared_params, nodes, groups, schedule, tick_order)
+    engine = _Engine(system, nodes, second, derive, tick_order, kernels, types, schedule, grouped)
+    engine.async_orders(batch)
 
-    # ---- the reset (section 4.4), on concrete values
-    values: dict[str, Array | None] = {v: None for n in nodes for v in n.outs}
-    live = {n.name: (carries or {}).get(n.name) for n in nodes}
-    key, k_reset = jax.random.split(key)
-    for node, k in zip(nodes, _reset_keys(k_reset, count), strict=True):
-        view, vparams = _reset_view(system, node, params)
-        out, live[node.name], _ = node.step(view, k, None, live[node.name], vparams)
-        out = _check_out(node, out, types, system, reset=True)
-        values.update(out)
-    start = {n.name: {v: values[v] for v in n.outs if values[v] is not None} for n in nodes}
-    held = {
-        n.name: (jnp.zeros((), jnp.int32), {a: _null(types[a]) for a in n.chosen})
-        for n in nodes
-        if n.name in schedule
-    }
-    state = _State(key, values, live, params, held, _sweep_key(key, count))
-    reset_carries = dict(live)
-
-    # ---- round 0 on concrete values, then the scan of the rounds after it (R1); while the
-    # state's shapes still change (a mixture belief growing to its cap) a round runs on concrete
-    # values again, at most _SETTLE of them
-    heads: list = []
-    rest = None
-    timing = {"compile": 0.0, "scan": 0.0, "scanned": 0, "concrete": 0}
-    t = 0
-    while t < ticks:
-        if t:
-            dynamic, static = eqx.partition(state, eqx.is_array)
-            program = _scan_program(engine, static, record_carries)
-            rounds = jnp.arange(t, ticks, dtype=jnp.int32)
-            try:
-                begun = time.perf_counter()
-                compiled = program.lower(dynamic, rounds).compile()
-                timing["compile"] = time.perf_counter() - begun
-            except _Unsettled:
-                if t > _SETTLE:
-                    raise
-            else:
-                begun = time.perf_counter()
-                dynamic, rest = jax.block_until_ready(compiled(dynamic, rounds))
-                timing.update(scan=time.perf_counter() - begun, scanned=ticks - t)
-                state = eqx.combine(dynamic, static)
-                break
-        state, row = engine.round(state, t)
-        heads.append(row)
-        state = _strong(state)
-        t += 1
-    timing["concrete"] = len(heads)
+    # ---- the replicas, in passes; each pass the reset, the rounds on concrete values and the
+    # compiled scan in chunks (R1, R11)
+    simulation = _Simulation(engine, ticks, chunk, fields, batch is not None)
+    if batch is None:
+        out = simulation.run(key, carries, params)
+        size, passes = None, 1
+    else:
+        keys = _replica_keys(key, batch)
+        size = batch if per_pass is None else min(per_pass, batch)
+        passes = -(-batch // size)
+        params_axis = eqx.if_array(0) if "params" in per_replica else None
+        seed_axes = {n: (eqx.if_array(0) if n in per_replica else None) for n in carries}
+        outs = []
+        for p in range(passes):
+            # the last pass is filled to the pass's size with copies of the last replica, so
+            # every pass runs one program; the copies are dropped
+            index = np.minimum(np.arange(p * size, (p + 1) * size), batch - 1)
+            simulation.passes = p
+            outs.append(
+                simulation.run(
+                    keys[index],
+                    {n: _rows(s, index) if n in per_replica else s for n, s in carries.items()},
+                    _rows(params, index) if "params" in per_replica else params,
+                    seed_axes,
+                    params_axis,
+                )
+            )
+        out = outs[0] if passes == 1 else _joined(outs, batch)
+    state, start, reset_carries, heads, rest, final = out
     if not engine.wrote:
         state = state._replace(home=params)  # no step wrote back: the home is the one handed in
-    final = {n.name: engine.read(n, state.values, state.values) for n in nodes}
+    timing = dict(simulation.timing, concrete=len(heads), passes=passes, replicas_per_pass=size)
     return _assemble_record(
         system,
-        params,
+        shared_params,
         state,
         nodes,
         ticks,
@@ -1616,8 +2091,273 @@ def _run(
         heads,
         rest,
         final,
-        record_carries,
+        fields,
+        batch,
     )._replace(timing=timing)
+
+
+def _count(value, what: str, meaning: str) -> int | None:
+    """``value`` as a positive count, or ``None``; refused otherwise naming ``what``."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | np.integer) or value < 1:
+        raise ValueError(f"run: {what}={value!r} is not a positive integer ({meaning}) or None")
+    return int(value)
+
+
+def _flat_steps(steps) -> tuple[dict, list[tuple[str, ...]]]:
+    """``steps`` with each group (a tuple of node names, design batched-run.md R12) spread over
+    its members, and the groups."""
+    if not isinstance(steps, Mapping):
+        return steps, []
+    flat, groups, owner = {}, [], {}
+    for k, step in steps.items():
+        members = (k,) if isinstance(k, str) else k
+        if not isinstance(k, str):
+            if (
+                not isinstance(k, tuple)
+                or len(k) < 2
+                or not all(isinstance(m, str) for m in k)
+                or len(set(k)) != len(k)
+            ):
+                raise TypeError(
+                    f"run: steps has the key {k!r}; a key is a node's name, or a tuple of two or "
+                    "more distinct node names stepped as one group by one vmapped call of the step"
+                )
+            groups.append(k)
+        for m in members:
+            if m in owner:
+                raise ValueError(
+                    f"run: steps names {m!r} twice (under {owner[m]!r} and {k!r}); a node is "
+                    "stepped by one step, alone or in one group"
+                )
+            owner[m] = k
+            flat[m] = step
+    return flat, groups
+
+
+def _leading(tree, batch: int) -> bool:
+    """Whether every array leaf of ``tree`` has a leading axis of ``batch`` entries."""
+    leaves = [x for x in jax.tree_util.tree_leaves(tree) if eqx.is_array(x)]
+    return all(jnp.ndim(x) >= 1 and jnp.shape(x)[0] == batch for x in leaves)
+
+
+def _rows(tree, index):
+    """``tree`` at the replicas ``index`` (its arrays' leading axis); other leaves as they are."""
+    return jax.tree_util.tree_map(lambda x: x[index] if eqx.is_array(x) else x, tree)
+
+
+def _check_per_replica(per_replica, params, carries, batch) -> SystemParams:
+    """Check ``per_replica`` (which inputs carry a leading replica axis: ``"params"`` and stepped
+    nodes' seeds in ``carries``) and return the params of one replica, which the structure pass
+    reads; per-replica params must agree across the replicas in what is structure (the
+    durations and the actuator kernels)."""
+    if isinstance(per_replica, str) or not isinstance(per_replica, Collection):
+        raise TypeError(
+            f"run: per_replica={per_replica!r}; pass a collection naming the inputs that carry "
+            'a leading replica axis: "params" and stepped nodes whose seed in carries does'
+        )
+    per_replica = set(per_replica)
+    unknown = sorted(per_replica - {"params"} - set(carries))
+    if unknown:
+        raise ValueError(
+            f'run: per_replica names {unknown}, which is neither "params" nor a node seeded in '
+            "carries; name the inputs that carry a leading replica axis"
+        )
+    for name in sorted(per_replica):
+        tree = params if name == "params" else carries[name]
+        if not _leading(tree, batch):
+            what = "params" if name == "params" else f"the seed of {name!r} in carries"
+            raise ValueError(
+                f"run: per_replica names {name!r}, and an array of {what} has no leading axis "
+                f"of batch={batch} entries; give every array of it a leading replica axis "
+                "(envs.generative.broadcast_params(tree, batch) for the shared ones, then "
+                "replace those that differ), or drop it from per_replica to share it"
+            )
+    if "params" not in per_replica:
+        return params
+    for field in ("durations", "actuator"):
+        tables = [getattr(params, field)] + [
+            getattr(part, field) for part in (params.parts or {}).values()
+        ]
+        for leaf in jax.tree_util.tree_leaves(tables):
+            if eqx.is_array(leaf) and not bool(jnp.all(leaf == leaf[:1])):
+                raise ValueError(
+                    f"run: params.{field} differs across the replicas of batch=; the "
+                    f"{field} are structure the structure pass reads once (the clock table, "
+                    "the actuator's draws), so share them: give every replica the same values"
+                )
+    return _rows(params, 0)
+
+
+def _replica_keys(key, batch: int) -> Array:
+    """The replicas' run keys (design batched-run.md R10): replica ``b`` runs under
+    ``fold_in(key, b)``, or under ``key[b]`` where ``key`` is a stack of ``batch`` keys."""
+    key = jnp.asarray(key)
+    typed = jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key)
+    single = key.ndim == (0 if typed else 1)
+    if single:
+        return jax.vmap(lambda b: jax.random.fold_in(key, b))(jnp.arange(batch))
+    if key.ndim != (1 if typed else 2) or key.shape[0] != batch:
+        raise ValueError(
+            f"run: key has shape {tuple(key.shape)}; under batch={batch} pass one key (replica b "
+            f"runs under fold_in(key, b)) or a stack of {batch} keys, one per replica"
+        )
+    return key
+
+
+def _joined(outs: list, batch: int):
+    """The passes' results joined on the replica axis and cut to ``batch`` replicas (the last
+    pass's copies dropped)."""
+    parts = [eqx.partition(o, eqx.is_array) for o in outs]
+    dynamic = jax.tree_util.tree_map(
+        lambda *xs: jnp.concatenate(xs)[:batch], *[d for d, _ in parts]
+    )
+    return eqx.combine(dynamic, parts[0][1])
+
+
+def _spread(dynamic):
+    """The scan's state with its replica axis sharded over the local devices where there are
+    several and they divide the pass (a CPU host given ``--xla_force_host_platform_device_count``,
+    or several accelerators), so the replicas run in parallel; as it is otherwise."""
+    devices = jax.local_devices()
+    leaves = jax.tree_util.tree_leaves(dynamic)
+    if len(devices) < 2 or not leaves or jnp.shape(leaves[0])[0] % len(devices):
+        return dynamic
+    mesh = jax.sharding.Mesh(np.asarray(devices), ("replicas",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("replicas"))
+    return jax.device_put(dynamic, sharding)
+
+
+def _reset(engine: _Engine, key, seeds, home) -> _State:
+    """The reset (section 4.4): each node's first call, with no observation, in node order with
+    the reset keys; the state entering round 0."""
+    system, nodes = engine.system, engine.nodes
+    values: dict[str, Array | None] = {v: None for n in nodes for v in n.outs}
+    live = {n.name: seeds.get(n.name) for n in nodes}
+    key, k_reset = jax.random.split(key)
+    for node, k in zip(nodes, _reset_keys(k_reset, engine.count), strict=True):
+        view, vparams = _reset_view(system, node, home)
+        out, live[node.name], _ = engine._call(node, view, k, None, live[node.name], vparams)
+        out = _check_out(node, out, engine.types, system, reset=True)
+        values.update(out)
+    held = {
+        n.name: (jnp.zeros((), jnp.int32), {a: _null(engine.types[a]) for a in n.chosen})
+        for n in nodes
+        if n.name in engine.clocks
+    }
+    return _State(key, values, live, home, held, _sweep_key(key, engine.count))
+
+
+class _Simulation:
+    """The replicas of one run, pass by pass: the reset, the rounds on concrete values while the
+    state's shapes change (round 0 and at most :data:`_SETTLE` more), and the compiled scan of
+    the rounds after them, a host loop over chunks of ``chunk`` rounds (one program re-run).
+    Under ``batch=`` every call is vmapped over the pass's replicas: the reset and the concrete
+    rounds as vmapped calls, the scan as a vmapped scan. The program compiled in the first pass
+    serves every pass after it, which settles at the same round."""
+
+    def __init__(self, engine: _Engine, ticks: int, chunk, fields, batched: bool):
+        self.engine = engine
+        self.ticks = ticks
+        self.chunk = chunk
+        self.fields = fields
+        self.batched = batched
+        self.compiled = None
+        self.static = None
+        self.settled: int | None = None
+        self.passes = 0
+        self.timing: dict[str, Any] = {
+            "compile": 0.0,
+            "scan": 0.0,
+            "scanned": 0,
+            "concrete_seconds": 0.0,
+            "chunks": [],
+        }
+
+    def run(self, key, seeds, home, seed_axes=None, home_axis=None):
+        engine, ticks = self.engine, self.ticks
+        begun = time.perf_counter()
+        if self.batched:
+            state = eqx.filter_vmap(
+                functools.partial(_reset, engine), in_axes=(0, seed_axes, home_axis)
+            )(key, seeds, home)
+        else:
+            state = _reset(engine, key, seeds, home)
+        start = {
+            n.name: {v: state.values[v] for v in n.outs if state.values[v] is not None}
+            for n in engine.nodes
+        }
+        reset_carries = dict(state.carries)
+        heads: list = []
+        rest = None
+        t = 0
+        while t < ticks:
+            if t and (self.settled is None or t == self.settled):
+                self.timing["concrete_seconds"] += time.perf_counter() - begun
+                scanned = self._scan(state, t)
+                begun = time.perf_counter()
+                if scanned is not None:
+                    state, rest = scanned
+                    break
+            step = functools.partial(engine.round, t=t)
+            state, row = eqx.filter_vmap(step)(state) if self.batched else step(state)
+            heads.append(row)
+            state = _strong(state)
+            t += 1
+        if rest is None:
+            self.timing["concrete_seconds"] += time.perf_counter() - begun
+        final = {n.name: engine.read(n, state.values, state.values) for n in engine.nodes}
+        return state, start, reset_carries, heads, rest, final
+
+    def _scan(self, state, t):
+        """The rounds from ``t`` on, scanned in chunks: ``(state, records)``, or ``None`` where
+        the state has not settled (a round runs on concrete values first)."""
+        dynamic, static = eqx.partition(state, eqx.is_array)
+        remaining = self.ticks - t
+        length = remaining if self.chunk is None else min(self.chunk, remaining)
+        padded = -(-remaining // length) * length
+        if self.compiled is None or not _same_static(static, self.static):
+            last = self.ticks if padded != remaining else None
+            program = _scan_program(self.engine, static, self.fields, self.batched, last)
+            rounds = jnp.arange(t, t + length, dtype=jnp.int32)
+            try:
+                begun = time.perf_counter()
+                spread = _spread(dynamic) if self.batched else dynamic
+                compiled = program.lower(spread, rounds).compile()
+                self.timing["compile"] += time.perf_counter() - begun
+            except _Unsettled:
+                if t > _SETTLE or self.settled is not None:
+                    raise
+                return None
+            self.compiled, self.static, self.settled = compiled, static, t
+        dynamic = _spread(dynamic) if self.batched else dynamic
+        records = []
+        for s in range(t, t + padded, length):
+            rounds = jnp.arange(s, s + length, dtype=jnp.int32)
+            begun = time.perf_counter()
+            dynamic, record = jax.block_until_ready(self.compiled(dynamic, rounds))
+            seconds = time.perf_counter() - begun
+            records.append(record)
+            self.timing["scan"] += seconds
+            self.timing["chunks"].append(
+                {
+                    "pass": self.passes,
+                    "start": s,
+                    "rounds": min(length, self.ticks - s),
+                    "seconds": seconds,
+                }
+            )
+        if self.passes == 0:
+            self.timing["scanned"] += remaining
+        axis = 1 if self.batched else 0
+        if len(records) == 1 and padded == remaining:
+            return eqx.combine(dynamic, static), records[0]
+        joined = jax.tree_util.tree_map(
+            lambda *xs: jax.lax.slice_in_dim(jnp.concatenate(xs, axis), 0, remaining, axis=axis),
+            *records,
+        )
+        return eqx.combine(dynamic, static), joined
 
 
 def _sweep_key(key: Array, count: int) -> Array:
@@ -2046,36 +2786,56 @@ def _box_value(name: str, port: str, value, kind: str, size: int) -> Array:
 # ----------------------------------------------------------------------- the trajectory
 
 
-def _series(head: list, body, tail: list, null: Array) -> tuple[Array, Array]:
+def _series(
+    head: list, body, tail: list, null: Array, batch=None, flags=None
+) -> tuple[Array, Array]:
     """A record over rounds: the values of ``head`` (arrays or ``None``), the rows of ``body`` (an
     array stacked over the scanned rounds, or ``None``) and the values of ``tail``, absent ones as
-    zeros of the first present shape; with the flags of which were present."""
-    rows = 0 if body is None else body.shape[0]
+    zeros of the first present shape; with the flags of which were present. Under ``batch=``
+    every value has a leading replica axis and ``body`` its rounds second; the rounds are then
+    the second axis of the series, and the flags are broadcast over the replicas. ``flags``
+    gives a head entry's presence where its record holds it (``None`` entries: from its
+    value)."""
+    lead = () if batch is None else (batch,)
+    axis = len(lead)
+    rows = 0 if body is None else body.shape[axis]
     like = next((v for v in head if v is not None), None)
     if like is None and rows:
-        like = jnp.zeros(body.shape[1:], body.dtype)
+        like = jnp.zeros(lead + body.shape[axis + 1 :], body.dtype)
     if like is None:
-        like = next((v for v in tail if v is not None), null)
+        like = next((v for v in tail if v is not None), None)
+    if like is None:
+        like = jnp.broadcast_to(null, lead + jnp.shape(null))
     like = jnp.asarray(like)
     parts, present = [], []
-    for v in head:
-        parts.append((jnp.zeros_like(like) if v is None else jnp.asarray(v))[None])
-        present.append(v is not None)
+
+    def row(v):
+        return jnp.expand_dims(jnp.zeros_like(like) if v is None else jnp.asarray(v), axis)
+
+    for i, v in enumerate(head):
+        parts.append(row(v))
+        flag = None if flags is None else flags[i]
+        present.append(v is not None if flag is None else flag)
     if rows:
         parts.append(body)
         present.extend([True] * rows)
     for v in tail:
-        parts.append((jnp.zeros_like(like) if v is None else jnp.asarray(v))[None])
+        parts.append(row(v))
         present.append(v is not None)
-    stacked = jnp.concatenate(parts) if parts else jnp.zeros((0, *like.shape), like.dtype)
-    return stacked, jnp.asarray(present, dtype=bool)
+    if parts:
+        stacked = jnp.concatenate(parts, axis)
+    else:
+        stacked = jnp.zeros(lead + (0, *like.shape[axis:]), like.dtype)
+    if not present:
+        return stacked, jnp.zeros(lead + (0,), bool)
+    return stacked, jnp.stack([jnp.broadcast_to(jnp.asarray(p, bool), lead) for p in present], -1)
 
 
-def _unstacked(stacked, static, rows: int) -> list:
-    """The ``rows`` entries of a tree stacked over rounds, each recombined with ``static`` (the
-    leaves that are no arrays)."""
+def _unstacked(stacked, static, rows: int, axis: int = 0) -> list:
+    """The ``rows`` entries of a tree stacked over rounds (on ``axis``), each recombined with
+    ``static`` (the leaves that are no arrays)."""
     leaves, treedef = jax.tree_util.tree_flatten(stacked)
-    columns = [list(jnp.unstack(leaf)) if rows else [] for leaf in leaves]
+    columns = [list(jnp.unstack(leaf, axis=axis)) if rows else [] for leaf in leaves]
     return [eqx.combine(treedef.unflatten([c[t] for c in columns]), static) for t in range(rows)]
 
 
@@ -2092,13 +2852,15 @@ def _assemble_record(
     heads,
     rest,
     final,
-    record_carries,
+    fields,
+    batch=None,
 ) -> Trajectory:
     table = dict(system.subsystems)
     order = list(table)
     modality_types = system._modality_types(system._params_in(params, "run"))
     control_types = {u: t for u, t in ports.ins.items() if u in system._table.control_names}
     records: dict[str, Trajectory] = {}
+    lead = () if batch is None else (batch,)
 
     def slot_null(node: _Node, slot: str) -> Array:
         t = modality_types.get(slot) or control_types.get(slot) or types[node.reads[slot]]
@@ -2108,43 +2870,56 @@ def _assemble_record(
         return None if rest is None else rest[field][name][key]
 
     for node in nodes:
-        rec: dict[str, Array] = {}
-        pres: dict[str, Array] = {}
-        for slot in node.reads:
-            rec[slot], pres[slot] = _series(
-                [h["received"][node.name][slot] for h in heads],
-                body("received", node.name, slot),
-                [final[node.name][slot]],
-                slot_null(node, slot),
-            )
-        em: dict[str, Array] = {}
-        for v in node.outs:
-            em[v], _ = _series(
-                [h["emitted"][node.name][v] for h in heads],
-                body("emitted", node.name, v),
-                [],
-                _null(types[v]),
-            )
-        it: dict[str, Array] = {}
-        for a in node.chosen:
-            it[a], _ = _series(
-                [h["intended"][node.name][a] for h in heads],
-                body("intended", node.name, a),
-                [],
-                _null(types[a]),
-            )
+        rec: dict[str, Array] | None = None
+        pres: dict[str, Array] | None = None
+        if "received" in fields:
+            rec, pres = {}, {}
+            for slot in node.reads:
+                rec[slot], pres[slot] = _series(
+                    [h["received"][node.name][slot] for h in heads],
+                    body("received", node.name, slot),
+                    [final[node.name][slot]],
+                    slot_null(node, slot),
+                    batch,
+                    [h.get("present", {}).get(node.name, {}).get(slot) for h in heads],
+                )
+        em: dict[str, Array] | None = None
+        if "emitted" in fields:
+            em = {}
+            for v in node.outs:
+                em[v], _ = _series(
+                    [h["emitted"][node.name][v] for h in heads],
+                    body("emitted", node.name, v),
+                    [],
+                    _null(types[v]),
+                    batch,
+                )
+        it: dict[str, Array] | None = None
+        if "intended" in fields:
+            it = {}
+            for a in node.chosen:
+                it[a], _ = _series(
+                    [h["intended"][node.name][a] for h in heads],
+                    body("intended", node.name, a),
+                    [],
+                    _null(types[a]),
+                    batch,
+                )
         decided, _ = _series(
-            [jnp.asarray(h["decided"][node.name]) for h in heads],
+            [jnp.broadcast_to(jnp.asarray(h["decided"][node.name]), lead) for h in heads],
             None if rest is None else rest["decided"][node.name],
             [],
             jnp.zeros((), bool),
+            batch,
         )
         log = None
-        if record_carries:
+        if "carries" in fields:
             log = [reset_carries[node.name], *(h["carries"][node.name] for h in heads)]
             if rest is not None:
                 static = eqx.filter(state.carries[node.name], eqx.is_array, inverse=True)
-                log.extend(_unstacked(rest["carries"][node.name], static, ticks - len(heads)))
+                log.extend(
+                    _unstacked(rest["carries"][node.name], static, ticks - len(heads), len(lead))
+                )
             log = tuple(log)
         records[node.name] = Trajectory(
             None,
@@ -2170,10 +2945,13 @@ def _assemble_record(
         prefix = f"{name}{SEPARATOR}" if name else ""
         parts = {k.removeprefix(prefix): v for k, v in kids.items()}
 
-        def merged(field: str) -> dict:
+        def merged(field: str) -> dict | None:
             out = {}
             for rel, part in parts.items():
-                out.update({f"{rel}{SEPARATOR}{k}": x for k, x in getattr(part, field).items()})
+                value = getattr(part, field)
+                if value is None:
+                    return None
+                out.update({f"{rel}{SEPARATOR}{k}": x for k, x in value.items()})
             return out
 
         def collected(field: str, keep_none: bool = False) -> dict | None:
@@ -2210,16 +2988,36 @@ def _assemble_record(
 
     top = {k: build(k) for k in order if parents[k] is None}
     root = union("", {k: v for k, v in top.items() if v is not None})
-    faults = {}
+    return root._replace(params=state.home, faults=_faults(heads, rest, ticks, batch))
+
+
+def _faults(heads: list, rest, ticks: int, batch=None) -> dict:
+    """The record's faults, a bool per round (and replica) under each label raised in any round:
+    the concrete rounds' (under ``batch=``, where they are traced) and the scan's."""
+    lead = () if batch is None else (batch,)
+    axis = len(lead)
+    labels = [label for h in heads for label in h["faults"]]
     if rest is not None:
-        for label, flags in rest["faults"].items():
-            faults[label] = jnp.concatenate(
-                [jnp.zeros((len(heads),), bool), jnp.asarray(flags, bool)]
-            )
-    return root._replace(params=state.home, faults=faults)
+        labels.extend(rest["faults"])
+    scanned = ticks - len(heads)
+    out = {}
+    for label in dict.fromkeys(labels):
+        parts = [
+            jnp.broadcast_to(jnp.asarray(h["faults"].get(label, False), bool), lead)[..., None]
+            for h in heads
+        ]
+        if rest is not None:
+            flags = rest["faults"].get(label)
+            if flags is None:
+                flags = jnp.zeros(lead + (scanned,), bool)
+            parts.append(jnp.asarray(flags, bool))
+        out[label] = jnp.concatenate(parts, axis)
+    return out
 
 
-def _relative(values: Mapping[str, Any], node: str) -> dict[str, Any]:
+def _relative(values: Mapping[str, Any] | None, node: str) -> dict[str, Any] | None:
+    if values is None:
+        return None
     prefix = f"{node}{SEPARATOR}"
     return {k.removeprefix(prefix): v for k, v in values.items()}
 
@@ -2234,6 +3032,12 @@ def run(
     tick_order: TickOrder = "simultaneous",
     carries: Mapping[str, Any] | None = None,
     record_carries: bool = False,
+    *,
+    batch: int | None = None,
+    record: Collection[str] | None = None,
+    chunk: int | None = None,
+    replicas_per_pass: int | None = None,
+    per_replica: Collection[str] = (),
 ) -> Trajectory:
     """Step a closed System for ``ticks`` rounds and record a :class:`Trajectory`.
 
@@ -2260,6 +3064,42 @@ def run(
     record what it sees in its carry). A check of a value that fails after round 0 is recorded
     in ``Trajectory.faults`` and the run goes on; round 0 refuses it.
 
+    ``batch=B`` runs ``B`` replicas by one program (module docstring, *Replicas*): replica ``b``
+    is the unbatched run under ``fold_in(key, b)``, or under ``key[b]`` when ``key`` is a stack
+    of ``B`` keys. Every array of the record gains a leading replica axis (``decided``,
+    ``present``, ``faults``, the final ``carry`` and ``params`` included; ``carries`` stays a
+    tuple over rounds, each carry's arrays leading with the replicas); ``batch=1`` keeps an axis
+    of length one, and ``batch=None`` gives the unbatched record. Inputs are shared unless
+    ``per_replica`` names them: ``"params"`` (every array with a leading axis of ``B``,
+    ``envs.generative.broadcast_params`` then the leaves that differ replaced; the durations and
+    actuator kernels, which are structure, must agree across the replicas) and a stepped node
+    whose seed in ``carries`` leads with ``B``. Round 0 is traced under ``batch=``, so a check
+    it refuses unbatched is a recorded fault there. ``replicas_per_pass`` runs the replicas in
+    host passes of at most that many (the last filled with copies of the last replica, dropped),
+    one compiled program for all, bounding working memory, which is linear in the replicas a pass
+    holds; ``None`` is one pass. Under async each replica's order is a switch over the distinct
+    derived orders that vmap evaluates in full (cost: the number of orders times the step work),
+    refused above four sources.
+
+    ``record`` names the fields stacked over rounds (``"received"`` with its ``present``,
+    ``"emitted"``, ``"intended"``, ``"carries"``; default all but ``"carries"``, which
+    ``record_carries=True`` adds; ``decided`` and ``faults`` are always kept); a field not
+    recorded is ``None``. ``chunk`` runs the scan as a host loop over compiled chunks of that
+    many rounds (one program re-run; a last chunk shorter than ``chunk`` runs padded rounds that
+    change nothing and are dropped), ``None`` as one scan. ``Trajectory.timing`` holds the host's
+    wall time: ``compile`` (the scan program, once), ``scan`` (its execution over every chunk
+    and pass) over ``scanned`` rounds, ``concrete`` (the rounds run before the scan) and
+    ``concrete_seconds`` (the resets and those rounds, their steps' own compiles included),
+    ``chunks`` (each chunk's ``pass``, ``start``, ``rounds`` and ``seconds``), ``passes`` and
+    ``replicas_per_pass``.
+
+    A key of ``steps`` may be a tuple of nodes, a group stepped by one vmapped call (module
+    docstring, *Groups*); refused, naming the fix: views that differ beyond their names in
+    static structure, a group mixing nodes another node's action drives with nodes none drives
+    or clocked with unclocked nodes (or clocked on different durations), a node named twice,
+    and a group whose members do not step one after another in the sequential order or in an
+    async order.
+
     Refused, each naming the fix: an open System; ``steps`` that is not an antichain covering
     every leaf, that names no component, or that names a non-leaf node and a ``sample()`` leaf
     beneath it; a step that omits an emission or an action node of its node on a round; a cycle
@@ -2273,7 +3113,22 @@ def run(
     or ``sample()`` on one, a step marked ``sliced`` on one, a node planned jointly with one
     beneath it and an in-port of one that nothing drives are refused.
     """
-    return _run(system, params, ticks, key, steps, clocks, tick_order, carries, record_carries)
+    return _run(
+        system,
+        params,
+        ticks,
+        key,
+        steps,
+        clocks,
+        tick_order,
+        carries,
+        record_carries,
+        batch=batch,
+        record=record,
+        chunk=chunk,
+        replicas_per_pass=replicas_per_pass,
+        per_replica=per_replica,
+    )
 
 
 # ----------------------------------------------------------------------- shared checks
