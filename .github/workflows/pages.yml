@@ -27,6 +27,8 @@ jobs:
           python-version: "3.12"
       - name: Install the package with the docs extra
         run: python -m pip install -e ".[docs]"
+      - name: Check project page matches its sources
+        run: python docs/site/build_page.py --check
       - name: Assemble the site
         env:
           # the reference's logo links back to the project page at the site's root

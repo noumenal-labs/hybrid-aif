@@ -1,0 +1,37 @@
+# Lint, format, site consistency, build, and unit test suite.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip build
+          python -m pip install -e ".[dev]"
+      - name: Lint and check formatting
+        run: |
+          ruff check .
+          ruff format --check src tests examples
+      - name: Check project page matches its sources
+        run: python docs/site/build_page.py --check
+      - name: Build sdist and wheel
+        run: python -m build
+      - name: Run test suite
+        run: pytest -n auto
