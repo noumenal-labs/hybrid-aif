@@ -294,8 +294,9 @@ The binding design rule is correspondingly about interfaces, not placement:
 **loops exchange only value-semantic, serializable pytrees — sufficient
 statistics of beliefs, parameters, and policy posteriors — never callables
 or shared mutable state.** Colocated deployments pass the same pytrees in
-memory and may fuse all three loops into one jit'd program (the
-pymdp-style fused rollout remains the default for simulation); a deployment
+memory and may fuse all three loops into one jit'd program (`run` over a closed
+System, one compiled `lax.scan` of rounds with replicas by `batch=`, is the
+simulation path; the pymdp-style `rollout` was retired in 0.22.0); a deployment
 boundary serializes the identical objects (beliefs are small pytrees;
 parameters use the sidecar format; structure uses the versioned spec). This
 contract is AIF-native rather than bolted on: timescale-separated levels
@@ -432,7 +433,7 @@ research-tier (novel, needs experiments).
 | C | **Continuous/mixture kernels** [E→R] | LGSSM filter/smoother; GMM indicator-CAVI; PG-CAVI MNLR; Runnalls/IMM reduction; NumPyro fallback | A |
 | D | **Objective/metrics layer** [E] | EFE term registry; per-node estimators (incl. entropy bound pairs); ablation flags; metrics trees; expectations via pluggable `SamplerBackend` | A |
 | E | **Policy search** [E] | enumeration; CEM/MPPI/gradient; SI tree (landed 2026-09-29 as the exact, unpruned sophisticated recursion over declared `branch_on` modalities — PR #6, external contribution) + mctx | A, D |
-| F | **System/env + rollout** [E] | functional Env; scan rollouts; `System` composition; tick runtime with transducer slots (host-side encoders sequenced with the jitted step); hierarchical conditional priors (`D_deps`, landed: ancestral joint sampling in `as_env`, mean-field marginal resolution via `initial_priors`; fully tabular hierarchical models classify discrete) | — |
+| F | **System/env + run** [E] | functional Env; `run` over a closed System (one compiled `lax.scan` of rounds, replicas by `batch=`; the scan `rollout` retired in 0.22.0, `design/batched-run.md` R14); `System` composition; tick runtime with transducer slots (host-side encoders sequenced with the jitted step); hierarchical conditional priors (`D_deps`, landed: ancestral joint sampling in `as_env`, mean-field marginal resolution via `initial_priors`; fully tabular hierarchical models classify discrete) | — |
 | G | **Data pipeline** [E] | format registry; HDF5 + Lance; ReplayBuffer; goal relabeling; teacher-trace columns (beliefs + per-policy term trees) | — |
 | H | **Learned-representation nodes** [R] | JEPA pseudo-observation node + SIGReg (exact-VFE per arXiv:2607.13612); state-epistemic coverage term; ensemble info-gain; frozen-encoder adapter (V-JEPA-class latents as pseudo-observations with injected precision) | A, C, D |
 | I | **Preference learning** [R] | phenotypic-prior node family; learned/online preference priors | A, D |
@@ -837,15 +838,18 @@ already designed, carrying a stated gate on when they must be paid.
     two-tier story becomes energy management; the wall belongs in the vehicle step (a clip,
     propagated unscented), after which the Gaussian-mixture preference is a constraint no
     longer needed but still the carrier of the page's G bracket. A 0.22 decision.
-  - *A batch axis for `run`* (2026-11-17, the multi-rover survey). `run` is a Python round
-    loop with no batch axis; the only vmapped simulation is `rollout` over the `Env` interface,
-    and `replay.stack_traces` for replays. Replicas of a closed System (seeds, starts) run one
-    after another today. The build: a traceable round body (holds as masked steps, write-backs
-    traced, every step jittable), dynamic rather than static slicing of a view at a driven
-    node's realised level (the blocker: replicas or copies at different option levels must
-    share one program), then `vmap` over replicas. The same body vmapped over copies of one
-    leaf within a round, write-backs summed at the boundary, is the batched leaf the two-rover
-    demo wants; the two are one build.
+  - *A batch axis for `run`* (2026-11-17, the multi-rover survey). **Landed in 0.22.0**:
+    `run` is one compiled `lax.scan` of rounds from the reset, `batch=` runs replicas by one
+    program (per-replica keys, params and seeds, `record=`, `chunk=`, passes), spread over the
+    devices by `shard_map`, and a tuple key of `steps` steps copies of one leaf by one vmapped
+    call; `rollout` is retired. The record, its rulings, deviations and measurements:
+    `design/batched-run.md` (R1–R14, the as-built sections of Phases A–C).
+  - *Pass sizing from the memory estimator.* `run(..., batch=B)` could size
+    `replicas_per_pass` from `branching_tree_memory` (the sophisticated planner's memory
+    estimate) instead of the caller choosing. Deferred past 0.22.0 by Alex on 2026-11-17: it
+    needs a design that pays attention to the worst-case failures of a bad estimate (an
+    underestimate that exhausts memory mid-run, an overestimate that serialises a batch that
+    would fit); the caller sets the number by hand today.
   - *Small.* `dataclasses.replace(s, branch_on=())` on a System declared through
     `sophisticated=` re-lowers silently; nine Markdown files fail `ruff format` at HEAD
     (ruff 0.17.3 formats code blocks in Markdown).

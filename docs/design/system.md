@@ -180,8 +180,11 @@ which carries the finding and the two candidate engine fixes).
 One System's action nodes pair with another's observation modalities; its
 observation modalities pair with the other's outputs (blanket-typed
 edges). v0.1 builds exactly one coupling shape: agent-System × env
-(`Env` interface) through the existing `rollout` driver, whose
-`policy_fn(key, history, t)` seam is where `act` plugs in. Hierarchical
+(`Env` interface) through the then-existing `rollout` driver, whose
+`policy_fn(key, history, t)` seam is where `act` plugs in. *(2026-11-17: the
+simulation path is `run` over a closed System, `couple`d to a mirror or a black
+box, batched over replicas with `batch=`; `rollout` was retired in 0.22.0,
+`batched-run.md` R14.)* Hierarchical
 nesting (System-of-Systems, transducer slots at the outermost boundary)
 is designed here in vocabulary but deliberately unbuilt until after v0.1.
 *2026-11-06: hierarchical nesting is now a shape of `merge` (a component whose bindings are a
@@ -342,9 +345,9 @@ it: content pinned to an external target (a paper's architecture, a
 benchmark env, an oracle's numbers), free to churn without an engine API
 break, and never imported by the engine.
 
-**The cut is abstraction vs. instances.** `rollout` is typed by `Env` and
-`as_env` returns a `GenerativeEnv`, so both are load-bearing engine
-types; a concrete T-maze or Mountain Car is a *target* we reproduce, and
+**The cut is abstraction vs. instances.** `env_step` (a black box's step) and
+`sample()` run an `Env`, and `as_env` returns a `GenerativeEnv`, so both are
+load-bearing engine types (`rollout`, once typed by `Env`, was retired in 0.22.0); a concrete T-maze or Mountain Car is a *target* we reproduce, and
 targets are reference. The same cut is why `inference/rssm.py`
 (`RSSMCore`, engine machinery) stays put while `worlds.tiny_rssm` (that
 machinery *placed* to match a paper) moves.

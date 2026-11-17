@@ -51,6 +51,7 @@ from hybrid_aif.composition import (
 from hybrid_aif.distributions import ConditionalGaussian
 from hybrid_aif.reads import Emission
 from hybrid_aif.system.emissions import identity, indicator
+from tests.host_log import unflagged
 
 GRID = Grid(shape=(2, 2), low=0.0, high=2.0)
 CELLS = GRID.n_cells
@@ -152,7 +153,7 @@ def _recorded(step, log, mind: str):
         if obs is not None:
             #  logged on the host: the rounds after the first run in one compiled scan
             jax.debug.callback(
-                lambda o, c: log.append((mind, o, c)), dict(obs), carry, ordered=True
+                lambda o, c: log.append((mind, unflagged(o), c)), dict(obs), carry, ordered=True
             )
         return step(system, key, obs, carry, params)
 

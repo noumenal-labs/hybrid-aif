@@ -22,12 +22,25 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from hybrid_aif.composition import Identify, couple, merge, plan, run, sample
+from hybrid_aif.composition import (
+    Identify,
+    black_box,
+    couple,
+    env_step,
+    merge,
+    plan,
+    run,
+    sample,
+    with_mirror,
+)
+from hybrid_aif.composition import runner as runner_module
+from hybrid_aif.controls import LEVEL
 from hybrid_aif.envs.generative import broadcast_params
 from hybrid_aif.system.mirror import mirror
 from tests.test_action_nodes import pusher
 from tests.test_clocks import robots, steps_of
 from tests.test_run import COUNTS, KEY, field_step, shared_field, two_node_leaf, wire
+from tests.test_system import _cc, tmaze_system
 
 ORDERS = ("simultaneous", "sequential", "async")
 
@@ -141,12 +154,12 @@ def test_passes_and_chunks_change_no_number():
         per_pass = kwargs.get("replicas_per_pass", 5)
         assert split.timing["passes"] == -(-5 // per_pass)
         chunks = split.timing["chunks"]
-        assert sum(c["rounds"] for c in chunks if c["pass"] == 0) == split.timing["scanned"] == 12
+        assert sum(c["rounds"] for c in chunks if c["pass"] == 0) == split.timing["scanned"] == 13
     alone = run(system, params, 13, KEY, steps_of(plan(selection="stochastic")))
     chunked = run(system, params, 13, KEY, steps_of(plan(selection="stochastic")), chunk=5)
     for (path, x), (_, y) in zip(record_of(alone, False), record_of(chunked, False), strict=True):
         np.testing.assert_array_equal(x, y, err_msg=jax.tree_util.keystr(path))
-    assert [c["rounds"] for c in chunked.timing["chunks"]] == [5, 5, 2]
+    assert [c["rounds"] for c in chunked.timing["chunks"]] == [5, 5, 3]
 
 
 def test_record_names_the_fields_stacked_over_rounds():
@@ -269,8 +282,8 @@ def test_a_non_positive_dirichlet_sum_is_a_fault_of_its_replica_and_the_run_goes
     """Two learners decay the shared concentration by 0.3 each a round, from 1.0, 2.0 and 0.5 by
     replica (``per_replica=["params"]``). A sum that is not positive is recorded in the faults of
     its replica and round, the variable keeping its round-start value, and every round runs;
-    under ``batch=`` round 0 is traced too, so replica 2's fault there is recorded, not refused
-    (unbatched, round 0 refuses it)."""
+    round 0 is traced too, so replica 2's fault there is recorded, as it is in the unbatched run
+    of that replica."""
     system, params = shared_field(COUNTS)
     steps = {"A": field_step("A", -0.3), "B": field_step("B", -0.3)}
     home = broadcast_params(params, 3)
@@ -291,8 +304,8 @@ def test_a_non_positive_dirichlet_sum_is_a_fault_of_its_replica_and_the_run_goes
     assert traj["A"].emitted["a1"].shape == (3, 4)
     third = home.parameters["A.field"].concentration[2]
     mine = eqx.tree_at(lambda p: p.parameters["A.field"].concentration, params, third)
-    with pytest.raises(ValueError, match="not positive after the views of"):
-        run(system, mine, 4, KEY, steps)
+    alone = run(system, mine, 4, KEY, steps)
+    np.testing.assert_array_equal(alone.faults["A.field"], [True, True, True, True])
 
 
 # ----------------------------------------------------------------------- groups (R12, pin 3)
@@ -443,3 +456,131 @@ def test_the_corridor_minds_under_async_with_batch_four_are_their_unbatched_runs
     for b in range(4):
         alone = run(system, params, 8, jax.random.fold_in(KEY, b), steps, tick_order="async")
         assert_replica(alone, batched, b, exact=False, carries=False)
+
+
+# --------------------------------------------------------------- devices (design Phase C)
+
+
+@pytest.mark.parametrize(
+    "size, count, plan_", [(10, 16, (10, 1)), (16, 8, (8, 2)), (13, 8, (7, 2)), (5, 1, (1, 5))]
+)
+def test_a_pass_is_spread_over_the_fewest_devices_at_the_lowest_load(
+    monkeypatch, size, count, plan_
+):
+    """A pass of ``size`` replicas over ``count`` local devices: the fewest replicas per device
+    the devices allow, then the fewest devices holding the pass at that load (ten replicas on
+    sixteen devices run on ten; thirteen on eight run two each on seven, one copy added)."""
+    monkeypatch.setattr(runner_module.jax, "local_devices", lambda: [None] * count)
+    assert runner_module._devices_for(size) == plan_
+
+
+def test_the_device_count_is_in_the_timing():
+    system, params = wire()
+    traj = run(system, params, 3, KEY, pushers(), batch=2)
+    assert traj.timing["devices"] == 1 and traj.timing["replicas_per_device"] == 2
+    assert run(system, params, 3, KEY, pushers()).timing["devices"] == 1
+
+
+# ------------------------------------------------- rollout's coverage, on batched run (R14)
+
+
+def uniform_step(view, key, obs, carry, params):
+    """A step choosing each of its action nodes uniformly at random each round (the random
+    policy ``rollout`` drove an env with): one draw per action node from its own subkey."""
+    if obs is None:
+        return {}, carry, params
+    outs = view.ports(params).outs
+    names = [a for a in view.action_names if a is not None]
+    keys = jax.random.split(key, len(names))
+    action = {
+        a: jax.random.randint(k, (), 0, outs[a][1], jnp.int32)
+        for a, k in zip(names, keys, strict=True)
+    }
+    return action, carry, params
+
+
+def test_a_world_sampled_by_name_equals_its_positional_env_as_a_black_box():
+    """The keyed process and the positional one, as ``rollout`` compared them, on batched
+    ``run``: the T-maze model coupled to its mirror, the world stepped by ``sample()``, and the
+    model coupled to a black box running the positional T-maze (``env_step``), under the same
+    keys and the same random actions, give the same observations and states, replica for
+    replica."""
+    system, params = tmaze_system()
+    B, T = 2, 4
+    named, named_params = with_mirror(system, params)
+    keyed = run(
+        named,
+        named_params,
+        T,
+        KEY,
+        {"model": uniform_step, "world": sample()},
+        batch=B,
+        record_carries=True,
+    )
+    env, ep = system.as_env(params)
+    box = black_box(
+        ins={"a_location": (LEVEL, 5)},
+        outs={"location_obs": (LEVEL, 5), "reward": (LEVEL, 3), "cue": (LEVEL, 3)},
+    )
+    flat, flat_params = couple(
+        {"model": (system, params), "world": box},
+        [Identify("model.a_location", "world.a_location")]
+        + [Identify(f"world.{m}", f"model.{m}") for m in system.modality_names],
+    )
+    world = env_step(env.inner, system.to_positional("params", ep))
+    positional = run(
+        flat,
+        flat_params,
+        T,
+        KEY,
+        {"model": uniform_step, "world": world},
+        batch=B,
+        record_carries=True,
+    )
+    for m in system.modality_names:
+        assert keyed["world"].emitted[m].shape == (B, T)
+        np.testing.assert_array_equal(keyed["world"].emitted[m], positional["world"].emitted[m])
+    np.testing.assert_array_equal(
+        keyed["model"].emitted["a_location"], positional["model"].emitted["a_location"]
+    )
+    for named_state, flat_state in zip(
+        keyed["world"].carries, positional["world"].carries, strict=True
+    ):
+        for f, name in enumerate(system.names.states):
+            np.testing.assert_array_equal(named_state[f"world.{name}"], flat_state[f])
+
+
+def test_replicas_of_a_process_with_different_params_keep_its_structure():
+    """Four replicas of the T-maze model against its mirror, each with its own reward
+    probability (``per_replica=["params"]``), under random actions: the context never moves
+    within a replica, the location moves only along the maze's arms, and replicas under
+    different keys differ."""
+    from hybrid_aif.reference.envs.tmaze import tmaze
+    from hybrid_aif.system import SystemParams
+
+    system, _ = tmaze_system()
+    homes = []
+    for probability in (0.2, 0.5, 0.8, 1.0):
+        env, p = tmaze(reward_probability=probability)
+        positional = SystemParams(
+            likelihood=tuple(_cc(a, len(d)) for a, d in zip(p.likelihood, env.A_deps, strict=True)),
+            transition=tuple(
+                _cc(b, len(d) + 1) for b, d in zip(p.transition, env.B_deps, strict=True)
+            ),
+            initial_state_prior=tuple(
+                tmaze_system()[1].initial_state_prior[n] for n in system.names.states
+            ),
+        )
+        homes.append(with_mirror(system, system.from_positional("params", positional)))
+    named = homes[0][0]
+    stacked = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *[h for _, h in homes])
+    steps = {"model": uniform_step, "world": sample()}
+    traj = run(named, stacked, 10, KEY, steps, batch=4, per_replica=["params"], record_carries=True)
+    assert traj["model"].emitted["a_location"].shape == (4, 10)
+    states = traj["world"].carries
+    context = np.stack([np.asarray(c["world.context"]) for c in states], axis=1)
+    assert np.all(context == context[:, :1])
+    location = np.stack([np.asarray(c["world.location"]) for c in states], axis=1)
+    from_centre = location[:, :-1] == 0
+    assert np.all(np.isin(location[:, 1:][from_centre], [0, 3, 4]))
+    assert not np.array_equal(location[0], location[1])

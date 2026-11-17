@@ -93,3 +93,12 @@ def test_a_stochastic_merged_mind_draws_a_coordinated_policy():
 def test_from_the_asymmetric_start_both_split_at_tick_two():
     assert cm.split_tick(*cm.merged_episode(KEY, cm.ASYMMETRIC)) == 2
     assert cm.split_tick(*cm.coupled_episode(KEY, cm.ASYMMETRIC)) == 2
+
+
+def test_the_batched_comparison_is_the_episodes_one_by_one():
+    """``coupled_split_by_tick`` runs the episodes as the replicas of one batched ``run``
+    (design batched-run.md R10): each replica is the episode its key runs alone."""
+    one_by_one = cm.split_by_tick(cm.coupled_episode, 6, start=cm.SYMMETRIC, selection="stochastic")
+    batched = cm.coupled_split_by_tick(6, start=cm.SYMMETRIC, selection="stochastic")
+    np.testing.assert_array_equal(batched[1], one_by_one[1])
+    np.testing.assert_array_equal(batched[0], one_by_one[0])

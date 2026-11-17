@@ -120,7 +120,9 @@ def test_the_warm_start_reaches_the_descent_through_the_registered_planner_too()
     shifted plan as its ``init``: the run is the one of the planner made with the same defaults."""
     registered = run_mind(plan(trace=True, warm_start=True), rounds=3)["mind"].carries
     made = run_mind(plan(make_gradient_planner(), trace=True, warm_start=True), rounds=3)
-    assert registered[0].plan is None
+    # the carry after the reset holds a plan of zeros (its form from the reset on, design
+    # batched-run.md Phase C), the start the first round's shift of zeros gives
+    np.testing.assert_array_equal(np.asarray(registered[0].plan), np.zeros((HORIZON, 1)))
     for a, b in zip(registered[1:], made["mind"].carries[1:], strict=True):
         assert a.plan.shape == (HORIZON, 1)
         np.testing.assert_allclose(np.asarray(a.plan), np.asarray(b.plan), atol=1e-6)

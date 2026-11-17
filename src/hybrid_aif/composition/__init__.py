@@ -54,12 +54,22 @@ from hybrid_aif.composition.merge import (
     subsystem_states,
     write_back,
 )
-from hybrid_aif.composition.runner import MindCarry, Step, Trace, Trajectory, plan, run, sample
+from hybrid_aif.composition.runner import (
+    Maybe,
+    MindCarry,
+    Step,
+    Trace,
+    Trajectory,
+    plan,
+    run,
+    sample,
+)
 
 __all__ = [
     "Clamp",
     "Identify",
     "Link",
+    "Maybe",
     "MindCarry",
     "Step",
     "Trace",

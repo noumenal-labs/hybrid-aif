@@ -30,7 +30,6 @@ from hybrid_aif.description import build, describe
 from hybrid_aif.envs import GenerativeEnv
 from hybrid_aif.envs._process import DiscreteProcess
 from hybrid_aif.replay import replay, stack_traces
-from hybrid_aif.rollout import random_policy, rollout
 from hybrid_aif.system import System, SystemParams
 from tests.test_merge import OBSERVATION_BINDINGS, agent_and_world, merged
 from tests.test_system import tmaze_system
@@ -168,9 +167,12 @@ def test_every_action_face_keys_by_action_node_and_refuses_the_control_node():
     assert set(wrapped.null_action()) == {"a_location"}
     with pytest.raises(ValueError, match=f"step: actions {refusal}"):
         wrapped.step(KEY, state, by_control, system.to_positional("params", ep))
-    batched = jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (2, *x.shape)), ep)
-    traj = rollout(KEY, env, batched, random_policy(system, params), 3, 2)
-    assert set(traj.actions) == {"a_location"}
+    from tests.test_batched_run import uniform_step
+
+    steps = {"model": uniform_step, "world": sample()}
+    traj = run(*with_mirror(system, params), 3, KEY, steps, batch=2)
+    assert set(traj["model"].emitted) == {"a_location"}
+    assert set(traj["world"].received) == {"u_location"}
     observations, actions = _tmaze_trace(system, params)
     out = replay(system, params, observations, actions, metrics=False)
     assert list(out.chosen) == ["a_location"]

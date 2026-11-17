@@ -10,8 +10,13 @@ of ``steps`` form an antichain that covers every leaf. A step is the function
 - ``system`` and ``params`` are its view (the leaf's :func:`~hybrid_aif.composition.merge.subsystem`
   view, or the joint view) and the view's params, taken from the parameter home each round;
 - ``obs`` maps each of its modality slots and each control node a variable drives, by the slot's
-  own name, to the value of the variable that slot observes (``None`` where the variable has no
-  value yet); ``obs`` is ``None`` on the step's first call, its reset;
+  own name, to the value of the variable that slot observes; ``obs`` is ``None`` on the step's
+  first call, its reset. A slot whose variable may have no value yet at the step's turn (a
+  variable the reset left without a value, read before it is realised in round 0: at the round's
+  boundary, or before its owner's turn) is handed a :class:`Maybe` ``(value, present)`` every
+  round, ``value`` zeros of the variable's form and ``present`` false in round 0, the value and
+  true after; which slots these are is a static fact of the structure pass, and every other slot
+  is handed its value. ``plan()`` reads an absent value as an absent modality;
 - ``out`` maps its out-ports to values: the action nodes of the nodes it chooses (each an
   intended level, or a float vector for a continuous node) and its emissions;
 - the params returned are the very object handed in when the step did not learn; a learner's
@@ -55,7 +60,8 @@ back one parameter variable are combined only where it is Dirichlet counts: the 
 concentration plus the sum of their deltas, the posterior given both nodes' data, and a sum that
 is not positive is refused as ``write_back`` refuses one; for any other form two ``plan()`` steps
 whose ``learn`` both reach the variable are refused before the first round, and two other steps
-that both wrote it back in one round are refused at that round's boundary. Under
+that both wrote it back in one round are recorded as a fault of that round (the variable keeps
+its round-start value), as is a sum that is not positive. Under
 ``"sequential"`` and ``"async"`` a write-back is live: the next view is taken from the home as it
 then stands.
 
@@ -83,31 +89,46 @@ nodes excluded) from its kernel's column at the intended level with key ``i`` of
 ``split(fold_in(k, ACTUATOR_TAG), A)``. An emission is realised with the owner's step key folded
 by ``EMIT_TAG``.
 
-**The compiled round.** A run is the structure pass, the reset, round 0 and one compiled
-``lax.scan`` of the rounds after it. The structure pass reads structure, not values, on the host
-before any step is called: the antichain, the order (under async every distinct derived order),
-the clock table (the rounds an option lasts at every level of each durations table, each
-validated), and the refusals above. The reset and round 0 run on concrete values (round 0 is the
-round body called on them, where a variable may still have no value and a step's carry takes
-its form); every round after it is the same body traced once and scanned, so a step is a traced
-function: its outputs JAX arrays of the shapes of round 0, its carry and its params of the
-structure it was handed, and nothing host-side (``np.asarray``, ``float()``, a Python branch on a
-value) on what it is handed, which is refused naming the step. The view of a sliced step is
-taken every round with its level a traced index (one System serves every level); a clocked
-node's decide-or-hold is a ``lax.cond``, its count an int32 array; write-backs are applied by
-arithmetic on the values. A check of a value that fails inside the scan cannot raise: it is
-recorded in ``Trajectory.faults`` (a write-back that was not applied, a level out of range, a
-step that changed its params outside its variables), where round 0 refuses it. While the state's
-shapes still change after round 0 (a mixture belief growing to its cap), up to three more rounds
-run on concrete values before the scan.
+**The compiled round.** A run is the structure pass, the reset, and one compiled ``lax.scan`` of
+every round from round 0. The structure pass reads structure, not values, on the host before
+any step is called: the antichain, the order (under async every distinct derived order), the
+clock table (the rounds an option lasts at every level of each durations table, each
+validated), and the refusals above. The reset runs on concrete values (unbatched); the state it
+leaves is then settled into the form of every round's state: a variable it left without a value
+holds zeros of its form with a presence flag (the :class:`Maybe` a step is handed), and a
+:class:`MindCarry` its every field, the ones round 0 sets as zeros its ``started`` flag guards
+(a factor carried as a mixture is padded to ``mixture_k`` components with zero-weight ones at
+the reset); any other carry must already have the form round 0 returns, refused naming the step
+otherwise. The forms are read off the structure (``plan()``'s out-ports and carry from the
+System's declarations, every other step's from what its reset returned) and checked on the
+scan's own trace; a ``plan(trace=True)`` node's trace takes the form round 0 gives it,
+evaluated abstractly on the state so settled (the planner traced once, its trace reused by the
+scan's compile); where a form is not derivable (a custom step that leaves an out-port without a
+value at its reset), or the check finds one that does not hold, round 0 of the state from the
+reset is evaluated abstractly (nothing run) and the state settled from it, one state every way
+(``Trajectory.timing["settled"]``). Every round is the same body
+traced once and scanned, so a step is a traced function: its outputs JAX arrays of one shape
+from round to round, its carry and its params of the structure it was handed, and nothing
+host-side (``np.asarray``, ``float()``, a Python branch on a value) on what it is handed, which
+is refused naming the step. The view of a sliced step is taken every round with its level a
+traced index (one System serves every level; a level handed as a :class:`Maybe` is a
+probability vector, its one-hot or, absent, uniform); a clocked node's decide-or-hold is a
+``lax.cond``, its count an int32 array; write-backs are applied by arithmetic on the values. A
+check of a value inside the scan cannot raise: it is recorded in ``Trajectory.faults`` (a
+write-back that was not applied, a level out of range, a step that changed its params outside
+its variables), round 0 included; the reset's checks refuse.
 
 **Replicas.** ``run(..., batch=B)`` runs ``B`` replicas of the closed System by one program:
 replica ``b`` under ``fold_in(key, b)`` (or ``key[b]`` for a stack of ``B`` keys), and inside it
-every key derived as above, so a replica is the unbatched run under its key. The reset and the
-rounds before the scan are vmapped calls of the same round body over the replicas, the scan a
-vmapped scan; a step never sees the replica axis (it is handed one replica's view, observations,
-carry and key). Every value is traced under ``batch=``, round 0 included, so a check of a value
-that round 0 refuses unbatched is recorded in ``Trajectory.faults`` there too. Replicas hold
+every key derived as above, so a replica is the unbatched run under its key. The reset is a
+vmapped call over the replicas and the scan a vmapped scan; a step never sees the replica axis
+(it is handed one replica's view, observations, carry and key). Where several local devices
+exist (accelerators, or a CPU host given ``--xla_force_host_platform_device_count``) the
+vmapped scan is a ``shard_map`` over them: each device runs the whole scan over its share of
+the pass's replicas, with no collective and no rendezvous between rounds, a pass filled with
+copies of its last replica to a multiple of the devices it uses (the fewest replicas per device,
+then the fewest devices at that load; ``Trajectory.timing["devices"]``). On a CPU host with one
+device a batched run is no faster than its replicas one after another. Replicas hold
 their options independently: a clocked node whose options last different rounds at different
 levels has a per-replica decide-or-hold, which vmap runs as both branches and a select. Under
 async each replica draws its own order and a switch over the distinct derived orders picks it,
@@ -125,7 +146,8 @@ simultaneous ones are (Dirichlet counts summed). A group is one node to the orde
 each node's own, under its name.
 
 Design: docs/design/engine-consolidation.md; nesting-and-coupling.md N3, N4, N5; control-states.md
-C13; batched-run.md R1–R12 (the compiled round, replicas, groups).
+C13; batched-run.md R1–R14 (the compiled round, replicas, groups; Phase C: the run settled from
+the reset, independent per-device scans).
 """
 
 import dataclasses
@@ -157,13 +179,14 @@ from hybrid_aif.composition.merge import (
 from hybrid_aif.controls import FLOAT, LEVEL, ControlStep
 from hybrid_aif.distributions import Categorical, ConditionalDirichlet, Dirichlet
 from hybrid_aif.envs.generative import ACTUATOR_TAG
+from hybrid_aif.objectives import hybrid as _hybrid
 from hybrid_aif.planning.base import Planner, get_planner, planner_takes_init
 from hybrid_aif.planning.gradient import PlanPosterior
 from hybrid_aif.reads import BLACK_BOX, EMIT_TAG
 from hybrid_aif.system import Belief, LearnState, System, SystemParams
 from hybrid_aif.system.faces import plan as _plan_face
 
-__all__ = ["Step", "Trace", "Trajectory", "plan", "run", "sample"]
+__all__ = ["Maybe", "Step", "Trace", "Trajectory", "plan", "run", "sample"]
 
 #: ``step(system, key, obs, carry, params) -> (out, carry, params)``: see the module docstring.
 Step = Callable[
@@ -184,16 +207,17 @@ class MindCarry(NamedTuple):
     """
 
     #: The empirical prior the next round filters from: the last posterior pushed through its
-    #: transition under the chosen action. ``None`` before the first round (the declared initial
-    #: priors are used).
+    #: transition under the chosen action; after the reset, the declared initial priors, a
+    #: factor carried as a mixture padded to ``mixture_k`` components with zero-weight ones
+    #: (``None`` in a carry not yet reset: the declared initial priors are used).
     beliefs: Mapping[str, Belief] | None = None
     #: The carry of ``System.learn`` once the mind learns online.
     learn_state: LearnState | None = None
     #: The posterior of the last round, the ``prev_beliefs`` that ``System.learn`` takes
-    #: (``None`` before the first round).
+    #: (``None`` before the first round, or zeros in ``run``'s settled carry, ``started`` false).
     previous: Mapping[str, Belief] | None = None
     #: The action the last round chose, the ``action`` that ``System.learn`` takes (``None``
-    #: before the first round).
+    #: before the first round, or zeros in ``run``'s settled carry).
     action: Mapping[str, Array] | None = None
     #: The last round's :class:`Trace` under ``plan(trace=True)``.
     trace: object | None = None
@@ -202,6 +226,10 @@ class MindCarry(NamedTuple):
     #: gradient and mixed planners put all of ``q_pi`` on it). ``None`` before the first round
     #: and without ``warm_start``.
     plan: Array | None = None
+    #: Whether a round has been planned (a bool array, ``False`` after the reset): ``run`` hands
+    #: round 0 a carry of the form of every later round, its ``previous``, ``action``, ``trace``
+    #: and ``plan`` zeros, and the round learns only where this holds.
+    started: Array | None = None
 
 
 class Trace(NamedTuple):
@@ -260,11 +288,17 @@ def _shifted(plan: Array) -> Array:
     return jnp.concatenate([plan[1:], plan[-1:]], axis=0)
 
 
-def _continuous_width(ctx) -> int:
-    """The width of the planner context's continuous controls, concatenated in node order."""
-    if ctx.continuous_controls is not None:
-        return int(ctx.continuous_controls.action_dim)
-    return int(sum(size for size, kind in zip(ctx.sizes, ctx.kinds, strict=True) if kind == FLOAT))
+def _first_plan(policy_len: int, layout, sizes, kinds) -> Array:
+    """The warm start of :func:`plan`'s first round: zeros ``(policy_len, width)``, the width
+    that of the continuous controls concatenated in node order (``layout``, the flat layout of
+    an all-continuous space, or the float nodes among ``sizes`` and ``kinds``). One rule for the
+    planner's context (:func:`_warm`) and for the state ``run`` settles from the reset
+    (:func:`_settle_static`), which reads the same control space."""
+    if layout is not None:
+        width = int(layout.action_dim)
+    else:
+        width = int(sum(size for size, kind in zip(sizes, kinds, strict=True) if kind == FLOAT))
+    return jnp.zeros((policy_len, width), jnp.float32)
 
 
 def _warm(planner, previous):
@@ -274,7 +308,7 @@ def _warm(planner, previous):
 
     def warm(ctx, use_bound="midpoint", metrics=True):
         if previous is None:
-            init = jnp.zeros((ctx.policy_len, _continuous_width(ctx)), jnp.float32)
+            init = _first_plan(ctx.policy_len, ctx.continuous_controls, ctx.sizes, ctx.kinds)
         else:
             init = _shifted(previous)
         return planner(ctx, use_bound=use_bound, metrics=metrics, init=init)
@@ -315,9 +349,11 @@ def _check_warm_start(planner, system: System) -> None:
 def _plan_tick(system, params, planner, kwargs, trace, learn, warm_start, key, seen, carry):
     """One compiled round: infer, learn, act, push, emit; ``params`` is an argument, so equal
     views share one program. ``seen`` is keyed by variable where the view observes its own."""
-    absent = {m: False for m, v in seen.items() if v is None}
+    present = {m: False for m, v in seen.items() if v is None}
+    present.update({m: v.present for m, v in seen.items() if isinstance(v, Maybe)})
+    seen = {m: v.value if isinstance(v, Maybe) else v for m, v in seen.items()}
     beliefs, detail = system.infer_states(
-        params, seen, priors=carry.beliefs, present=absent or None, detail=trace
+        params, seen, priors=carry.beliefs, present=present or None, detail=trace
     )
     learned, learn_state = None, carry.learn_state
     if learn is not None and carry.previous is not None:
@@ -333,6 +369,10 @@ def _plan_tick(system, params, planner, kwargs, trace, learn, warm_start, key, s
             **_learn_keywords(learn),
         )
         learned, learn_state = out if isinstance(out, tuple) else (out, carry.learn_state)
+        if carry.started is not None:
+            # a settled carry (run's round 0 onward): no previous round before the first
+            learned = _select(carry.started, learned, params)
+            learn_state = _select(carry.started, learn_state, carry.learn_state)
     held = params if learned is None else learned
     if warm_start:
         planner = _warm(get_planner(system.planner) if planner is None else planner, carry.plan)
@@ -359,6 +399,7 @@ def _plan_tick(system, params, planner, kwargs, trace, learn, warm_start, key, s
         action=action,
         trace=None,
         plan=_acted_plan(q_pi, policies) if warm_start else carry.plan,
+        started=jnp.asarray(True),
     )
     planned = (q_pi, tree, policies, detail, held.parameters) if trace else None
     return action, emitted, stored, learned, planned
@@ -430,6 +471,10 @@ class _Plan:
                 _check_warm_start(self.planner, system)
             if self.learn is not None and carry.learn_state is None:
                 carry = carry._replace(learn_state=system.init_learn_state(params))
+            beliefs = system.initial_priors(params) if carry.beliefs is None else carry.beliefs
+            carry = carry._replace(
+                beliefs=_canonical(system, params, beliefs), started=jnp.asarray(False)
+            )
             return {}, carry, params
         renamed = dict(system.observes)
         seen = {renamed.get(slot, slot): value for slot, value in obs.items()}
@@ -458,6 +503,66 @@ class _Plan:
                 )
             )
         return {**action, **emitted}, stored, params if learned is None else learned
+
+
+def _settled_mind(carry, like):
+    """A planning mind's carry from the reset in the form of every round's (``like``, round 0's
+    carry as an abstract value): each field the reset leaves ``None`` that a round fills
+    (``previous``, ``action``, ``trace``, ``plan``) as zeros of its form, which ``started``
+    (false) guards. Read off the carry, so a wrapper of :func:`plan` that hands the carry
+    through settles as ``plan()`` does (design batched-run.md, Phase C)."""
+    if not isinstance(carry, MindCarry) or not isinstance(like, MindCarry):
+        return carry
+    filled = {
+        field: _zeros_like(getattr(like, field))
+        for field in MindCarry._fields
+        if getattr(carry, field) is None and getattr(like, field) is not None
+    }
+    return carry._replace(**filled)
+
+
+def _canonical(system: System, params: SystemParams, beliefs: Mapping[str, Belief]) -> dict:
+    """``beliefs`` in the form a planning mind carries from round to round: each state factor
+    carried as a mixture (a mode-coupled continuous factor) brought to exactly ``mixture_k``
+    components, padded with zero-weight ones (``pad_mixture``), so the carry has one form from
+    the reset on; inference, the propagation and the reduction are invariant to the padding."""
+    if not system.mixture_k or system._is_amortized(system._p(params)):
+        return dict(beliefs)
+    held = system._params_in(params, "plan")
+    families = system._families(held)
+    names = system._table.state_names
+    out = dict(beliefs)
+    for name, family in zip(names, families, strict=True):
+        if family == _hybrid.MIXTURE and name in out:
+            out[name] = _hybrid.as_mixture(out[name], system.mixture_k)
+    return out
+
+
+def _zeros_like(tree):
+    """``tree`` with every array (or abstract array) leaf as zeros of its shape and dtype."""
+
+    def leaf(x):
+        if isinstance(x, jax.ShapeDtypeStruct) or eqx.is_array(x):
+            return jnp.zeros(x.shape, x.dtype)
+        return x
+
+    return jax.tree_util.tree_map(leaf, tree)
+
+
+class Maybe(eqx.Module):
+    """A value handed to a step for a slot whose variable may have no value yet at the step's
+    turn: ``value`` (zeros of the variable's form where it has none) and ``present`` (a bool).
+
+    It is handed only for a variable that the reset left without a value (an action node or
+    emission of a node that has not yet stepped) and that the step reads before it is realised
+    in round 0 (at the round's boundary, or before its owner's turn), a static fact of the
+    structure pass: the slot is then handed a ``Maybe`` every round, ``present`` false in round
+    0 and true after. Every other slot is handed its value. ``plan()`` reads an absent value as
+    an absent modality; a custom step reads ``obs[slot].value`` where ``obs[slot].present``.
+    """
+
+    value: Array
+    present: Array
 
 
 def plan(
@@ -526,6 +631,15 @@ class _Sample:
             emitted, state = system.sample_initial(key, params, state=carry)
             return emitted, state, params
         nodes = set(system._table.control_names)
+        unset = [k for k, v in obs.items() if k in nodes and isinstance(v, Maybe)]
+        if unset:
+            raise ValueError(
+                f"sample(): control node {unset[0]!r} is driven by a variable that has no value "
+                "at the reset and is read before it is realised in round 0, so the process would "
+                "step with no value for it; have the driver return that variable at its reset "
+                "(obs is None), drive the node from an action node (its owner steps before the "
+                'process in every round), or run under "sequential" with the driver listed first'
+            )
         inputs = {k: v for k, v in obs.items() if k in nodes and v is not None}
         emitted, state, actions = _sample_tick(system, params, key, carry, inputs)
         return {**emitted, **actions}, state, params
@@ -587,7 +701,8 @@ class Trajectory(NamedTuple):
     #: The out-ports that held a value entering round 0, as the reset call left them.
     start: dict[str, Array]
     #: A stepped node's carry after each round (``ticks + 1`` entries, the first after the reset
-    #: call) when ``record_carries`` asked for them, else ``None``. For a node that is not itself
+    #: call, settled into every round's form: a ``plan()`` carry with ``started`` false) when
+    #: ``record_carries`` asked for them, else ``None``. For a node that is not itself
     #: stepped, a mapping from each stepped node beneath it, by relative name. Each entry is the
     #: object the step returned, kept as it is and not copied, so a step whose carries are
     #: recorded returns a new carry each round rather than mutating the one it was handed.
@@ -603,14 +718,19 @@ class Trajectory(NamedTuple):
     #: not applied (a concentration that is not positive, two writers of a form that is not
     #: counts; the variable kept its round-start value), an out-port given a level out of range,
     #: or ``"<node>:params"`` for a step that changed its params outside its parameter variables
-    #: and its own tables. Round 0 runs on concrete values, where each of these is refused
-    #: instead. Empty when nothing failed to be checked; ``None`` below the root.
+    #: and its own tables; every round is traced, round 0 included. Empty when nothing was
+    #: checked; ``None`` below the root.
     faults: Any = None
-    #: At the root, the host's wall time of the run's parts, in seconds: ``compile`` (tracing and
-    #: compiling the scan of rounds), ``scan`` (executing it, compile excluded), with the rounds
-    #: it ran (``scanned``) and the rounds run on concrete values before it (``concrete``, round 0
-    #: and any while the state settled, their steps' own compiles included). ``None`` below the
-    #: root.
+    #: At the root, the host's wall time of the run's parts, in seconds, and how it ran:
+    #: ``compile`` (tracing and compiling the scan of rounds), ``scan`` (executing it, compile
+    #: excluded) over ``scanned`` rounds, ``reset`` (the reset calls) and ``settle`` (bringing
+    #: the state from the reset into every round's form), ``settled`` (how: ``"static"``, the
+    #: forms read off the structure; ``"static+trace"``, the same with each ``plan(trace=True)``
+    #: node's trace read off an abstract round 0 of that state; ``"traced"``, round 0 of the
+    #: state from the reset evaluated abstractly; ``None`` for a run of no rounds), ``chunks``,
+    #: ``passes``, ``replicas_per_pass``, and ``devices``
+    #: with ``replicas_per_device`` (see :func:`run`).
+    #: ``None`` below the root.
     timing: Any = None
 
     def __getitem__(self, path):
@@ -965,12 +1085,19 @@ def _uniform(node: "_Node") -> tuple:
     return tuple((v, None) for v in node.inputs)
 
 
-def _level_of(value) -> "int | Array | None":
+def _level_of(value, size: int | None = None) -> "int | Array | None":
     """The input a sliced view takes for a variable's value: an ``int`` for a concrete level, the
     traced integer scalar itself inside the scanned round, the vector itself otherwise, ``None``
-    before the variable has a value."""
+    before the variable has a value. A :class:`Maybe` (a variable the reset left without a
+    value, read before it is realised in round 0) is a probability vector over the ``size``
+    levels every round: the level's one-hot where it is present, uniform where it is not (the
+    average the view takes of a variable with no value)."""
     if value is None:
         return None
+    if isinstance(value, Maybe):
+        level = jnp.asarray(value.value)
+        probs = jax.nn.one_hot(level, size) if level.ndim == 0 else level.astype(jnp.float32)
+        return jnp.where(value.present, probs, jnp.full((size,), 1.0 / size, probs.dtype))
     array = jnp.asarray(value)
     if array.ndim == 0 and jnp.issubdtype(array.dtype, jnp.integer):
         return array if isinstance(array, jax.core.Tracer) else int(array)
@@ -1074,10 +1201,13 @@ def _declared_durations(params: SystemParams, name: str) -> dict:
 
 
 class _State(NamedTuple):
-    """What a round hands the next: the run key, the value of every variable (``None`` before it
-    has one, which only the reset and round 0 can see), each stepped node's carry, the parameter
-    home, each clocked node's option in force (the rounds left to hold after this one, an int32
-    array, and the intended action it chose), and the key the async order is drawn from."""
+    """What a round hands the next: the run key, the value of every variable, each stepped
+    node's carry, the parameter home, each clocked node's option in force (the rounds left to
+    hold after this one, an int32 array, and the intended action it chose), the key the async
+    order is drawn from, and, for each variable the reset left without a value, whether it has
+    one (a bool array). Straight from the reset a variable with no value is ``None``; the state
+    settled from the reset (:func:`_settle_static`, :func:`_settle`) holds zeros of its form
+    there, its flag false."""
 
     key: Array
     values: dict
@@ -1085,6 +1215,7 @@ class _State(NamedTuple):
     home: SystemParams
     held: dict
     sweep: Array
+    present: dict
 
 
 def _traced(x) -> bool:
@@ -1099,17 +1230,6 @@ def _select(flag, new, old):
     return jax.tree_util.tree_map(lambda a, b: jnp.where(flag, a, b), new, old)
 
 
-class _Unsettled(ValueError):
-    """A value of the round's state whose shape or structure changed between rounds: the state
-    has not settled (a mixture belief that grows to its cap, a carry filled on its first round),
-    so the round is run on concrete values once more before the scan is traced again; after
-    :data:`_SETTLE` such rounds it is refused with this sentence."""
-
-
-#: The rounds after round 0 that may run on concrete values while the state settles.
-_SETTLE = 3
-
-
 def _like(value, reference, what: str):
     """``value`` in the dtype of ``reference`` (the value it replaces in the scan's state), which
     it must match in shape: a port, a carry and the home keep their structure from round to
@@ -1118,7 +1238,7 @@ def _like(value, reference, what: str):
         return value
     array = jnp.asarray(value)
     if array.shape != jnp.shape(reference):
-        raise _Unsettled(
+        raise ValueError(
             f"run: {what} has shape {tuple(array.shape)} this round and "
             f"{tuple(jnp.shape(reference))} the round before; a value keeps its shape from round "
             "to round (each round is one step of a scan), so return a value of the same shape "
@@ -1135,7 +1255,7 @@ def _like_tree(tree, reference, what: str):
     leaves, treedef = jax.tree_util.tree_flatten(tree)
     ref_leaves, ref_def = jax.tree_util.tree_flatten(reference)
     if treedef != ref_def:
-        raise _Unsettled(
+        raise ValueError(
             f"run: {what} changed structure between rounds ({ref_def} to {treedef}); each round "
             "is one step of a scan, whose state keeps one structure: return a carry of the "
             "structure it was handed (fields filled from the first round on), and the params "
@@ -1183,6 +1303,10 @@ class _Round:
         self.scanned = scanned
         self.values = dict(state.values)
         self.boundary = dict(state.values)
+        #: whether each variable the reset left without a value has one: a flag of the state
+        #: (traced), or ``True`` once realised this round
+        self.present = dict(state.present)
+        self.boundary_present = dict(state.present)
         self.carries = dict(state.carries)
         self.home = state.home
         self.round_home = state.home
@@ -1195,9 +1319,9 @@ class _Round:
         self.faults: dict = {}
 
     def flag(self, bad, label: str, sentence) -> None:
-        """A check of a value: on a concrete value (the reset and round 0) a failure is refused
-        with ``sentence``; on a traced one (the scanned rounds) it is recorded under ``label``
-        in ``Trajectory.faults`` and the round goes on (design batched-run.md R6, R7)."""
+        """A check of a value: on a concrete value (the reset) a failure is refused with
+        ``sentence``; on a traced one (every round) it is recorded under ``label`` in
+        ``Trajectory.faults`` and the round goes on (design batched-run.md R6, R7)."""
         _flagged(self.faults, bad, label, sentence)
 
 
@@ -1215,8 +1339,9 @@ def _flagged(faults: dict | None, bad, label: str, sentence) -> None:
 class _Engine:
     """The round of ``run``: a function ``round(state, t) -> (state, record)`` of the structure
     pass's static facts (the stepped nodes, the groups, the order, the clocks, the action nodes
-    and their kernels), called on concrete values for round 0 and scanned over the rounds after
-    it (under ``batch=``, both vmapped over the replicas)."""
+    and their kernels), scanned over every round (under ``batch=``, vmapped over the replicas),
+    and evaluated abstractly on the state straight from the reset (round 0) where the state's
+    form is settled by a trace (:func:`_settle`)."""
 
     def __init__(
         self, system, nodes, second, derive, tick_order, kernels, types, clocks, groups=None
@@ -1247,6 +1372,10 @@ class _Engine:
         #: whether any turn traced so far wrote back (a fact of the trace, read after the run:
         #: a run in which no step wrote back returns the starting home itself)
         self.wrote = False
+        #: set while the scan of a statically settled state is traced: a round's variable or
+        #: carry of another form than the state's raises :class:`_Unformed` (:func:`_exact`)
+        #: where it would be converted
+        self.strict = False
         self.orders, self.permutations, self.order_of = [], None, None
 
     def _units(self, nodes: Sequence[_Node]) -> list[list[_Node]]:
@@ -1324,17 +1453,24 @@ class _Engine:
             variable in self.index and variable in node.driven.values()
         )
 
-    def read(self, node: _Node, source: Mapping[str, Any], at_boundary: Mapping[str, Any]) -> dict:
-        return {
-            slot: (source if self.stands(node, variable) else at_boundary).get(variable)
-            for slot, variable in node.reads.items()
-        }
+    def value(self, node: _Node, variable: str, now, at_boundary) -> Any:
+        """``variable`` as ``node`` reads it, from ``now`` or ``at_boundary`` (each a pair of the
+        values and the presence flags): its value, a :class:`Maybe` where whether it has one is a
+        flag of the state (a variable the reset left without a value, not yet realised this
+        round), or ``None`` straight from the reset."""
+        values, present = now if self.stands(node, variable) else at_boundary
+        value, flag = values.get(variable), present.get(variable, True)
+        return value if flag is True or value is None else Maybe(value, flag)
+
+    def read(self, node: _Node, now, at_boundary) -> dict:
+        return {slot: self.value(node, v, now, at_boundary) for slot, v in node.reads.items()}
 
     # --------------------------------------------------------------------- the round
 
     def round(self, state: _State, t, scanned: bool = False):
-        """Round ``t``: ``(state, record)``. ``t`` is a Python int on the rounds run on concrete
-        values, a traced one in the scan (``scanned``)."""
+        """Round ``t``: ``(state, record)``. ``t`` is the Python int 0 for the abstract round 0
+        that settles the state (``scanned`` false: a carry may still change form), a traced one
+        in the scan (``scanned``)."""
         key, k_tick = jax.random.split(state.key)
         keys = _round_keys(k_tick, self.count)
         state = state._replace(key=key)
@@ -1355,9 +1491,7 @@ class _Engine:
         ]
         if len(branches) == 1:
             return branches[0](state, keys)
-        if any(v is None for v in state.values.values()):
-            branches = _alike(branches, state, keys)
-        return jax.lax.switch(which, branches, state, keys)
+        return jax.lax.switch(which, _alike(branches, state, keys), state, keys)
 
     def _turns(self, order: Sequence[_Node]) -> list[list[_Node]]:
         """``order`` as its turns: a group's members together at its first member's place."""
@@ -1406,15 +1540,28 @@ class _Engine:
                         dict.fromkeys(picked, decided),
                         node.chosen,
                     )
+        received = {
+            n: {s: x.value if isinstance(x, Maybe) else x for s, x in seen.items()}
+            for n, seen in r.received.items()
+        }
+        present = {
+            n: {
+                s: x.present if isinstance(x, Maybe) else jnp.asarray(x is not None)
+                for s, x in seen.items()
+            }
+            for n, seen in r.received.items()
+        }
         record = dict(
-            received=r.received,
+            received=received,
+            present=present,
             intended=r.intended,
             decided=r.decided,
             emitted={n.name: {v: r.values[v] for v in n.outs} for n in self.nodes},
             carries=dict(r.carries),
             faults=r.faults,
         )
-        return _State(state.key, r.values, r.carries, r.home, r.held, state.sweep), record
+        flags = {v: jnp.asarray(r.present[v]) for v in state.present}
+        return _State(state.key, r.values, r.carries, r.home, r.held, state.sweep, flags), record
 
     def _turn_of(self, r: _Round, turn: list[_Node], keys) -> list:
         if len(turn) == 1 and turn[0].name not in self.member_of:
@@ -1436,6 +1583,8 @@ class _Engine:
                 r.values[a] = (
                     _select(flags[a], new, r.values[a]) if r.values[a] is not None else new
                 )
+                # realised, or held after an earlier decision (round 0 always decides)
+                r.present[a] = True
 
     def _base(self, r: _Round) -> SystemParams:
         """The home a turn's view is taken from: the round's start under ``"simultaneous"``, the
@@ -1445,12 +1594,13 @@ class _Engine:
     def _prepare(self, r: _Round, node: _Node, base):
         """What ``node`` reads this turn (recorded), the levels its sliced view is cut at, its
         view and the observations its step is handed."""
-        seen = self.read(node, r.values, r.boundary)
+        now, at_boundary = (r.values, r.present), (r.boundary, r.boundary_present)
+        seen = self.read(node, now, at_boundary)
         r.received[node.name] = seen
         levels: tuple = ()
         if getattr(node.step, "sliced", False):
             levels = tuple(
-                (v, _level_of((r.values if self.stands(node, v) else r.boundary).get(v)))
+                (v, _level_of(self.value(node, v, now, at_boundary), self.types[v][1]))
                 for v in node.inputs
             )
         view, vparams = _take_view(self.system, node, base, levels)
@@ -1497,8 +1647,15 @@ class _Engine:
                     f"run: the step of {node.name!r} returned {type(learned).__name__} as its "
                     "params; a step returns the SystemParams it was given, or learned ones"
                 )
-            out = _check_out(node, out, self.types, self.system, False, standing)
+            strict = scanned and self.strict
+            out = _check_out(
+                node, out, self.types, self.system, False, None if strict else standing
+            )
             identity["params"] = learned is vparams
+            if strict:
+                ports = [k for k in out if k in standing]
+                _exact({k: out[k] for k in ports}, {k: standing[k] for k in ports})
+                _exact(_strong(stepped), carry)
             if scanned:
                 stepped = _like_tree(_strong(stepped), carry, f"the carry of {node.name!r}")
                 if learned is not vparams:
@@ -1528,15 +1685,11 @@ class _Engine:
             try:
                 out, stepped, learned = jax.lax.cond(decided, act, hold, k, obs, carry, vparams)
             except TypeError as error:
-                if scanned:
-                    raise
                 raise ValueError(
-                    f"run: under batch= the clocked node {node.name!r}, whose options last "
-                    f"different rounds at different levels, decides on some replicas and holds "
-                    f"on others at round {t}, while its carry still changes form (its step "
-                    "returns a carry of another structure or shape than it was handed); hold "
-                    "a carry of one form from round 0 on, give its durations one value at every "
-                    "level, or run the replicas one call each without batch="
+                    f"run: the clocked node {node.name!r} decides or holds by a traced flag, and "
+                    "its step returns a carry of another structure or shape than it was handed, "
+                    "so the two branches differ; return a carry of the form it was handed every "
+                    "round, from the reset on"
                 ) from error
         chosen = {a: out[a] for a in node.chosen}
         level = jnp.asarray(chosen[clock.action], jnp.int32)
@@ -1560,6 +1713,7 @@ class _Engine:
             r.held[node.name] = held
         for e in node.emissions:
             r.values[e] = out[e]
+            r.present[e] = True
         chosen = {a: out[a] for a in node.chosen}
         r.intended[node.name] = chosen
         r.decided[node.name] = decided
@@ -1625,13 +1779,25 @@ class _Engine:
                 raise
             raise ValueError(
                 f"run: the step of {node.name!r} calls host-side code on a traced value "
-                f"({type(error).__name__}); run steps every round after the first inside one "
-                "compiled scan (and every call under batch=, vmapped over the replicas), so a "
-                "step is a traced function whose outputs are JAX arrays: "
+                f"({type(error).__name__}); run steps every round inside one compiled scan "
+                "(and every call under batch=, the reset included, vmapped over the replicas), "
+                "so a step is a traced function whose outputs are JAX arrays: "
                 "write it with jax.numpy and lax control flow (no np.asarray, float(), int(), "
                 "bool() or a Python branch on a value), and keep host-side work such as timing "
                 "or logging outside run (record what a step sees in its carry, "
                 "record_carries=True)"
+            ) from error
+        except (TypeError, AttributeError) as error:
+            unset = [s for s, v in (obs or {}).items() if isinstance(v, Maybe)]
+            if not unset or isinstance(node.step, _Plan | _Sample):
+                raise
+            raise ValueError(
+                f"run: the step of {node.name!r} failed ({type(error).__name__}: {error}) and "
+                f"was handed obs[{unset[0]!r}] as a Maybe(value, present): its variable has no "
+                "value at the reset and the step reads it before it is realised in round 0, so "
+                "every round hands it the value with a flag (present false in round 0); read "
+                f"obs[{unset[0]!r}].value where obs[{unset[0]!r}].present (jnp.where), or have "
+                "the variable's owner return it at its reset (obs is None)"
             ) from error
 
     def _write(self, r: _Round, node, view, vparams, learned, levels, base, pending=None) -> None:
@@ -1652,11 +1818,10 @@ class _Engine:
 
 def _alike(branches: list, state, keys) -> list:
     """The async round's branches (one per derived order) made to return records of one
-    structure, for a switch whose index is traced on a round where a variable has no value yet
-    (round 0 under ``batch=``): a slot one order reads before its variable has a value and
-    another after is recorded as zeros where absent with its presence a flag of the record
-    (``present``), and every branch records every fault label (``False`` where it raised none).
-    """
+    structure, for a switch whose index is traced: every branch records every fault label
+    (``False`` where it raised none), and, straight from the reset (the settling pass, where a
+    variable may still be ``None``), a slot one order reads before its variable has a value and
+    another after is recorded as zeros where absent."""
     shapes = [eqx.filter_eval_shape(b, state, keys)[1] for b in branches]
     received: dict[str, dict[str, Any]] = {}
     for shape in shapes:
@@ -1670,19 +1835,18 @@ def _alike(branches: list, state, keys) -> list:
     def alike(branch):
         def call(state, keys):
             out, record = branch(state, keys)
-            seen, present = {}, {}
+            seen = {}
             for node, slots in received.items():
-                seen[node], present[node] = {}, {}
+                seen[node] = {}
                 for slot, like in slots.items():
                     value = record["received"][node].get(slot)
-                    present[node][slot] = jnp.asarray(value is not None)
                     if value is None and like is not None:
                         value = jnp.zeros(like.shape, like.dtype)
                     seen[node][slot] = value
             faults = {
                 label: jnp.asarray(record["faults"].get(label, False), bool) for label in labels
             }
-            return out, {**record, "received": seen, "present": present, "faults": faults}
+            return out, {**record, "received": seen, "faults": faults}
 
         return call
 
@@ -1886,20 +2050,28 @@ def _kept(record: dict, fields: frozenset) -> dict:
     for field in ("received", "emitted", "intended"):
         if field not in fields:
             out[field] = None
+    if "received" not in fields:
+        out["present"] = None
     return out
 
 
-def _scan_program(engine: _Engine, static, fields: frozenset, batched: bool, last=None):
+def _scan_program(engine: _Engine, static, fields: frozenset, batched: bool, last=None, mesh=None):
     """The compiled scan of the rounds over the array part of the state (its other leaves,
     ``static``, the same every round): ``program(dynamic, rounds) -> (dynamic, records)``,
     ``rounds`` the indices of the rounds it runs. Under ``batch=`` it is vmapped over the
-    replicas (the leading axis of ``dynamic``). ``last``: the run's round count, past which a
-    round of a padded last chunk leaves the state as it was."""
+    replicas (the leading axis of ``dynamic``), and with a ``mesh`` of several devices it is a
+    ``shard_map`` of that vmapped scan: each device runs the whole scan over its share of the
+    replicas to the end, with no collective and no rendezvous between rounds (nothing crosses
+    replicas). ``last``: the run's round count, past which a round of a padded last chunk leaves
+    the state as it was."""
 
     def body(dynamic, t):
         state = eqx.combine(dynamic, static)
         state, record = engine.round(state, t, scanned=True)
         out, rest = eqx.partition(state, eqx.is_array)
+        if engine.strict:
+            _exact((out.values, out.carries), (dynamic.values, dynamic.carries))
+            _exact(rest.carries, static.carries)
         _check_static(rest, static)
         out = _like_tree(out, dynamic, "the round's state")
         if last is not None:
@@ -1910,9 +2082,21 @@ def _scan_program(engine: _Engine, static, fields: frozenset, batched: bool, las
     def scan(dynamic, rounds):
         return jax.lax.scan(body, dynamic, rounds)
 
-    if batched:
-        return jax.jit(jax.vmap(scan, in_axes=(0, None)))
-    return jax.jit(scan)
+    if not batched:
+        return jax.jit(scan)
+    replicas = jax.vmap(scan, in_axes=(0, None))
+    if mesh is None:
+        return jax.jit(replicas)
+    spec = jax.sharding.PartitionSpec
+    return jax.jit(
+        jax.shard_map(
+            replicas,
+            mesh=mesh,
+            in_specs=(spec("replicas"), spec()),
+            out_specs=spec("replicas"),
+            check_vma=False,
+        )
+    )
 
 
 def _same_static(a, b) -> bool:
@@ -1926,14 +2110,14 @@ def _check_static(rest, static) -> None:
     for name in static.carries:
         a, b = static.carries[name], rest.carries[name]
         if not _same_static(a, b):
-            raise _Unsettled(
+            raise ValueError(
                 f"run: the carry of {name!r} changed a value that is not an array between rounds "
                 f"({a!r} to {b!r}); each round is one step of a scan, whose state is arrays: "
                 "hold a count or a flag in the carry as a JAX array (jnp.asarray(0)), and keep "
                 "every other value of the carry the same from round to round"
             )
     if not _same_static(rest, static):
-        raise _Unsettled(
+        raise ValueError(
             "run: the round changed a value of its state that is not an array (the parameter "
             "home's or a held option's); a step returns the params it was given or learned ones "
             "of the same form"
@@ -2046,23 +2230,28 @@ def _run(
     engine = _Engine(system, nodes, second, derive, tick_order, kernels, types, schedule, grouped)
     engine.async_orders(batch)
 
-    # ---- the replicas, in passes; each pass the reset, the rounds on concrete values and the
-    # compiled scan in chunks (R1, R11)
-    simulation = _Simulation(engine, ticks, chunk, fields, batch is not None)
+    # ---- the replicas, in passes; each pass the reset, the state settled from it and the
+    # compiled scan of every round in chunks (R1, R11), its replicas spread over the devices
     if batch is None:
+        simulation = _Simulation(engine, ticks, chunk, fields, False, shared_params)
         out = simulation.run(key, carries, params)
-        size, passes = None, 1
+        size, passes, devices, per_device = None, 1, 1, None
     else:
         keys = _replica_keys(key, batch)
         size = batch if per_pass is None else min(per_pass, batch)
         passes = -(-batch // size)
+        devices, per_device = _devices_for(size)
+        width = devices * per_device  # a pass's replicas, filled to a multiple of the devices
+        mesh = _mesh(devices)
+        simulation = _Simulation(engine, ticks, chunk, fields, True, shared_params, mesh)
         params_axis = eqx.if_array(0) if "params" in per_replica else None
         seed_axes = {n: (eqx.if_array(0) if n in per_replica else None) for n in carries}
-        outs = []
+        outs, counts = [], []
         for p in range(passes):
-            # the last pass is filled to the pass's size with copies of the last replica, so
-            # every pass runs one program; the copies are dropped
-            index = np.minimum(np.arange(p * size, (p + 1) * size), batch - 1)
+            # each pass is filled to its width with copies of its last replica, so every pass
+            # runs one program and every device as many replicas; the copies are dropped
+            real = np.arange(p * size, min((p + 1) * size, batch))
+            index = np.concatenate([real, np.full(width - len(real), real[-1])])
             simulation.passes = p
             outs.append(
                 simulation.run(
@@ -2073,11 +2262,18 @@ def _run(
                     params_axis,
                 )
             )
-        out = outs[0] if passes == 1 else _joined(outs, batch)
-    state, start, reset_carries, heads, rest, final = out
+            counts.append(len(real))
+        out = _joined(outs, counts)
+    state, start, reset_carries, rest, final = out
     if not engine.wrote:
         state = state._replace(home=params)  # no step wrote back: the home is the one handed in
-    timing = dict(simulation.timing, concrete=len(heads), passes=passes, replicas_per_pass=size)
+    timing = dict(
+        simulation.timing,
+        passes=passes,
+        replicas_per_pass=size,
+        devices=devices,
+        replicas_per_device=per_device,
+    )
     return _assemble_record(
         system,
         shared_params,
@@ -2088,7 +2284,6 @@ def _run(
         ports,
         start,
         reset_carries,
-        heads,
         rest,
         final,
         fields,
@@ -2206,32 +2401,49 @@ def _replica_keys(key, batch: int) -> Array:
     return key
 
 
-def _joined(outs: list, batch: int):
-    """The passes' results joined on the replica axis and cut to ``batch`` replicas (the last
-    pass's copies dropped)."""
+def _joined(outs: list, counts: list[int]):
+    """The passes' results, each cut to its ``counts`` real replicas (the copies that filled it
+    dropped), joined on the replica axis."""
     parts = [eqx.partition(o, eqx.is_array) for o in outs]
     dynamic = jax.tree_util.tree_map(
-        lambda *xs: jnp.concatenate(xs)[:batch], *[d for d, _ in parts]
+        lambda *xs: jnp.concatenate([x[:n] for x, n in zip(xs, counts, strict=True)]),
+        *[d for d, _ in parts],
     )
     return eqx.combine(dynamic, parts[0][1])
 
 
-def _spread(dynamic):
-    """The scan's state with its replica axis sharded over the local devices where there are
-    several and they divide the pass (a CPU host given ``--xla_force_host_platform_device_count``,
-    or several accelerators), so the replicas run in parallel; as it is otherwise."""
-    devices = jax.local_devices()
-    leaves = jax.tree_util.tree_leaves(dynamic)
-    if len(devices) < 2 or not leaves or jnp.shape(leaves[0])[0] % len(devices):
+def _devices_for(size: int) -> tuple[int, int]:
+    """``(devices, replicas per device)`` for a pass of ``size`` replicas over the local devices
+    (several accelerators, or a CPU host given ``--xla_force_host_platform_device_count``): the
+    fewest replicas per device the devices allow, then the fewest devices that hold the pass at
+    that load, so a pass is filled with at most ``devices - 1`` copies (none where the count
+    divides it): ten replicas on sixteen devices run on ten, sixteen on eight run two each,
+    thirteen on eight run two each on seven, one copy added."""
+    count = len(jax.local_devices())
+    per_device = -(-size // max(count, 1))
+    return -(-size // per_device), per_device
+
+
+def _mesh(devices: int):
+    """A one-axis mesh (``"replicas"``) over the first ``devices`` local devices, or ``None``
+    for one."""
+    if devices < 2:
+        return None
+    return jax.sharding.Mesh(np.asarray(jax.local_devices()[:devices]), ("replicas",))
+
+
+def _placed(dynamic, mesh):
+    """The scan's state with its replica axis split over ``mesh``'s devices (as it is without
+    one)."""
+    if mesh is None:
         return dynamic
-    mesh = jax.sharding.Mesh(np.asarray(devices), ("replicas",))
-    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("replicas"))
-    return jax.device_put(dynamic, sharding)
+    spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("replicas"))
+    return jax.device_put(dynamic, spec)
 
 
 def _reset(engine: _Engine, key, seeds, home) -> _State:
     """The reset (section 4.4): each node's first call, with no observation, in node order with
-    the reset keys; the state entering round 0."""
+    the reset keys; the state entering round 0, a variable the reset gave no value ``None``."""
     system, nodes = engine.system, engine.nodes
     values: dict[str, Array | None] = {v: None for n in nodes for v in n.outs}
     live = {n.name: seeds.get(n.name) for n in nodes}
@@ -2246,37 +2458,273 @@ def _reset(engine: _Engine, key, seeds, home) -> _State:
         for n in nodes
         if n.name in engine.clocks
     }
-    return _State(key, values, live, home, held, _sweep_key(key, engine.count))
+    return _State(key, values, live, home, held, _sweep_key(key, engine.count), {})
+
+
+def _settle(engine: _Engine, state: _State, lead: tuple) -> _State:
+    """The state straight from the reset brought to the form of every round's state, so that
+    round 0 is the scan's first round (design batched-run.md, Phase C), by a trace: the path
+    taken where :func:`_settling` finds a form the structure does not give (a statically
+    settled state, :func:`_settle_static`, is the same state). Round 0 is evaluated
+    abstractly (``eval_shape``, nothing runs, the planner's search traced), each variable the
+    reset left without a value
+    takes zeros of the form round 0 gives it and a presence flag, false (``lead``: the replica
+    axis of a pass, or ``()``), and each step's carry the form round 0 returns: a
+    :class:`MindCarry` (``plan()``'s) by filling what round 0 sets with zeros its ``started``
+    flag guards, any other carry as it is (Python numbers made arrays), refused naming the step
+    where its form differs from round 0's."""
+    state = _strong(state)
+    round0 = functools.partial(engine.round, t=0)
+    if lead:
+        round0 = eqx.filter_vmap(round0)
+    like = eqx.filter_eval_shape(round0, state)[0]
+    values = {v: _zeros_like(like.values[v]) if x is None else x for v, x in state.values.items()}
+    present = {v: jnp.zeros(lead, bool) for v, x in state.values.items() if x is None}
+    carries = {}
+    for node in engine.nodes:
+        target = like.carries[node.name]
+        carry = _settled_mind(state.carries[node.name], target)
+        carries[node.name] = _formed(carry, target, node.name)
+    return _strong(state._replace(values=values, carries=carries, present=present))
+
+
+def _formed(carry, target, name: str):
+    """``carry`` (a reset's) in the dtypes of ``target`` (round 0's carry, abstract), refused
+    where the two differ in structure, a shape, or a leaf that is no array."""
+    leaves, treedef = jax.tree_util.tree_flatten(carry)
+    targets, target_def = jax.tree_util.tree_flatten(target)
+    problem = None
+    if treedef != target_def:
+        problem = f"its structure is {treedef} at the reset and {target_def} at round 0"
+    else:
+        paths = [jax.tree_util.keystr(p) for p, _ in jax.tree_util.tree_flatten_with_path(carry)[0]]
+        out = []
+        for x, t, path in zip(leaves, targets, paths, strict=True):
+            if isinstance(t, jax.ShapeDtypeStruct):
+                if not _arrayish(x) or jnp.shape(x) != t.shape:
+                    problem = (
+                        f"at {path or 'its root'} it is {_described(x)} at the reset and an "
+                        f"array of shape {t.shape} at round 0"
+                    )
+                    break
+                typed = jax.dtypes.issubdtype(t.dtype, jax.dtypes.prng_key)
+                out.append(x if typed else jnp.asarray(x, t.dtype))
+            elif x is t or _same_static(x, t):
+                out.append(x)
+            else:
+                problem = f"at {path or 'its root'} it is {x!r} at the reset and {t!r} at round 0"
+                break
+        else:
+            return treedef.unflatten(out)
+    raise ValueError(
+        f"run: the step of {name!r} returns at its reset (obs is None) a carry of another form "
+        f"than at round 0 ({problem}); every round, round 0 included, is one step of a scan "
+        "from the reset, whose state keeps one form, so return from the reset a carry of the "
+        "structure, shapes and dtypes every round returns (zeros where round 0 sets a value, "
+        "with a flag that says whether it is set)"
+    )
+
+
+def _plan_of(step) -> "_Plan | None":
+    """The :func:`plan` step a node is stepped by: the step itself, or the one a wrapper made
+    with ``functools.wraps`` wraps (its ``__wrapped__`` chain); ``None`` for any other step."""
+    for _ in range(16):
+        if isinstance(step, _Plan) or step is None:
+            break
+        step = getattr(step, "__wrapped__", None)
+    return step if isinstance(step, _Plan) else None
+
+
+#: How ``run`` settles the state from the reset (``Trajectory.timing["settled"]``): every form
+#: read off the structure; the same with the :class:`Trace` of each ``plan(trace=True)`` node
+#: read off an abstract round 0 of that settled state; round 0 of the state straight from the
+#: reset evaluated abstractly.
+STATIC, STATIC_TRACE, TRACED = "static", "static+trace", "traced"
+
+
+def _settling(engine: _Engine, state: _State) -> str:
+    """How the state straight from the reset is settled (:data:`STATIC` and the rest). The
+    forms follow from the structure where every node is stepped by :func:`plan` (or a wrapper of
+    it) and keeps a :class:`MindCarry`, or by a step that gave each of its out-ports a value at
+    its reset and whose carry is no :class:`MindCarry` the reset left unfilled
+    (:func:`_settle_static`). A ``plan(trace=True)`` node's :class:`Trace` has the form of its
+    planner's search, which only a trace gives: it is read off round 0 evaluated abstractly on
+    the state settled from the structure, whose trace of the planner the scan's compile reuses
+    (``jit`` caches it by those forms and that wrapping), so the search is traced once. A custom
+    step that leaves an out-port without a value at its reset gives it a form of its own in
+    round 0: the state is settled by round 0 of the state from the reset (:func:`_settle`)."""
+    how = STATIC
+    for node in engine.nodes:
+        carry = state.carries[node.name]
+        planned = _plan_of(node.step)
+        if planned is not None:
+            if not isinstance(carry, MindCarry):
+                return TRACED
+            if planned.trace:
+                how = STATIC_TRACE
+        elif any(state.values[v] is None for v in node.outs):
+            return TRACED
+        elif isinstance(carry, MindCarry) and (carry.previous is None or carry.action is None):
+            return TRACED
+    return how
+
+
+def _absent(engine: _Engine, variable: str) -> Array:
+    """Zeros of the form a :func:`plan` step gives an out-port it returns nothing for at its
+    reset: an action node a level (int32) or a continuous node's float vector (:func:`_null`),
+    an emission its realisation, a level's probability vector under ``realise="stats"`` and
+    otherwise a level or a float vector of the port's width."""
+    kind, size = engine.types[variable]
+    emission = dict(engine.system.emissions).get(variable)
+    if kind == LEVEL and emission is not None and emission.realise == "stats":
+        return jnp.zeros((size,), jnp.float32)
+    return _null(engine.types[variable])
+
+
+def _settle_static(engine: _Engine, state: _State, lead: tuple, one: SystemParams) -> _State:
+    """The state straight from the reset brought to the form of every round's state without a
+    trace, where :func:`_settling` allows: the state :func:`_settle` gives, each form read off
+    the structure (a ``plan(trace=True)`` node's ``trace`` left ``None``, for
+    :func:`_with_traces`). A variable the reset left without a value (an out-port of a :func:`plan`
+    node) takes zeros of :func:`_absent`'s form and a presence flag, false (``lead``: the
+    replica axis of a pass, or ``()``); a plan node's :class:`MindCarry` takes ``previous`` of
+    the form of its ``beliefs`` (the posterior a round stores has the form of the canonical
+    prior it filters from, :func:`_canonical`), ``action`` one :func:`_null` per action node it
+    chooses, and under ``warm_start`` ``plan`` as :func:`_first_plan` of its view's control space
+    (``one``: the params of one replica, read for structure), all zeros that ``started`` (false)
+    guards; any other carry is kept as it is (Python numbers made arrays). The scan's trace
+    checks every form (:class:`_Unformed`), and where one does not hold the state is settled by
+    the trace after all."""
+    state = _strong(state)
+    values, present = {}, {}
+    for v, x in state.values.items():
+        if x is None:
+            form = _absent(engine, v)
+            values[v] = jnp.zeros(lead + form.shape, form.dtype)
+            present[v] = jnp.zeros(lead, bool)
+        else:
+            values[v] = x
+    carries = dict(state.carries)
+    for node in engine.nodes:
+        planned = _plan_of(node.step)
+        if planned is None:
+            continue
+        carry, filled = carries[node.name], {}
+        if carry.previous is None:
+            filled["previous"] = _zeros_like(carry.beliefs)
+        if carry.action is None:
+            nulls = {a: _null(engine.types[a]) for a in node.chosen}
+            filled["action"] = {a: jnp.zeros(lead + x.shape, x.dtype) for a, x in nulls.items()}
+        if planned.warm_start and carry.plan is None:
+            view, vparams = _reset_view(engine.system, node, one)
+            view = planned._view(view)
+            space = view._space(view._params_in(vparams, "plan"))
+            first = _first_plan(view.policy_len, space.layout, space.sizes, space.kinds)
+            filled["plan"] = jnp.zeros(lead + first.shape, first.dtype)
+        carries[node.name] = _strong(carry._replace(**filled))
+    return state._replace(values=values, carries=carries, present=present)
+
+
+def _with_traces(engine: _Engine, state: _State, lead: tuple, mesh=None) -> _State:
+    """``state`` (settled from the structure) with the ``trace`` of each ``plan(trace=True)``
+    node as zeros of the :class:`Trace` round 0 gives it, round 0 evaluated abstractly on
+    ``state`` itself and wrapped as the scan wraps its round (vmapped over the replicas, a
+    ``shard_map`` over ``mesh``): the planner is then traced on the forms and in the context
+    the scan's compile traces it in, and the compile reuses that trace (see
+    :func:`_settling`)."""
+    dynamic, static = eqx.partition(state, eqx.is_array)
+    held = {}
+
+    def round0(dynamic):
+        out, _ = engine.round(eqx.combine(dynamic, static), 0)
+        arrays, held["rest"] = eqx.partition(out, eqx.is_array)
+        return arrays
+
+    if lead:
+        round0 = jax.vmap(round0)
+    if mesh is not None:
+        spec = jax.sharding.PartitionSpec("replicas")
+        round0 = jax.shard_map(round0, mesh=mesh, in_specs=(spec,), out_specs=spec, check_vma=False)
+    like = eqx.combine(jax.eval_shape(round0, dynamic), held["rest"])
+    carries = dict(state.carries)
+    for node in engine.nodes:
+        planned = _plan_of(node.step)
+        carry, target = carries[node.name], like.carries[node.name]
+        if planned is not None and planned.trace and carry.trace is None:
+            if isinstance(target, MindCarry) and target.trace is not None:
+                carries[node.name] = carry._replace(trace=_zeros_like(target.trace))
+    return state._replace(carries=carries)
+
+
+class _Unformed(Exception):  # noqa: N818 - a signal of the settling, not an error a caller sees
+    """Raised on the trace of the scan of a statically settled state (:func:`_settle_static`)
+    where a round returns a variable or a carry of another form than the state was settled to:
+    the static rule did not hold for this run, and ``run`` settles the state by the trace of
+    round 0 (:func:`_settle`) and compiles again, so both paths give one state, and a step whose
+    carry differs from round 0's is refused by :func:`_formed`'s sentence on either."""
+
+
+def _exact(tree, reference) -> None:
+    """Raise :class:`_Unformed` where ``tree`` differs from ``reference`` in structure, in an
+    array leaf's shape or dtype, or in a leaf that is no array."""
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    refs, ref_def = jax.tree_util.tree_flatten(reference)
+    if treedef != ref_def:
+        raise _Unformed
+    for x, r in zip(leaves, refs, strict=True):
+        if eqx.is_array(x) or eqx.is_array(r):
+            same = eqx.is_array(x) and eqx.is_array(r)
+            if not (same and x.shape == r.shape and x.dtype == r.dtype):
+                raise _Unformed
+        elif not _same_static(x, r):
+            raise _Unformed
+
+
+def _arrayish(x) -> bool:
+    return eqx.is_array(x) or isinstance(x, bool | int | float | complex | np.ndarray | np.generic)
+
+
+def _described(x) -> str:
+    if x is None:
+        return "None"
+    if _arrayish(x):
+        return f"an array of shape {tuple(jnp.shape(x))}"
+    return f"a {type(x).__name__}"
 
 
 class _Simulation:
-    """The replicas of one run, pass by pass: the reset, the rounds on concrete values while the
-    state's shapes change (round 0 and at most :data:`_SETTLE` more), and the compiled scan of
-    the rounds after them, a host loop over chunks of ``chunk`` rounds (one program re-run).
-    Under ``batch=`` every call is vmapped over the pass's replicas: the reset and the concrete
-    rounds as vmapped calls, the scan as a vmapped scan. The program compiled in the first pass
-    serves every pass after it, which settles at the same round."""
+    """The replicas of one run, pass by pass: the reset, the state settled from it into the form
+    of every round (statically, :func:`_settle_static`, where :func:`_settling` allows, else by
+    a trace of round 0, :func:`_settle`), and the compiled scan of every round from round 0, a
+    host loop over chunks of ``chunk`` rounds (one program re-run). Under ``batch=`` every call
+    is vmapped over the pass's replicas: the reset as a vmapped call, the scan as a vmapped
+    scan. The program compiled in the first pass serves every pass after it, and the first
+    pass's way of settling every pass after it. ``one``: the params of one replica, read for
+    structure."""
 
-    def __init__(self, engine: _Engine, ticks: int, chunk, fields, batched: bool):
+    def __init__(self, engine: _Engine, ticks: int, chunk, fields, batched: bool, one, mesh=None):
         self.engine = engine
+        self.one = one
+        self.mesh = mesh
         self.ticks = ticks
         self.chunk = chunk
         self.fields = fields
         self.batched = batched
         self.compiled = None
         self.static = None
-        self.settled: int | None = None
         self.passes = 0
         self.timing: dict[str, Any] = {
             "compile": 0.0,
             "scan": 0.0,
             "scanned": 0,
-            "concrete_seconds": 0.0,
+            "reset": 0.0,
+            "settle": 0.0,
+            "settled": None,
             "chunks": [],
         }
 
     def run(self, key, seeds, home, seed_axes=None, home_axis=None):
-        engine, ticks = self.engine, self.ticks
+        engine = self.engine
         begun = time.perf_counter()
         if self.batched:
             state = eqx.filter_vmap(
@@ -2288,52 +2736,74 @@ class _Simulation:
             n.name: {v: state.values[v] for v in n.outs if state.values[v] is not None}
             for n in engine.nodes
         }
-        reset_carries = dict(state.carries)
-        heads: list = []
-        rest = None
-        t = 0
-        while t < ticks:
-            if t and (self.settled is None or t == self.settled):
-                self.timing["concrete_seconds"] += time.perf_counter() - begun
-                scanned = self._scan(state, t)
-                begun = time.perf_counter()
-                if scanned is not None:
-                    state, rest = scanned
-                    break
-            step = functools.partial(engine.round, t=t)
-            state, row = eqx.filter_vmap(step)(state) if self.batched else step(state)
-            heads.append(row)
-            state = _strong(state)
-            t += 1
-        if rest is None:
-            self.timing["concrete_seconds"] += time.perf_counter() - begun
-        final = {n.name: engine.read(n, state.values, state.values) for n in engine.nodes}
-        return state, start, reset_carries, heads, rest, final
+        self.timing["reset"] += time.perf_counter() - begun
+        rest, reset_carries = None, dict(state.carries)
+        if self.ticks:
+            state, reset_carries, rest = self._settled_scan(state, jnp.shape(key)[:1])
+        now = (state.values, state.present)
+        final = {n.name: engine.read(n, now, now) for n in engine.nodes}
+        return state, start, reset_carries, rest, final
 
-    def _scan(self, state, t):
-        """The rounds from ``t`` on, scanned in chunks: ``(state, records)``, or ``None`` where
-        the state has not settled (a round runs on concrete values first)."""
+    def _settled_scan(self, reset: _State, replicas: tuple):
+        """The state from the reset settled and scanned: ``(state, settled carries, records)``.
+        Settled as :func:`_settling` says (``timing["settled"]``): from the structure, its
+        traces read off an abstract round 0 of the settled state, or by the abstract round 0 of
+        the state from the reset; where the scan's trace finds a form the structure did not give
+        (:class:`_Unformed`), or refuses, settled by the last and compiled again, so a run
+        refuses with the sentence round 0's trace refuses with (a step changing its params'
+        structure, a carry of another form than round 0's) whichever way it was settled.
+        ``replicas``: the pass's replica axis under ``batch=``, else ``()``."""
+        engine = self.engine
+        lead = replicas if self.batched else ()
+        how = TRACED if self.timing["settled"] == TRACED else _settling(engine, reset)
+        begun = time.perf_counter()
+        try:
+            if how == TRACED:
+                state = _settle(engine, reset, lead)
+            else:
+                state = _settle_static(engine, reset, lead, self.one)
+                if how == STATIC_TRACE:
+                    state = _with_traces(engine, state, lead, self.mesh)
+            self.timing["settle"] += time.perf_counter() - begun
+            begun = None
+            out = self._scan(state, strict=how != TRACED)
+        except (_Unformed, ValueError, TypeError):
+            if how == TRACED:
+                raise
+            if begun is not None:  # refused while the round 0 of the traces was evaluated
+                self.timing["settle"] += time.perf_counter() - begun
+            self.compiled = None
+            how = TRACED
+            begun = time.perf_counter()
+            state = _settle(engine, reset, lead)
+            self.timing["settle"] += time.perf_counter() - begun
+            out = self._scan(state)
+        self.timing["settled"] = how
+        return out[0], dict(state.carries), out[1]
+
+    def _scan(self, state, strict: bool = False):
+        """Every round from round 0, scanned in chunks: ``(state, records)``; ``strict``: the
+        state was settled statically, and the trace of the program checks its forms
+        (:class:`_Unformed`)."""
         dynamic, static = eqx.partition(state, eqx.is_array)
-        remaining = self.ticks - t
-        length = remaining if self.chunk is None else min(self.chunk, remaining)
-        padded = -(-remaining // length) * length
+        ticks = self.ticks
+        length = ticks if self.chunk is None else min(self.chunk, ticks)
+        padded = -(-ticks // length) * length
         if self.compiled is None or not _same_static(static, self.static):
-            last = self.ticks if padded != remaining else None
-            program = _scan_program(self.engine, static, self.fields, self.batched, last)
-            rounds = jnp.arange(t, t + length, dtype=jnp.int32)
+            last = ticks if padded != ticks else None
+            program = _scan_program(self.engine, static, self.fields, self.batched, last, self.mesh)
+            rounds = jnp.arange(0, length, dtype=jnp.int32)
+            begun = time.perf_counter()
+            self.engine.strict = strict
             try:
-                begun = time.perf_counter()
-                spread = _spread(dynamic) if self.batched else dynamic
-                compiled = program.lower(spread, rounds).compile()
+                self.compiled = program.lower(_placed(dynamic, self.mesh), rounds).compile()
+            finally:
+                self.engine.strict = False
                 self.timing["compile"] += time.perf_counter() - begun
-            except _Unsettled:
-                if t > _SETTLE or self.settled is not None:
-                    raise
-                return None
-            self.compiled, self.static, self.settled = compiled, static, t
-        dynamic = _spread(dynamic) if self.batched else dynamic
+            self.static = static
+        dynamic = _placed(dynamic, self.mesh)
         records = []
-        for s in range(t, t + padded, length):
+        for s in range(0, padded, length):
             rounds = jnp.arange(s, s + length, dtype=jnp.int32)
             begun = time.perf_counter()
             dynamic, record = jax.block_until_ready(self.compiled(dynamic, rounds))
@@ -2344,17 +2814,17 @@ class _Simulation:
                 {
                     "pass": self.passes,
                     "start": s,
-                    "rounds": min(length, self.ticks - s),
+                    "rounds": min(length, ticks - s),
                     "seconds": seconds,
                 }
             )
         if self.passes == 0:
-            self.timing["scanned"] += remaining
+            self.timing["scanned"] += ticks
         axis = 1 if self.batched else 0
-        if len(records) == 1 and padded == remaining:
+        if len(records) == 1 and padded == ticks:
             return eqx.combine(dynamic, static), records[0]
         joined = jax.tree_util.tree_map(
-            lambda *xs: jax.lax.slice_in_dim(jnp.concatenate(xs, axis), 0, remaining, axis=axis),
+            lambda *xs: jax.lax.slice_in_dim(jnp.concatenate(xs, axis), 0, ticks, axis=axis),
             *records,
         )
         return eqx.combine(dynamic, static), joined
@@ -2786,49 +3256,29 @@ def _box_value(name: str, port: str, value, kind: str, size: int) -> Array:
 # ----------------------------------------------------------------------- the trajectory
 
 
-def _series(
-    head: list, body, tail: list, null: Array, batch=None, flags=None
-) -> tuple[Array, Array]:
-    """A record over rounds: the values of ``head`` (arrays or ``None``), the rows of ``body`` (an
-    array stacked over the scanned rounds, or ``None``) and the values of ``tail``, absent ones as
-    zeros of the first present shape; with the flags of which were present. Under ``batch=``
-    every value has a leading replica axis and ``body`` its rounds second; the rounds are then
-    the second axis of the series, and the flags are broadcast over the replicas. ``flags``
-    gives a head entry's presence where its record holds it (``None`` entries: from its
-    value)."""
+def _series(body, null: Array, batch=None, body_present=None, tail=None) -> tuple[Array, Array]:
+    """A record over rounds: ``body``, stacked over the rounds (``None`` for a run of no rounds),
+    then, for what the slots received, the ``tail`` entry ``(value, present)``, what they hold
+    after the last round (``None`` where nothing has a value: zeros of the record's form, or of
+    ``null``); with the flags of which entries held a value (``body_present``, true where not
+    given). Under ``batch=`` every value has a leading replica axis and ``body`` its rounds
+    second."""
     lead = () if batch is None else (batch,)
     axis = len(lead)
-    rows = 0 if body is None else body.shape[axis]
-    like = next((v for v in head if v is not None), None)
-    if like is None and rows:
-        like = jnp.zeros(lead + body.shape[axis + 1 :], body.dtype)
-    if like is None:
-        like = next((v for v in tail if v is not None), None)
-    if like is None:
-        like = jnp.broadcast_to(null, lead + jnp.shape(null))
-    like = jnp.asarray(like)
-    parts, present = [], []
-
-    def row(v):
-        return jnp.expand_dims(jnp.zeros_like(like) if v is None else jnp.asarray(v), axis)
-
-    for i, v in enumerate(head):
-        parts.append(row(v))
-        flag = None if flags is None else flags[i]
-        present.append(v is not None if flag is None else flag)
-    if rows:
-        parts.append(body)
-        present.extend([True] * rows)
-    for v in tail:
-        parts.append(row(v))
-        present.append(v is not None)
-    if parts:
-        stacked = jnp.concatenate(parts, axis)
-    else:
-        stacked = jnp.zeros(lead + (0, *like.shape[axis:]), like.dtype)
-    if not present:
-        return stacked, jnp.zeros(lead + (0,), bool)
-    return stacked, jnp.stack([jnp.broadcast_to(jnp.asarray(p, bool), lead) for p in present], -1)
+    value, flag = (None, False) if tail is None else tail
+    if body is None:
+        like = null if value is None else jnp.asarray(value)[(0,) * axis]
+        body = jnp.zeros(lead + (0, *jnp.shape(like)), jnp.result_type(like))
+        body_present = jnp.zeros(lead + (0,), bool)
+    if body_present is None:
+        body_present = jnp.ones(lead + (body.shape[axis],), bool)
+    if tail is None:
+        return body, body_present
+    if value is None:
+        value, flag = jnp.zeros(lead + body.shape[axis + 1 :], body.dtype), False
+    stacked = jnp.concatenate([body, jnp.expand_dims(jnp.asarray(value, body.dtype), axis)], axis)
+    flags = jnp.broadcast_to(jnp.asarray(flag, bool), lead)[..., None]
+    return stacked, jnp.concatenate([jnp.asarray(body_present, bool), flags], -1)
 
 
 def _unstacked(stacked, static, rows: int, axis: int = 0) -> list:
@@ -2849,7 +3299,6 @@ def _assemble_record(
     ports,
     start,
     reset_carries,
-    heads,
     rest,
     final,
     fields,
@@ -2875,51 +3324,39 @@ def _assemble_record(
         if "received" in fields:
             rec, pres = {}, {}
             for slot in node.reads:
+                last = final[node.name][slot]
+                if isinstance(last, Maybe):
+                    tail = (last.value, last.present)
+                else:  # nothing has a value after a run of no rounds: (None, False)
+                    tail = (last, last is not None)
                 rec[slot], pres[slot] = _series(
-                    [h["received"][node.name][slot] for h in heads],
                     body("received", node.name, slot),
-                    [final[node.name][slot]],
                     slot_null(node, slot),
                     batch,
-                    [h.get("present", {}).get(node.name, {}).get(slot) for h in heads],
+                    body("present", node.name, slot),
+                    tail,
                 )
         em: dict[str, Array] | None = None
         if "emitted" in fields:
-            em = {}
-            for v in node.outs:
-                em[v], _ = _series(
-                    [h["emitted"][node.name][v] for h in heads],
-                    body("emitted", node.name, v),
-                    [],
-                    _null(types[v]),
-                    batch,
-                )
+            em = {
+                v: _series(body("emitted", node.name, v), _null(types[v]), batch)[0]
+                for v in node.outs
+            }
         it: dict[str, Array] | None = None
         if "intended" in fields:
-            it = {}
-            for a in node.chosen:
-                it[a], _ = _series(
-                    [h["intended"][node.name][a] for h in heads],
-                    body("intended", node.name, a),
-                    [],
-                    _null(types[a]),
-                    batch,
-                )
+            it = {
+                a: _series(body("intended", node.name, a), _null(types[a]), batch)[0]
+                for a in node.chosen
+            }
         decided, _ = _series(
-            [jnp.broadcast_to(jnp.asarray(h["decided"][node.name]), lead) for h in heads],
-            None if rest is None else rest["decided"][node.name],
-            [],
-            jnp.zeros((), bool),
-            batch,
+            None if rest is None else rest["decided"][node.name], jnp.zeros((), bool), batch
         )
         log = None
         if "carries" in fields:
-            log = [reset_carries[node.name], *(h["carries"][node.name] for h in heads)]
+            log = [reset_carries[node.name]]
             if rest is not None:
                 static = eqx.filter(state.carries[node.name], eqx.is_array, inverse=True)
-                log.extend(
-                    _unstacked(rest["carries"][node.name], static, ticks - len(heads), len(lead))
-                )
+                log.extend(_unstacked(rest["carries"][node.name], static, ticks, len(lead)))
             log = tuple(log)
         records[node.name] = Trajectory(
             None,
@@ -2988,31 +3425,15 @@ def _assemble_record(
 
     top = {k: build(k) for k in order if parents[k] is None}
     root = union("", {k: v for k, v in top.items() if v is not None})
-    return root._replace(params=state.home, faults=_faults(heads, rest, ticks, batch))
+    return root._replace(params=state.home, faults=_faults(rest))
 
 
-def _faults(heads: list, rest, ticks: int, batch=None) -> dict:
-    """The record's faults, a bool per round (and replica) under each label raised in any round:
-    the concrete rounds' (under ``batch=``, where they are traced) and the scan's."""
-    lead = () if batch is None else (batch,)
-    axis = len(lead)
-    labels = [label for h in heads for label in h["faults"]]
-    if rest is not None:
-        labels.extend(rest["faults"])
-    scanned = ticks - len(heads)
-    out = {}
-    for label in dict.fromkeys(labels):
-        parts = [
-            jnp.broadcast_to(jnp.asarray(h["faults"].get(label, False), bool), lead)[..., None]
-            for h in heads
-        ]
-        if rest is not None:
-            flags = rest["faults"].get(label)
-            if flags is None:
-                flags = jnp.zeros(lead + (scanned,), bool)
-            parts.append(jnp.asarray(flags, bool))
-        out[label] = jnp.concatenate(parts, axis)
-    return out
+def _faults(rest) -> dict:
+    """The record's faults, a bool per round (and replica) under each label raised in any
+    round."""
+    if rest is None:
+        return {}
+    return {label: jnp.asarray(flags, bool) for label, flags in rest["faults"].items()}
 
 
 def _relative(values: Mapping[str, Any] | None, node: str) -> dict[str, Any] | None:
@@ -3057,12 +3478,18 @@ def run(
     to the home each round (the next view is taken from the new home), and ``Trajectory.params``
     is the home after the last round.
 
-    The rounds after the first are one compiled ``lax.scan`` of the round body (module docstring,
-    *The compiled round*): a step is a traced function whose outputs keep the shapes and dtypes
-    of round 0 and whose carry keeps its structure, and a step that calls host-side code on a
-    traced value is refused naming it (log from inside a step with ``jax.debug.callback``, or
-    record what it sees in its carry). A check of a value that fails after round 0 is recorded
-    in ``Trajectory.faults`` and the run goes on; round 0 refuses it.
+    Every round, round 0 included, is one compiled ``lax.scan`` of the round body from the reset
+    (module docstring, *The compiled round*): a step is a traced function whose outputs keep one
+    shape and dtype from round to round and whose carry keeps the form it has from the reset on
+    (a ``plan()`` carry is filled at the reset; a custom step returns from its reset the carry
+    form every round returns, refused naming it otherwise), and a step that calls host-side code
+    on a traced value is refused naming it (log from inside a step with ``jax.debug.callback``,
+    or record what it sees in its carry). A slot whose variable the reset left without a value
+    and that the step reads before it is realised in round 0 is handed a :class:`Maybe`
+    ``(value, present)`` every round (a custom step reads ``obs[slot].value`` where
+    ``obs[slot].present``; ``plan()`` reads an absent value as an absent modality). A check of a
+    value inside the scan is recorded in ``Trajectory.faults`` and the run goes on, round 0
+    included; the reset's checks refuse.
 
     ``batch=B`` runs ``B`` replicas by one program (module docstring, *Replicas*): replica ``b``
     is the unbatched run under ``fold_in(key, b)``, or under ``key[b]`` when ``key`` is a stack
@@ -3073,13 +3500,25 @@ def run(
     ``per_replica`` names them: ``"params"`` (every array with a leading axis of ``B``,
     ``envs.generative.broadcast_params`` then the leaves that differ replaced; the durations and
     actuator kernels, which are structure, must agree across the replicas) and a stepped node
-    whose seed in ``carries`` leads with ``B``. Round 0 is traced under ``batch=``, so a check
-    it refuses unbatched is a recorded fault there. ``replicas_per_pass`` runs the replicas in
-    host passes of at most that many (the last filled with copies of the last replica, dropped),
-    one compiled program for all, bounding working memory, which is linear in the replicas a pass
-    holds; ``None`` is one pass. Under async each replica's order is a switch over the distinct
-    derived orders that vmap evaluates in full (cost: the number of orders times the step work),
-    refused above four sources.
+    whose seed in ``carries`` leads with ``B``. ``replicas_per_pass`` runs the replicas in host
+    passes of at most that many, one compiled program for all, bounding working memory, which is
+    linear in the replicas a pass holds; ``None`` is one pass. Under async each replica's order
+    is a switch over the distinct derived orders that vmap evaluates in full (cost: the number of
+    orders times the step work), refused above four sources.
+
+    *Devices.* A pass's replicas run in parallel across the local devices: each device runs the
+    whole scan over its share (a ``shard_map``, no rendezvous between rounds), the fewest
+    replicas per device the devices allow and the fewest devices at that load, a pass filled
+    with copies of its last replica to that multiple and the copies dropped (ten replicas on
+    sixteen devices run on ten; thirteen on eight run two each on seven).
+    ``Trajectory.timing`` records ``devices`` and ``replicas_per_device``. On a CPU host there
+    is one device unless ``XLA_FLAGS=--xla_force_host_platform_device_count=N`` is set before
+    jax is imported, and a batched run on one device is no faster than its replicas one after
+    another (a survey rover's step is compute-bound; ``batch=10`` on one device took 8.9 times
+    one replica's tick). Measured on a 16-core CPU host, the one-level survey: 101 replica-ticks
+    per second for ``batch=16`` over 16 host devices against 8.7 unbatched (11.7 times), and the
+    two-tier survey's ten 800-round replicas in 154 s against 1099 s one after another
+    (design batched-run.md, Phase C).
 
     ``record`` names the fields stacked over rounds (``"received"`` with its ``present``,
     ``"emitted"``, ``"intended"``, ``"carries"``; default all but ``"carries"``, which
@@ -3088,10 +3527,15 @@ def run(
     many rounds (one program re-run; a last chunk shorter than ``chunk`` runs padded rounds that
     change nothing and are dropped), ``None`` as one scan. ``Trajectory.timing`` holds the host's
     wall time: ``compile`` (the scan program, once), ``scan`` (its execution over every chunk
-    and pass) over ``scanned`` rounds, ``concrete`` (the rounds run before the scan) and
-    ``concrete_seconds`` (the resets and those rounds, their steps' own compiles included),
-    ``chunks`` (each chunk's ``pass``, ``start``, ``rounds`` and ``seconds``), ``passes`` and
-    ``replicas_per_pass``.
+    and pass) over ``scanned`` rounds, ``reset`` (the reset calls), ``settle`` (bringing the
+    state from the reset into every round's form) and ``settled`` (``"static"`` where the forms
+    were read off the structure; ``"static+trace"`` where a ``plan(trace=True)`` node's trace
+    was then read off an abstract round 0 of that state, whose trace of the planner the compile
+    reuses; ``"traced"`` where round 0 of the state from the reset was evaluated abstractly: a
+    custom step leaving an out-port without a value at its reset, or a carry whose form the
+    structure did not give), ``chunks`` (each chunk's ``pass``, ``start``,
+    ``rounds`` and ``seconds``), ``passes``, ``replicas_per_pass``, ``devices`` and
+    ``replicas_per_device``.
 
     A key of ``steps`` may be a tuple of nodes, a group stepped by one vmapped call (module
     docstring, *Groups*); refused, naming the fix: views that differ beyond their names in

@@ -32,6 +32,7 @@ from collections.abc import Callable, Mapping
 from numbers import Integral
 from typing import Any
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -215,7 +216,8 @@ def env_step(env: Env, params: Any = None, *, actions: Mapping[str, int] | None 
                 f"env_step: the in-ports {[_short(u) for u in ins]} are of both kinds, and a "
                 "positional action is a level vector or a float vector; declare one kind"
             )
-        missing = [u for u in ins if obs.get(u) is None]
+        #  a variable the reset left without a value is handed as run's Maybe (value, present)
+        missing = [u for u in ins if obs.get(u) is None or hasattr(obs.get(u), "present")]
         if missing:
             raise ValueError(
                 f"env_step: in-port(s) {missing} hold no value this round; the environment "
@@ -253,6 +255,15 @@ def env_step(env: Env, params: Any = None, *, actions: Mapping[str, int] | None 
                     f"env_step: in-port {_short(u)!r} holds level {int(level)}, and factor {at} "
                     f"of the environment takes {axes[at]} action levels; drive it within "
                     f"[0, {axes[at]})"
+                )
+            if not concrete and axes is not None:
+                # inside run's compiled rounds the level is traced: checked as the round runs
+                level = eqx.error_if(
+                    level,
+                    (level < 0) | (level >= axes[at]),
+                    f"env_step: in-port {_short(u)!r} holds a level outside [0, {axes[at]}), "
+                    f"and factor {at} of the environment takes {axes[at]} action levels; drive "
+                    f"it within [0, {axes[at]})",
                 )
             action = action.at[at].set(level.astype(null.dtype))
         return action

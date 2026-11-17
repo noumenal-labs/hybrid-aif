@@ -323,13 +323,20 @@ can (its zeros are floored at `LOG_ZERO`). A sampled *planner* on the tabular
 paths (several particles per policy, averaged) is a roadmap item, not a feature.
 Design: `design/amortization.md`, FLAG (1)'s amendment of 2026-09-20.
 
-**Compiled cores.** `replay` and `rollout` check their arguments eagerly and
-then run a compiled core, so a second call with the same model, trace length
-and switches reuses the program; pass the same `policy_fn` object to `rollout`
-to share it. `run`'s `plan()` step compiles its tick once per view and belief
-layout (a mixture System's first tick pads its priors, so twice), with the parameters as an
-argument rather than a baked-in constant; an all-illegal `legal=` mask is refused on the step's
-reset call, where the params are concrete.
+**Compiled cores.** `replay` checks its arguments eagerly and then runs a
+compiled core, so a second call with the same model, trace length and switches
+reuses the program. `run` compiles one `lax.scan` of every round from the reset
+(its record's `timing` says how long the compile and the scan took); `plan()`'s
+carry holds a mixture factor at `mixture_k` components from the reset on, so
+the program is one, with the parameters as an argument rather than a
+baked-in constant; an all-illegal `legal=` mask is refused on the step's reset
+call, where the params are concrete. Replicas of a closed System (seeds,
+starts, parameter draws) are `run(..., batch=B)`, one program; on a CPU host
+they run in parallel only across host devices
+(`XLA_FLAGS=--xla_force_host_platform_device_count=N`, set before jax is
+imported). `rollout`, the pymdp-style scan of an `Env` against a policy, was
+retired in 0.22.0: a model against its world is `run` over `with_mirror`, a bare
+`Env` a black box stepped by `env_step`.
 
 **The training side's episode format.** `train.buffers.Episode` carries the
 engine's columns — `obs`, `action`, `reward`, `cont` (one minus terminal, as

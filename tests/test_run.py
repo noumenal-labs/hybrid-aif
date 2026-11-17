@@ -34,7 +34,7 @@ from hybrid_aif.composition import (
 )
 from hybrid_aif.system import System, SystemParams
 from hybrid_aif.system.mirror import mirror
-from tests.host_log import logged, noted
+from tests.host_log import logged, noted, unflagged
 from tests.test_action_nodes import KERNEL, pusher
 from tests.test_merge import agent_and_world
 from tests.test_merge_gaussian_control import float_composite
@@ -77,7 +77,9 @@ def recorder(log, name, inner=None):
     inner = inner or level(1)
 
     def step(system, key, obs, carry, params):
-        jax.debug.callback(lambda o, p: log.append((name, o, system, p)), obs, params, ordered=True)
+        jax.debug.callback(
+            lambda o, p: log.append((name, unflagged(o), system, p)), obs, params, ordered=True
+        )
         return inner(system, key, obs, carry, params)
 
     return step
@@ -512,7 +514,7 @@ def test_sequential_derives_the_order_of_a_join_and_of_nodes_ready_together():
     def tagged(name):
         def step(system, key, obs, carry, p):
             if obs is not None:
-                calls.append(name)
+                noted(calls, name)
             return level(0)(system, key, obs, carry, p)
 
         return step
@@ -608,22 +610,29 @@ TABLE = ConditionalCategorical(log_table=jnp.log(jnp.full((3, 3, 3), 1 / 3)), pa
 
 def test_two_decays_of_one_dirichlet_summed_at_the_boundary_must_stay_positive():
     """Each learner decays the shared concentration from 1.0 by 0.6, which alone stays positive;
-    summed at the boundary of a ``"simultaneous"`` round they reach -0.2, refused with
-    ``write_back``'s sentence naming both nodes, as ``"sequential"`` refuses the second write-back
-    on its own."""
+    summed at the boundary of a ``"simultaneous"`` round they reach -0.2, which ``write_back``
+    refuses, as ``"sequential"`` refuses the second write-back on its own. Every round is traced
+    (round 0 included, design batched-run.md Phase C), so the refusal is a recorded fault of
+    the round under the variable, the variable keeping its round-start value (simultaneous) or
+    the first write-back (sequential), and the run goes on."""
     system, params = shared_field(COUNTS)
     steps = {"A": field_step("A", -0.6), "B": field_step("B", -0.6)}
-    with pytest.raises(ValueError, match=r"not positive after the views of \['A', 'B'\]"):
-        run(system, params, 1, KEY, steps)
-    with pytest.raises(ValueError, match="not positive after the view of 'B' learned"):
-        run(system, params, 1, KEY, steps, tick_order="sequential")
+    together = run(system, params, 2, KEY, steps)
+    assert together.faults["A.field"].tolist() == [True, True]
+    np.testing.assert_array_equal(
+        together.params.parameters["A.field"].concentration, COUNTS.concentration
+    )
+    one_by_one = run(system, params, 2, KEY, steps, tick_order="sequential")
+    assert one_by_one.faults["A.field"].tolist() == [True, True]
+    np.testing.assert_allclose(
+        one_by_one.params.parameters["A.field"].concentration, COUNTS.concentration - 0.6
+    )
 
 
 def test_custom_steps_sharing_a_variable_that_is_not_counts_are_checked_at_the_boundary():
     """A custom step is not known to learn before it returns, so ``"simultaneous"`` runs two
-    custom steps that share a table variable and learn nothing, and refuses them at the boundary
-    of the first round in which both wrote it back, naming the variable, the nodes and the
-    round."""
+    custom steps that share a table variable and learn nothing, and records a fault at the
+    boundary of each round in which both wrote it back, under the variable."""
     system, params = shared_field(TABLE)
     run(system, params, 2, KEY, {"A": field_step("A", None), "B": field_step("B", None)})
     traj = run(system, params, 2, KEY, {"A": field_step("A", 0.5), "B": field_step("B", None)})
@@ -631,12 +640,11 @@ def test_custom_steps_sharing_a_variable_that_is_not_counts_are_checked_at_the_b
         traj.params.parameters["A.field"].log_table, TABLE.log_table + 1.0, rtol=1e-6
     )
     steps = {"A": field_step("A", 0.5), "B": field_step("B", 0.5)}
-    with pytest.raises(
-        ValueError,
-        match=r"'A.field' \(ConditionalCategorical\) was written back by both 'A' and 'B' in "
-        "round 0",
-    ):
-        run(system, params, 2, KEY, steps)
+    # every round is traced (round 0 included), so the refusal is a recorded fault of each round
+    # in which both wrote it back, and the variable keeps its round-start value
+    both = run(system, params, 2, KEY, steps)
+    assert both.faults["A.field"].tolist() == [True, True]
+    np.testing.assert_array_equal(both.params.parameters["A.field"].log_table, TABLE.log_table)
     run(system, params, 2, KEY, steps, tick_order="sequential")
 
 
@@ -681,7 +689,9 @@ class Recording(runner._Plan):
         self.log = log
 
     def __call__(self, system, key, obs, carry, params):
-        jax.debug.callback(lambda o, p: self.log.append((o, system, p)), obs, params, ordered=True)
+        jax.debug.callback(
+            lambda o, p: self.log.append((unflagged(o), system, p)), obs, params, ordered=True
+        )
         return super().__call__(system, key, obs, carry, params)
 
 
@@ -809,9 +819,15 @@ def test_the_first_call_of_each_kind_of_step():
     system, params = pair()
     traj = run(system, params, 2, KEY, {"model": plan(), "world": sample()}, record_carries=True)
     model, world = traj["model"], traj["world"]
-    # plan() returns nothing and leaves the declared initial priors as the first prior
+    # plan() returns nothing and leaves the declared initial priors as the first prior: its
+    # carry after the reset holds them, in the form every round's carry has (design
+    # batched-run.md Phase C), and says no round has run
     assert model.start == {}
-    assert isinstance(model.carries[0], MindCarry) and model.carries[0].beliefs is None
+    first = model.carries[0]
+    assert isinstance(first, MindCarry) and not bool(first.started)
+    initial = system.initial_priors(params)
+    for name, belief in first.beliefs.items():
+        np.testing.assert_array_equal(belief.probs, initial[name].probs)
     # sample() returns the emissions of the initial state, which enter round 0, and the state
     assert set(world.start) == {"see"} and set(world.carries[0]) == {"world.x"}
     assert model.present["see"].tolist() == [True, True, True]

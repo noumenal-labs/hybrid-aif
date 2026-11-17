@@ -392,7 +392,12 @@ def test_plan_threads_the_empirical_prior():
     view, vp = subsystem(composite, cp, "agent")
     step = plan()
     out, carry, given = step(view, KEY, None, None, vp)  # the reset: nothing out, a fresh carry
-    assert out == {} and given is vp and carry == MindCarry()
+    # holding the declared initial priors, and no round run yet
+    assert out == {} and given is vp and not bool(carry.started)
+    assert carry._replace(beliefs=None, started=None) == MindCarry()
+    initial = view.initial_priors(vp)
+    for name, belief in carry.beliefs.items():
+        np.testing.assert_array_equal(belief.probs, initial[name].probs)
     obs = view.as_env(vp)[0].reset(KEY, view.as_env(vp)[1])[0]
     action, carry, given = step(view, KEY, obs, carry, vp)
     assert given is vp

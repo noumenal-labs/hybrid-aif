@@ -538,21 +538,22 @@ def host_step(sensor):
 
 @pytest.mark.parametrize("order", ORDERS)
 def test_a_black_box_step_in_host_python_is_refused_naming_the_step(order):
-    """The rounds after the first run in one compiled scan (design batched-run.md R1, R8), so a
-    step is a traced function: a black box's step that reads a value on the host (here
-    ``int(np.asarray(...))`` of the command it is handed) is refused naming the step and the
-    remedy. A run of one round, on concrete values only, still runs it."""
+    """Every round runs in one compiled scan from the reset (design batched-run.md R1, R8, and
+    Phase C: round 0 included), so a step is a traced function: a black box's step that reads a
+    value on the host (here ``int(np.asarray(...))`` of the command it is handed) is refused
+    naming the step and the remedy, in a run of one round too. Its reset, unbatched, runs on
+    concrete values and may read the host (here an iterator)."""
     system, params = coupled()
-    with pytest.raises(
-        ValueError, match=r"the step of 'world' calls host-side code on a traced value"
-    ):
-        steps = {"agent": plan(), "world": host_step(_Sensor())}
-        run(system, params, 5, KEY, steps, tick_order=order)
+    for ticks in (5, 1):
+        with pytest.raises(
+            ValueError, match=r"the step of 'world' calls host-side code on a traced value"
+        ):
+            steps = {"agent": plan(), "world": host_step(_Sensor())}
+            run(system, params, ticks, KEY, steps, tick_order=order)
     sensor = _Sensor()
     steps = {"agent": plan(), "world": host_step(sensor)}
-    rec = run(system, params, 1, KEY, steps, tick_order=order)
-    assert sensor.sent == [int(rec["agent"].emitted["push"][0])]
-    assert rec["world"].emitted["o"].dtype == jnp.int32
+    rec = run(system, params, 0, KEY, steps, tick_order=order)
+    assert sensor.sent == [] and int(rec["world"].start["o"]) == 0
 
 
 def test_a_host_step_returning_the_wrong_shape_or_type_is_refused_naming_the_port():
@@ -698,7 +699,9 @@ def test_env_step_refuses_a_level_out_of_range_and_an_uncontrolled_factor():
         ins={"a_loc": (LEVEL, 7)}, outs={"loc": (LEVEL, 5), "r": (LEVEL, 3), "c": (LEVEL, 3)}
     )
     system, params = couple({"brain": brain, "world": world}, [Identify("brain.a", "world.a_loc")])
-    with pytest.raises(ValueError, match="holds level 6, and factor 0 .* takes 5 action levels"):
+    # every round is traced (design batched-run.md Phase C): the level is checked as the round
+    # runs, and the run stops with the sentence
+    with pytest.raises(Exception, match="holds a level outside .*factor 0 .* takes 5 action"):
         run(system, params, 1, KEY, {"brain": say(6), "world": env_step(env, env_params)})
     uncontrolled = env_step(env, env_params, actions={"a_loc": 1})
     with pytest.raises(ValueError, match="factor 1, which the environment's transitions take no"):

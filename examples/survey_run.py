@@ -36,6 +36,7 @@ the terrain instead of the image. The runs are written to one bundle for the pro
 REPORT.md summarises them.
 
     python examples/survey_run.py --out DIR [--settings id,id] [--ticks 200] [--seed 0]
+    python examples/survey_run.py --out DIR --replicas 10   # seeds 0..9 by one batched run
     python examples/survey_run.py --out DIR --assemble     # merge the part files into bundle
     python examples/survey_trim.py DIR/bundle.json OUT_DIR   # the page's bundle.js
 """
@@ -49,6 +50,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+if __name__ == "__main__":  # before jax is imported: --replicas runs the seeds by one batched run
+    from host_devices import replicas_in_argv, use_host_devices
+
+    use_host_devices(replicas_in_argv())
 
 import equinox as eqx
 import jax
@@ -484,13 +490,16 @@ def run_setting(
     starts=PLANNER_STARTS,
     encoder=None,
     confusion=None,
+    replicas=None,
 ):
     """One run of a setting: the two-tier agent (``run_tiered``, ``tiers`` 2), or the rover alone
     coupled to the world (the one-level setting). The
     camera's form is the setting's (``camera_mode``): the image through ``decoder``, or the
-    reading of the recogniser ``encoder`` through its ``confusion`` table, or none."""
+    reading of the recogniser ``encoder`` through its ``confusion`` table, or none. With
+    ``replicas``, the seeds ``seed`` to ``seed + replicas - 1`` by one batched ``run``
+    (``run_keys``), a list of their results, the timing harness run once."""
     if setting.get("tiers") == 2:
-        return run_tiered(setting, ticks, decoder, steps, starts, encoder, confusion)
+        return run_tiered(setting, ticks, decoder, steps, starts, encoder, confusion, replicas)
     mode = camera_mode(setting)
     rs, rp, _, _ = rover_of(setting, decoder, confusion)
     system, params = couple(
@@ -499,28 +508,57 @@ def run_setting(
     )
     world_step, readout = sensors(mode, encoder)
     start = setting.get("start_energy")
-    rec = run(
+    batched = run(
         system,
         params,
         ticks,
-        jax.random.PRNGKey(setting["seed"]),
+        run_keys(setting["seed"], replicas),
         steps={"rover": rover_plan(setting, steps, starts, "rover."), "world": world_step},
         tick_order="sequential",
         carries=None if start is None else {"world": {"energy": start}},
         record_carries=True,
+        batch=replicas,
     )
-    seconds = run_seconds(rec, ticks)
+    seconds = run_seconds(batched, ticks)
     decoder = params.likelihood.get("rover.img")
 
     def record(carry):
         return rover_record(carry, setting, "rover.", decoder, rs.policy_len)
 
-    rows = tick_rows(rec, "rover", ticks, record, seconds, recognise=readout)
-    return dict(
-        ticks=rows,
-        planner=dict(steps=steps, starts=starts),
-        timing=timing(rec, "rover", setting, decoder, confusion, steps, starts),
-    )
+    harness = None
+    results = []
+    for rec in replicas_of(batched, replicas, params):
+        rows = tick_rows(rec, "rover", ticks, record, seconds, recognise=readout)
+        if harness is None:
+            harness = timing(rec, "rover", setting, decoder, confusion, steps, starts)
+        results.append(dict(ticks=rows, planner=dict(steps=steps, starts=starts), timing=harness))
+    return results[0] if replicas is None else results
+
+
+def run_keys(seed, replicas=None):
+    """The run key of a setting's ``seed``, or, for ``replicas``, a stack of the keys of the
+    seeds ``seed`` onward, one per replica of a batched ``run``."""
+    if replicas is None:
+        return jax.random.PRNGKey(seed)
+    return jnp.stack([jax.random.PRNGKey(seed + b) for b in range(replicas)])
+
+
+def replicas_of(rec, replicas, params):
+    """The records of a batched run one replica each, in the form of an unbatched record (every
+    array cut at the replica; the params as handed in where no step wrote back), or ``[rec]``
+    for an unbatched run."""
+    if replicas is None:
+        return [rec]
+
+    def cut(b):
+        def leaf(x):
+            return x[b] if eqx.is_array(x) else x
+
+        home = params if rec.params is params else jax.tree_util.tree_map(leaf, rec.params)
+        body = jax.tree_util.tree_map(leaf, rec._replace(params=None, timing=None))
+        return body._replace(params=home, timing=rec.timing)
+
+    return [cut(b) for b in range(replicas)]
 
 
 SLOW_TICKS = ss.SURVEY_TICKS  # fast ticks per slow step
@@ -685,10 +723,11 @@ def run_tiered(
     starts=PLANNER_STARTS,
     encoder=None,
     confusion=None,
+    replicas=None,
 ):
     """A run of the two-tier agent coupled to the world: one ``run`` call over the closed System
     steps the scheduler (``plan()``, once per option, its trace recorded), the rover (every round)
-    and the world (every round)."""
+    and the world (every round); with ``replicas``, a list, as ``run_setting`` gives."""
     system, params = survey_system(decoder, setting, confusion)
     world_step, readout = sensors(camera_mode(setting), encoder)
     every = setting["slow_ticks"]
@@ -700,18 +739,33 @@ def run_tiered(
         learn=ss.learn_rates("agent.mission."),
     )
     rover = rover_plan(setting, steps, starts, "agent.rover.")
-    rec = run(
+    batched = run(
         system,
         params,
         ticks,
-        jax.random.PRNGKey(setting["seed"]),
+        run_keys(setting["seed"], replicas),
         steps={"agent.mission": mission, "agent.rover": rover, "world": world_step},
         clocks={"agent.mission": every / ss.SURVEY_TICKS},
         tick_order="sequential",
         carries=None if start is None else {"world": {"energy": start}},
         record_carries=True,
+        batch=replicas,
     )
-    seconds = run_seconds(rec, ticks)
+    seconds = run_seconds(batched, ticks)
+    harness = None
+    results = []
+    for rec in replicas_of(batched, replicas, params):
+        result, harness = _tiered_result(
+            rec, setting, ticks, params, seconds, steps, starts, readout, confusion, harness
+        )
+        results.append(result)
+    return results[0] if replicas is None else results
+
+
+def _tiered_result(
+    rec, setting, ticks, params, seconds, steps, starts, readout, confusion, harness
+):
+    """One replica's result of ``run_tiered``, and the timing harness (run on the first)."""
     scheduler = rec["agent.mission"]
     options = scheduler.intended["option"]
     decided = [t for t in range(ticks) if bool(scheduler.decided[t])]
@@ -735,16 +789,18 @@ def run_tiered(
 
     rows = tick_rows(rec, "agent.rover", ticks, record, seconds, extra, recognise=readout)
     learned = rec.params.parameters["agent.mission.energy_table"]
+    if harness is None:
+        harness = timing(rec, "agent.rover", setting, decoder, confusion, steps, starts)
     return dict(
         ticks=rows,
         planner=dict(steps=steps, starts=starts),
-        timing=timing(rec, "agent.rover", setting, decoder, confusion, steps, starts),
+        timing=harness,
         #  the scheduler's energy table at the run's end (the parameter home after the last
         #  round): its record, and its counts, which a later mission's setting may start from
         #  (``energy_counts``)
         energy_table=energy_record(learned),
         energy_counts=np.asarray(learned.concentration, np.float64).tolist(),
-    )
+    ), harness
 
 
 def downsampled_maps():
@@ -1399,6 +1455,13 @@ def main():
         help="observe the position fix (--no-fix: the fix ablation, vision-only localisation)",
     )
     ap.add_argument("--tag", default="")
+    ap.add_argument(
+        "--replicas",
+        type=int,
+        default=None,
+        help="run the seeds seed..seed+N-1 of each setting by one batched run (one part file "
+        "each, tagged _s<seed>); on a CPU host with XLA_FLAGS unset, one host device per core",
+    )
     args = ap.parse_args()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1419,18 +1482,29 @@ def main():
         if not args.fix:
             s["fix"] = False
         result = run_setting(
-            s, args.ticks, decoder, args.steps, args.starts, encoder=encoder, confusion=confusion
+            s,
+            args.ticks,
+            decoder,
+            args.steps,
+            args.starts,
+            encoder=encoder,
+            confusion=confusion,
+            replicas=args.replicas,
         )
         elapsed = time.time() - t0
-        result["seconds"] = elapsed
-        part = out_dir / f"part_{s['id']}{args.tag}.json"
-        part.write_text(json.dumps(dict(runs={s["id"]: result}, settings={s["id"]: s})))
-        print(
-            f"{s['id']}: {elapsed:.1f}s ({elapsed / args.ticks:.2f}s/tick; the compiled "
-            f"rounds {result['ticks'][0]['seconds']:.2f}s/tick) final coverage "
-            f"{result['ticks'][-1]['coverage']:.3f}",
-            flush=True,
-        )
+        results = [result] if args.replicas is None else result
+        for b, one in enumerate(results):
+            one["seconds"] = elapsed
+            setting = s if args.replicas is None else dict(s, seed=s["seed"] + b)
+            tag = args.tag if args.replicas is None else f"{args.tag}_s{setting['seed']}"
+            part = out_dir / f"part_{s['id']}{tag}.json"
+            part.write_text(json.dumps(dict(runs={s["id"]: one}, settings={s["id"]: setting})))
+            print(
+                f"{s['id']}{tag}: {elapsed:.1f}s ({elapsed / args.ticks:.2f}s/tick; the compiled "
+                f"rounds {one['ticks'][0]['seconds']:.2f}s/tick) final coverage "
+                f"{one['ticks'][-1]['coverage']:.3f}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

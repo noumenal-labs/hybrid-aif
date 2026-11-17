@@ -31,7 +31,9 @@ symmetric), so any deterministic rule breaks the tie the same way for both and t
 part; stochastic selection breaks it by chance. From an asymmetric start the two
 compositions behave alike.
 
-Run as a script it prints the identity check and the comparison::
+Run as a script it prints the identity check and the comparison, the 32 stochastic coupled
+episodes by one batched ``run`` (:func:`coupled_split_by_tick`; on a CPU host with
+``XLA_FLAGS`` unset it sets one host device per core first, ``host_devices.py``)::
 
     .venv/bin/python examples/compose_minds.py
 
@@ -40,6 +42,16 @@ docs/composing-systems.md
 """
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+if __name__ == "__main__":  # before jax is imported: the comparison runs 32 episodes batched
+    from host_devices import use_host_devices
+
+    use_host_devices(32)
 
 import dataclasses
 
@@ -356,6 +368,28 @@ def split_by_tick(episode, episodes: int, ticks: int = 8, seed: int = 0, **kwarg
     return by_tick, first
 
 
+def coupled_split_by_tick(
+    episodes: int, ticks: int = 8, seed: int = 0, start=SYMMETRIC, selection="deterministic"
+):
+    """:func:`split_by_tick` of :func:`coupled_episode` by one batched ``run``: the
+    ``episodes`` (keys ``seed`` onward, one replica each) stepped by one program, each replica
+    the episode its key runs alone. Returns what :func:`split_by_tick` returns."""
+    system, params = coupled(start)
+    keys = jnp.stack([jax.random.PRNGKey(seed + i) for i in range(episodes)])
+    steps = coupled_steps(selection)
+    record = run(system, params, ticks, keys, steps, record_carries=True, batch=episodes)
+    carries = record["world"].carries
+    a = np.stack([np.asarray(c["world.a"]) for c in carries], axis=1)
+    b = np.stack([np.asarray(c["world.b"]) for c in carries], axis=1)
+    first = []
+    for path_a, path_b in zip(a, b, strict=True):
+        t = split_tick(path_a, path_b)
+        first.append(-1 if t is None else t)
+    first = np.asarray(first)
+    by_tick = np.asarray([np.mean((first >= 0) & (first <= t)) for t in range(ticks + 1)])
+    return by_tick, first
+
+
 def policy_counts(policy_len: int = 2) -> dict[str, int]:
     """How many policies each planner scores a tick: the merged mind's joint ones, and one
     coupled mind's own."""
@@ -375,7 +409,7 @@ def main() -> None:
         print(f"  merged, deterministic: split at tick {split_tick(*path)}")
         path = coupled_episode(jax.random.PRNGKey(0), start)
         print(f"  coupled, deterministic: split at tick {split_tick(*path)}")
-        _, first = split_by_tick(coupled_episode, 32, start=start, selection="stochastic")
+        _, first = coupled_split_by_tick(32, start=start, selection="stochastic")
         print(f"  coupled, stochastic: first split ticks over 32 episodes {first.tolist()}")
 
 

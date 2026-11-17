@@ -559,7 +559,8 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   `lax.scan` for the horizon loops; no explicit inverses. Enumeration and the
   sophisticated planner now fold one prefix-sharing policy tree
   (`planning/tree.py`). Also in this release: the `sophisticated` planner
-  (PR #6), one compiled rollout shared by `random_policy` (PR #4), the
+  (PR #6), one compiled rollout shared by `random_policy` (PR #4; both retired in
+  0.22.0, batched `run` the simulation path), the
   switching noise statistic laid out as inference lays it out (PR #5), and the
   two-rollout rule reaching recognition (`infer_states(key=)`, a sampled
   posterior for acting).
@@ -579,8 +580,9 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   (`design/model-description-0.3.md`).
 - **v0.12.0 (2026-10-13)**: control nodes, action nodes, composition by `merge()` and
   `couple()`, and description 0.3. Migrating from 0.11.0:
-  - Faces are keyed by name: `infer_states`, `step`, `rollout` and the rest take and return
-    mappings keyed by factor and modality name; positional tuples are refused.
+  - Faces are keyed by name: `infer_states`, `step`, `rollout` (retired in 0.22.0) and the
+    rest take and return mappings keyed by factor and modality name; positional tuples are
+    refused.
   - `couple()` on Systems is `merge()`; `couple()` now wires participants' ports into a
     `Wiring` that `run` takes. (`merge` makes one particle; `couple` joins separate particles,
     and what crosses a wire is action or sensation, `design/nesting-and-coupling.md` N1, N2.)
@@ -1225,6 +1227,36 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   noise under `epistemic` (no novelty term yet), `plan_learning` on it (not a table), one prior
   object under two readers, `durations.compose` of a learned noise. Design:
   `design/process-noise-learning.md` D1–D4 and its As built.
+
+- **v0.22.0**: **`run` takes `batch=`.** `run(..., batch=B)` runs `B` replicas of a closed
+  System by one program: replica `b` is the unbatched run under `fold_in(key, b)` (or `key[b]`
+  for a stack of keys), bitwise under simultaneous and sequential; `per_replica=["params", ...]`
+  names the inputs with a leading replica axis (params, a node's seed in `carries`); `record=`
+  names the fields stacked over rounds, `chunk=` runs the scan in compiled chunks and
+  `replicas_per_pass=` in host passes, one program for all. A tuple key of `steps`,
+  `steps={("agent.rover1", "agent.rover2"): step}`, steps copies of one leaf by one vmapped call
+  of the step, simultaneous among themselves, their Dirichlet write-backs summed (equal to the
+  ungrouped simultaneous run). Every round, round 0 included, is one compiled `lax.scan` from the
+  reset: a step is a traced function, a check of a value inside it is recorded in
+  `Trajectory.faults` (a non-positive Dirichlet sum, two writers of a non-counts variable, a
+  level out of range) where it used to refuse on round 0, and `Trajectory.timing` holds the
+  compile, the scan and the device count. A slot whose variable the reset left without a value,
+  read before it is realised in round 0, is handed a `Maybe(value, present)` every round (a
+  custom step reads `obs[slot].value` where `obs[slot].present`); `plan()`'s carry has its
+  every round's form from the reset (`MindCarry.started`, a mixture factor padded to
+  `mixture_k`). Async under a batch draws each replica's order (refused above four sources).
+  **On a CPU host the speedup needs host devices**: replicas run in parallel only across
+  devices (each device runs the whole scan over its share, a `shard_map`), and a CPU host has
+  one unless `XLA_FLAGS=--xla_force_host_platform_device_count=N` is set before jax is
+  imported; on one device a batched survey run is no faster than its replicas one after
+  another. Measured on a 16-core host, the one-level survey: 101 replica-ticks per second at
+  `batch=16` over 16 devices against 8.7 unbatched; the two-tier survey's ten 800-round
+  replicas in 154 s against 1099 s one after another. `examples/survey_run.py --replicas N` and
+  `examples/compose_minds.py` set the flag when it is unset (`examples/host_devices.py`).
+  **`rollout` is retired** (`hybrid_aif.rollout`, `random_policy`, `History`): a model against
+  its world is `run` over `with_mirror`, a bare `Env` a black box stepped by `env_step`, both
+  batched; `Env`, `GenerativeEnv`, `as_env` and `broadcast_params` stay. Design:
+  `design/batched-run.md` R1–R14.
 
 ## In the field / in flight
 

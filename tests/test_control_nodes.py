@@ -663,11 +663,6 @@ def test_sugar_sentences_name_counts_and_the_face():
     s, _ = tmaze_system(policy_len=2)
     with pytest.raises(ValueError, match=r"state_names has 2 name\(s\) for 1 state factor\(s\)"):
         dataclasses.replace(s, B_deps=((0,), (1,)))
-    native, q = _tmaze_variant(((2, 0), (1,), ()), lambda t: jnp.swapaxes(t, 1, 2), lambda t: t)[2:]
-    with pytest.raises(NotImplementedError, match="^describe: |^random_policy: "):
-        from hybrid_aif.rollout import random_policy
-
-        random_policy(native, q)
 
 
 # ------------------------------------------- clamp and belief, targets on control nodes (C3, C7)

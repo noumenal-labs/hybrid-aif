@@ -43,7 +43,7 @@ from hybrid_aif.composition import (
 )
 from hybrid_aif.composition.merge import _inputs_of, retake
 from hybrid_aif.system.mirror import mirror
-from tests.host_log import logged
+from tests.host_log import logged, unflagged
 from tests.test_merge import OBSERVATION_BINDINGS, agent_and_world, merged
 from tests.test_merge_gaussian_control import mission as mission_tier
 from tests.test_merge_gaussian_control import rover as lg_rover
@@ -69,8 +69,11 @@ PINNED_LOCATION = [0, 3, 3, 3, 3]
 
 
 def _bump_any(view, params):
-    """The params of ``view`` with the shared field one count higher, wherever it is named."""
-    from tests.test_run_parity import _bump
+    """The params of ``view`` with the shared field one count higher, wherever it is named. Called
+    inside a traced step: a first import there would build the imported modules' arrays on the
+    trace, so it is evaluated at compile time."""
+    with jax.ensure_compile_time_eval():
+        from tests.test_run_parity import _bump
 
     return _bump(view, params)
 
@@ -406,7 +409,7 @@ def test_a_step_that_does_not_learn_writes_nothing_and_a_learner_beside_it_still
         return action, carry, same
 
     traj = run(system, params, 1, KEY, _shared_steps(_learning(), plain))
-    assert f"{M}mission.cell_obs" in seen[0] and seen[0][f"{M}mission.cell_obs"] is None
+    assert unflagged(seen[0])[f"{M}mission.cell_obs"] is None
     assert np.array_equal(_home_field(traj.params), _home_field(params) + 1)
     idle = run(system, params, 1, KEY, _shared_steps(plan(), plain))
     assert idle.params is params  # nothing learned: the very object handed in

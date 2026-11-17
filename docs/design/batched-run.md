@@ -531,3 +531,218 @@ need. Two Phase C items follow:
   otherwise it silently runs on one device (`batch=10` on 16 devices: 1.3×). Use the largest
   device count that divides the pass, or pad the pass to a multiple of the device count and drop
   the padding, and report the device count in `Trajectory.timing`.
+
+## As built (Phase C, 2026-11-17)
+
+*Built under the delegation of the opening note; no commit. Seven items, in order: the run settled
+from the reset, independent per-device scans, the device flag in the examples and docs, `rollout`
+retired (R14), the version (0.22.0), the gate. The optional `replicas_per_pass` sizing from
+`branching_tree_memory` was not built.*
+
+**1. Settled from the reset.** Round 0 is the scan's first round; `_Unsettled`, `_SETTLE` and
+the concrete rounds are gone, unbatched and under `batch=`, with no class of custom step left that
+needs them.
+
+- *(b) The mixture carry.* `plan()`'s reset puts the declared initial priors in
+  `MindCarry.beliefs`, each factor carried as a mixture brought to `mixture_k` components by
+  `objectives.hybrid.as_mixture` (`pad_mixture`: dead components at `PAD_LOG_WEIGHT`, component
+  0's moments); round 0 filters from them instead of `priors=None`. On the survey pins every
+  belief and plan array of the two-tier run (the 2 → 4 component rover) is bitwise as recorded:
+  inference, the propagation and the Runnalls/mode-aligned reduce are invariant to the padding
+  bitwise there. The arrays that differ are the world's (below).
+- *(a) Absent values: the contract.* A variable the reset leaves without a value (an action node
+  or emission of a `plan()` node, which returns nothing at its reset) holds zeros of its form in
+  the state with a presence flag. A slot is handed **`Maybe(value, present)`**
+  (`composition.Maybe`, an `equinox.Module`) when, and only when, its variable may have no value
+  at the reader's turn of round 0: no value at the reset and read at the round's boundary, or
+  before its owner's turn. That is a static fact of the structure pass (per derived order under
+  async), and such a slot is handed a `Maybe` every round, `present` false in round 0 and true
+  after; every other slot is handed its value, as before. `plan()` reads `present` as the
+  modality's traced presence (`infer_states(present=...)`); `sample()` refuses a `Maybe` on a
+  driven control node (it refused the `None` before, in `sample_step`); a sliced step's level
+  that comes as a `Maybe` is a probability vector, the one-hot or, absent, uniform (the average a
+  view takes of a variable with no value), every round, so one view structure serves every round.
+  A custom step that reads such a slot reads `obs[slot].value` where `obs[slot].present`; one that
+  fails on the `Maybe` is refused naming the slot. A step mark choosing the form was considered
+  and not built: the flagged form is needed only where absence is not static for every round,
+  and there a `None` cannot be handed by one program.
+- *Carries.* After the reset `run` evaluates round 0 abstractly (`eqx.filter_eval_shape` of the
+  round body on the state straight from the reset, nothing run) and settles the state into its
+  form: zeros and flags for the absent values; a `MindCarry` (read off the carry, so any wrapper
+  of `plan()` settles too) gets `previous`, `action`, `trace` and `plan` as zeros of round 0's
+  form and the new field `started` (false at the reset, true after any round) gates the learning
+  of round 0 by a select; `_shifted` of a zero plan is the zero plan, so the warm start needs no
+  gate. Any other carry must already have round 0's form (Python numbers are made arrays first);
+  otherwise refused naming the step.
+- *Round 0's value refusals are recorded faults everywhere*, unbatched included (round 0 is
+  traced everywhere now): a non-positive Dirichlet sum, two writers of a non-counts variable, a
+  level out of range, a learned sliced table, params changed outside the variables. The reset's
+  checks still refuse. `env_step`'s level range, which it checked on concrete values only, is
+  checked inside the scan by `eqx.error_if` and stops the run with its sentence (a runtime error,
+  not a recorded fault: an environment handed an action it does not take has no next state).
+- *What it saves.* One-level survey, 200 ticks, unbatched: before the scan, Phase B spent 17.99 s
+  (compile 7.78 s, the reset and concrete round 0 10.21 s, holding round 0's own `plan()`
+  compile), Phase C 13.79 s (reset 2.13 s, the abstract round 0 3.29 s, compile 8.37 s): **4.2 s
+  saved**, less than round 0's ~8 s compile because the abstract round 0 traces the round once
+  more. Under `batch=` the concrete round was a vmapped eager call and the saving is larger: 10.0
+  s at `batch=16` (29.7 → 19.7 s), 8.8 s on the two-tier survey at `batch=10` (31.8 → 22.9 s).
+  `Trajectory.timing` reports `reset` and `settle` in place of `concrete` and
+  `concrete_seconds`; `scanned` is now every round (`ticks`).
+- *The survey pins* pass at their tolerance and are not re-recorded: two-tier 719 of 725 arrays
+  bitwise (the gauge and true energy level of ticks 1–3 differ, at most 6.3e-8 relative), one-tier
+  146 of 177 (at most 9.4e-7 relative). Round 0's world step and planner now run fused inside the
+  scan, the XLA-fusion difference Phase A's re-pin describes; float32 rounding, nothing semantic.
+  `run_parity.npz` (including the async re-pin), `clock_parity.npz` and the B6 fixtures pass
+  bitwise, and `tests/test_batched_run.py` holds bitwise as in Phase B.
+- *Settle without a trace (2026-11-17, after the gate below).* The abstract round 0 traced the
+  whole round, the planner's search included (3.3 s on the one-level survey), and the scan's
+  compile traced it again. The state is now settled from the structure where its forms follow
+  from it (`_settling`, `_settle_static`): a variable a `plan()` node leaves without a value at
+  the reset takes zeros of its port's form (an action node `_null`: an int32 level, a float32
+  vector of a continuous node's width; an emission on a level port under `realise="stats"` a
+  float32 probability vector, any other the `_null` form); its `MindCarry` takes `previous` of
+  the form of `beliefs` (the canonical prior: the posterior a round stores has its form),
+  `action` one `_null` per chosen action node and, under `warm_start`, `plan` as
+  `_first_plan` of the view's control space (the rule `_warm` builds its first `init` by, now
+  one function). A wrapper made with `functools.wraps` settles as the `plan()` it wraps. Any
+  other carry stays as its reset returned it (Python numbers made arrays).
+  *Where a form is not derivable.* A `plan(trace=True)` node's `Trace` has the form of its
+  planner's search: round 0 is evaluated abstractly on the state already settled from the
+  structure, wrapped as the scan wraps it (vmapped, inside the `shard_map`), and the trace's
+  form read off it (`_with_traces`). `_plan_tick` is jitted and is then traced on the very
+  forms and in the context of the scan, so the compile reuses that trace and the search is
+  traced once (evaluated vmapped but outside the `shard_map`, the cache missed: compile 12.5 s
+  at `batch=16`, no saving). A custom step that leaves an out-port without a value at its
+  reset, or a `MindCarry` not from `plan()` left unfilled, settles by the Phase C path (round
+  0 of the state from the reset). The survey rover keeps its trace, so the surveys take the
+  first fallback; a run of `plan()` minds without traces and steps that return every out-port
+  at their reset traces nothing in the settle.
+  *One contract.* The scan of a state settled from the structure is traced strictly (`_exact`):
+  a variable or carry a round returns in another structure, shape or dtype than the settled
+  state (where the scan would convert it) abandons the compile (`_Unformed`), and the state is
+  settled by the Phase C path and compiled again. So a reset carry of another form than round
+  0's is refused by `_formed`'s sentence as before (pinned: a Python float then a vector, a
+  dict gaining a key), and one Phase C converted (an integer round 0 makes a float) is
+  converted as before, at the cost of one more trace. A refusal raised on that trace takes the
+  same path, so a run refuses with the sentence round 0's trace refuses with (a step changing
+  its params' structure is refused naming the parameter, as `test_run_nested.py` pins, not by
+  the scan's generic structure sentence). `Trajectory.timing["settled"]` records
+  the path: `"static"`, `"static+trace"`, `"traced"` (`None` for a run of no rounds);
+  `timing["settle"]` stays the seconds. Pinned in `tests/test_settle.py`: both paths settle one
+  state (tree structure, shapes, dtypes and values) on the pusher pair under each order and
+  `batch=3`, `plan(learn=True)` minds, a `plan(trace=True)` mind unbatched and `batch=2`, and
+  the one-level survey; the paths taken; the refusal; the dtype fallback. A scratch plugin
+  settled every run of the 36 test files that call `run` both ways (831 tests): 213 settles
+  equal, no fallback but the test that asks for one. No fixture re-recorded, no tolerance
+  changed.
+  *Measured* (seconds before the scan, settle + compile; one configuration per process):
+
+  | configuration | Phase C (traced settle) | settled from the structure | saved |
+  |---|---|---|---|
+  | one-level, 200 ticks, unbatched | 3.59 + 9.26 = 12.85 | 3.39 + 5.29 = 8.68 | 4.2 |
+  | one-level, `batch=16`, 16 devices | 4.28 + 12.28 = 16.56 | 4.43 + 7.85 = 12.28 | 4.3 |
+  | two-tier, 800 ticks, `batch=10`, 10 devices | 5.07 + 14.63 = 19.70 | 5.32 + 8.77 = 14.08 | 5.6 |
+
+  All three took `"static+trace"`; the settle's seconds are now the planner's one trace, which
+  the compile no longer repeats. Scan seconds unchanged (22.9, 31.3, 110.6).
+
+**2. Independent per-device scans.** `_spread` (the state of one scan sharded over the devices)
+is gone. With several local devices the vmapped scan is `jax.shard_map(vmap(scan), mesh,
+in_specs=(P("replicas"), P()), out_specs=P("replicas"), check_vma=False)` under `jit`: each
+device runs the whole scan over its share, no collective, no rendezvous between rounds. The
+divisibility trap is fixed by the pass's width: `_devices_for(size)` takes the fewest replicas
+per device the devices allow, then the fewest devices holding the pass at that load, and each
+pass is filled with copies of its last replica to `devices × per_device` (the copies dropped, per
+pass): ten replicas on sixteen devices run on ten, sixteen on eight run two each, thirteen on
+eight run two each on seven (one copy). `Trajectory.timing` records `devices` and
+`replicas_per_device`. On four host devices the pusher pair at `batch=4, 3, 6` is bitwise its
+unbatched runs. Measured (one-level survey, 200 ticks, replica-ticks per second of scan
+execution; this machine, one configuration per process):
+
+| configuration | Phase C (`shard_map`) | Phase B (sharded scan) | ceiling (independent processes) |
+|---|---|---|---|
+| unbatched | 8.7 | 8.1 | — |
+| `batch=16`, 16 devices | **101.4 / 102.8** (two runs); 57.4 s real, 9.2 cores busy | 52.1; 6.5 cores | 89.0 (16 processes) |
+| `batch=16`, 8 devices (two each) | **71.2**; 71.1 s real, 5.9 cores | 56.1 | 57.9 (8 processes) |
+| `batch=10`, 16 host devices | **77.9** (ten devices used); 52.4 s real | 10.2 (one device) | — |
+
+Two-tier survey, 800 ticks, `batch=10` on 10 devices: **154 s** real (149 s in process; scan
+111.8 s, 71.5 replica-ticks per second, 8.2 cores busy, peak RSS 3.9 GB), against 214 s for the
+Phase B sharded scan and 1099 s for ten sequential runs (7.1×). The independent scans beat the
+process ceiling at sixteen devices (one process, one compile, shared host memory against sixteen
+processes each compiling) and at eight; the sharded form's gap was the per-round
+synchronisation, as the device-scaling reading guessed.
+
+**3. The device flag.** `examples/host_devices.py` (`use_host_devices(replicas)`,
+`replicas_in_argv()`): run as a script, an example that runs replicas batched sets
+`XLA_FLAGS=--xla_force_host_platform_device_count=min(os.cpu_count(), replicas)` before it imports
+jax when the flag is unset, and prints one line saying so. `examples/survey_run.py` gains
+`--replicas N` (seeds `seed` to `seed + N - 1` by one batched run, one part file each, tagged
+`_s<seed>`; the timing harness run once); `examples/compose_minds.py` runs its 32 stochastic
+coupled episodes by one batched run (`coupled_split_by_tick`, equal to the episodes one by one,
+tested). `run`'s docstring (*Devices*) and `docs/capabilities.md` (v0.22.0) state that on a CPU
+host the speedup needs host devices, with the numbers above.
+
+**4. `rollout` retired.** `src/hybrid_aif/rollout.py` (`rollout`, `_rollout_batched`,
+`random_policy`, `History`, its `Trajectory`) and `tests/test_rollout.py` are deleted; `Env`,
+`GenerativeEnv`, `as_env` and `broadcast_params` stay. Coverage moved onto batched `run`
+(`tests/test_batched_run.py`, with `uniform_step`, the random policy as a step): the keyed against
+the positional process (`test_keyed_faces.py`'s rollout parity) becomes
+`test_a_world_sampled_by_name_equals_its_positional_env_as_a_black_box` (the T-maze model against
+its mirror stepped by `sample()`, and against a black box running the positional T-maze by
+`env_step`: observations, actions and states equal replica for replica); four envs with different
+reward probabilities becomes `test_replicas_of_a_process_with_different_params_keep_its_structure`
+(`per_replica=["params"]`, and replicas under different keys differ); the LG and switching envs'
+dtypes and shapes, and the action keyed by action node (`test_action_nodes.py`), are read off a
+batched run over `with_mirror`. Deleted as rollout's own: the History window's shapes, mask,
+sliding and sentinels, rollout's jit determinism, `random_policy`'s range, keyed draw and refusal
+of continuous controls, the one compiled rollout shared by equal policies, and rollout's
+refusals of a policy of the wrong action form (and in `test_control_nodes.py` the
+`random_policy` refusal). Docs: `project-brief.md` (the simulation path, workstream F, the
+roadmap entry now landed), `design/system.md` (both passages), `composing-systems.md` (compiled
+cores), `capabilities.md` (the two history entries annotated). The grep before: `rollout(` or
+`hybrid_aif.rollout` in `src/hybrid_aif/rollout.py`, `tests/test_rollout.py`,
+`test_keyed_faces.py` (8), `test_action_nodes.py`, `test_control_nodes.py`; after: only local
+functions of other names (`one_mind_rollout`, `cosine_sim_to_pref_rollout`, test-local
+`rollout` helpers in `test_mountain_car_env.py`, `test_demo_lg.py`, `examples/sensor_detour.py`)
+and a historical design row; the notebooks never imported it.
+
+**6. Version 0.22.0** (`pyproject.toml`, `CITATION.cff` with `date-released: 2026-11-17`,
+`__version__`, the CHANGELOG row, the capabilities entry).
+
+**Refusals added**, each a sentence naming the fix: a step whose reset carry differs in form from
+round 0's ("return from the reset a carry of the structure, shapes and dtypes every round returns
+(zeros where round 0 sets a value, with a flag that says whether it is set)"); a custom step that
+fails on a `Maybe` ("read obs[s].value where obs[s].present (jnp.where), or have the variable's
+owner return it at its reset (obs is None)"); `sample()` handed a `Maybe` on a driven control node
+("have the driver return that variable at its reset, drive the node from an action node, or run
+under "sequential" with the driver listed first"); a clocked node whose carry changes form under a
+traced decide-or-hold ("return a carry of the form it was handed every round, from the reset
+on"); `env_step`'s level out of range inside the scan (the concrete sentence, as a runtime error).
+Removed: the unsettled-state refusal after three rounds, and the batch-only refusal of a clocked
+node whose carry still changed form.
+
+**Changed from the brief, and why.** (1) The saving of item 1 is 4.2 s unbatched, not ~8 s: the
+settle traces round 0 abstractly. (2) `env_step`'s range check is a runtime error, not a recorded
+fault (above). (3) The `Maybe` level of a sliced step is a probability vector every round; no
+fixture exercises it. (4) `examples/survey_run.py` had no batch CLI; `--replicas` was added so
+the flag has a batched run to serve.
+
+**Test changes.** Contract changes, no tolerance loosened: `test_run.py` (the boundary refusals
+are faults of each round; a trace-time append counts a log by `jax.debug.callback`; the reset's
+carry holds the declared priors and `started` false; logged observations normalised by
+`tests/host_log.unflagged`), `test_batched_run.py` (`scanned` counts round 0, chunks `[5, 5, 3]`,
+the unbatched replica's fault recorded; seven tests added: devices and the moved rollout
+coverage), `test_black_box.py` (a host-side step is refused in a run of one round too; the reset
+still reads the host; the range check's runtime sentence), `test_plan_warm_start.py`,
+`test_run_both_ways.py` (the reset carry), `test_run_nested.py` and `test_sibling_read.py`
+(`unflagged`; an import inside a traced step moved to compile time, since a first import on the
+trace built `test_couple`'s module arrays as tracers), `test_keyed_faces.py`,
+`test_action_nodes.py`, `test_control_nodes.py` (item 4), `test_demo_compose_minds.py` (one
+added).
+
+**7. Gate.** Full suite (`pytest -x -q`): 3961 passed, 2 skipped, 9 deselected, 1 xpassed in
+1168 s. `ruff check` and `ruff format --check` on `src tests examples` clean.
+`examples/demo.ipynb` re-executed by nbconvert, exit 0, no error output (it never touched
+`rollout`; it imports `compose_minds`, whose import is unchanged). The survey regression pins,
+`tests/test_batched_run.py` and the parity fixtures pass as stated under item 1.

@@ -13,10 +13,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from hybrid_aif.composition import run, sample, with_mirror
 from hybrid_aif.distributions import InverseGamma
-from hybrid_aif.envs import Env, GenerativeEnv, broadcast_params
+from hybrid_aif.envs import Env, GenerativeEnv
 from hybrid_aif.replay import replay
-from hybrid_aif.rollout import random_policy, rollout
 from tests.test_cem import lq_system
 from tests.test_system import tmaze_system
 
@@ -182,46 +182,36 @@ def test_as_env_speaks_names_and_rolls_out_a_continuous_modality():
     assert list(obs) == ["position"] and obs["position"].shape == (1,)
     assert list(state) == ["state"]
 
-    B, T, W = 2, 5, 3
-    batched = broadcast_params(env_params, B)
-    traj = rollout(KEY, env, batched, random_policy(system, params), T, B, window_len=W)
-    assert traj.observations["position"].shape == (B, T + 1, 1)
-    assert traj.observations["position"].dtype == jnp.float32
-    assert traj.states["state"].shape == (B, T + 1, 2)
-    assert traj.actions["a_state"].shape == (B, T) and traj.actions["a_state"].dtype == jnp.int32
-    hist = traj.history
-    assert hist.obs["position"].shape == (B, T, W, 1)
-    assert hist.actions["a_state"].shape == (B, T, W)
-    #  the window holds each tick's observation, right-aligned, with -1 sentinels to its left
-    obs_seq, valid = np.asarray(traj.observations["position"]), np.asarray(hist.valid)
-    window = np.asarray(hist.obs["position"])
-    for t in range(T):
-        for i in range(W):
-            src = t - (W - 1 - i)
-            if src >= 0:
-                assert np.array_equal(window[:, t, i], obs_seq[:, src])
-            else:
-                assert np.all(window[:, t, i] == -1.0) and not valid[:, t, i].any()
+    #  the same process run forward by name under batched run (design batched-run.md R14): the
+    #  model coupled to its mirror, the world sampled, the model choosing at random
+    B, T = 2, 5
+    traj = run(*with_mirror(system, params), T, KEY, _random_world_steps(), batch=B)
+    position = traj["world"].emitted["position"]
+    assert position.shape == (B, T, 1) and position.dtype == jnp.float32
+    assert traj["world"].carry["world.state"].shape == (B, 2)
+    action = traj["model"].emitted["a_state"]
+    assert action.shape == (B, T) and action.dtype == jnp.int32
 
 
 def test_a_mixed_categorical_and_lg_env_rolls_out_with_each_dtype():
     system, params = _example("switching_filter").make_agent()
-    env, env_params = system.as_env(params)
-    traj = rollout(KEY, env, broadcast_params(env_params, 2), random_policy(system, params), 3, 2)
-    assert traj.observations["y"].dtype == jnp.float32 and traj.observations["y"].shape == (2, 4, 1)
-    assert traj.states["mode"].dtype == jnp.int32 and traj.states["mode"].shape == (2, 4)
-    assert traj.states["x"].shape == (2, 4, 1)
-    assert list(traj.actions) == ["a_x"]
+    traj = run(
+        *with_mirror(system, params), 3, KEY, _random_world_steps(), batch=2, record_carries=True
+    )
+    y = traj["world"].emitted["y"]
+    assert y.dtype == jnp.float32 and y.shape == (2, 3, 1)
+    mode = traj["world"].carries[-1]["world.mode"]
+    assert mode.dtype == jnp.int32 and mode.shape == (2,)
+    assert traj["world"].carries[-1]["world.x"].shape == (2, 1)
+    assert list(traj["model"].emitted) == ["a_x"]
 
 
-def test_random_policy_on_a_system_draws_what_the_positional_one_draws():
-    system, params = tmaze_system()
-    k = jax.random.PRNGKey(3)
-    keyed_draw = random_policy(system, params)(k, None, 0)
-    positional = random_policy((5,))(k, None, 0)
-    assert np.array_equal(system.to_positional("actions", keyed_draw), positional)
-    with pytest.raises(ValueError, match="continuous control nodes"):
-        random_policy(lq_system()[0], lq_system()[1])
+def _random_world_steps():
+    """The steps of a model against its mirror: the model choosing uniformly at random, the
+    world sampled forward."""
+    from tests.test_batched_run import uniform_step
+
+    return {"model": uniform_step, "world": sample()}
 
 
 # ------------------------------------------------------------------------ more refusals
@@ -370,21 +360,8 @@ def test_keyed_env_matches_its_positional_process_by_name_eagerly_and_under_jit_
             assert np.array_equal(got_obs[name], want_obs[m])
         for f, name in enumerate(system.names.states):
             assert np.array_equal(got_state[name], want_state[f])
-
-    B, T = 2, 4
-    batched = broadcast_params(ep, B)
-    keyed_traj = rollout(KEY, env, batched, random_policy(system, params), T, B)
-    flat_batched = broadcast_params(positional_ep, B)
-    flat_traj = rollout(KEY, env.inner, flat_batched, random_policy((5,)), T, B)
-    for m, name in enumerate(system.modality_names):
-        assert np.array_equal(keyed_traj.observations[name], flat_traj.observations[m])
-        assert np.array_equal(keyed_traj.history.obs[name], flat_traj.history.obs[m])
-    for f, name in enumerate(system.names.states):
-        assert np.array_equal(keyed_traj.states[name], flat_traj.states[f])
-    assert np.array_equal(keyed_traj.actions["a_location"], flat_traj.actions[..., 0])
-    assert np.array_equal(
-        keyed_traj.history.actions["a_location"], flat_traj.history.actions[..., 0]
-    )
+    #  under batched run, replica for replica: test_batched_run's
+    #  test_a_world_sampled_by_name_equals_its_positional_env_as_a_black_box
 
 
 # ---------------------------------------------------------------- the keyed InferenceDetail
@@ -589,7 +566,7 @@ class _Counter(Env):
 
 
 def test_generative_env_wraps_an_outside_positional_env_given_a_system():
-    from hybrid_aif import Categorical, ConditionalCategorical, System, SystemParams
+    from hybrid_aif import System
 
     system = System(
         A_deps=((0,),),
@@ -599,21 +576,11 @@ def test_generative_env_wraps_an_outside_positional_env_given_a_system():
         state_names=("count",),
         modality_names=("seen",),
     )
-    #  the control's levels live with the tables: three, read by the one transition
-    params = SystemParams(
-        likelihood={"seen": ConditionalCategorical(log_table=jnp.zeros((2, 2)), parent_ndims=1)},
-        transition={
-            "count": ConditionalCategorical(log_table=jnp.zeros((2, 2, 3)), parent_ndims=2)
-        },
-        initial_state_prior={"count": Categorical(logits=jnp.zeros(2))},
-    )
     env = GenerativeEnv.wrap(_Counter(), system)
     obs, state = env.reset(KEY, 10)  # an outside env's own params pass through untouched
     assert obs == {"seen": 0} and list(state) == ["count"]
     obs, state = env.step(KEY, state, {"a_count": jnp.asarray(2, jnp.int32)}, 10)
     assert int(obs["seen"]) == 20 and int(state["count"]) == 2
-    traj = rollout(KEY, env, jnp.full((2,), 10), random_policy(system, params), 3, 2)
-    assert traj.observations["seen"].shape == (2, 4) and list(traj.actions) == ["a_count"]
     with pytest.raises(ValueError, match=r"has 1 state factor\(s\), the System 2"):
         GenerativeEnv.wrap(_Counter(), tmaze_system()[0])
 
@@ -831,22 +798,6 @@ def test_a_continuous_control_refuses_a_non_float_block():
     beliefs = system.initial_priors(params)
     with pytest.raises(ValueError, match=r"actions\['a_x'\] has dtype int32; .* take float blocks"):
         system.update_empirical_prior(params, beliefs, {"a_x": jnp.zeros((1,), jnp.int32)})
-
-
-def test_a_keyed_policy_on_a_positional_env_is_refused_with_the_converter_sentence():
-    from hybrid_aif.reference.envs.tmaze import tmaze
-
-    system, params = tmaze_system()
-    process, raw = tmaze(reward_probability=0.98, punishment_probability=0.98, cue_validity=0.98)
-    with pytest.raises(
-        TypeError, match=r"policy returned a mapping, but this env takes a positional"
-    ):
-        rollout(KEY, process, broadcast_params(raw, 2), random_policy(system, params), 2, 2)
-    env, ep = system.as_env(tmaze_system()[1])
-    with pytest.raises(
-        TypeError, match=r"policy returned a positional array, but this env takes a mapping"
-    ):
-        rollout(KEY, env, broadcast_params(ep, 2), random_policy((5,)), 2, 2)
 
 
 def _flat_priors():
