@@ -201,11 +201,12 @@ def survey():
 
 
 def test_one_node_is_the_enumeration_planner(survey):
-    """The one-rover scheduler, horizon 4, 625 sequences. Against the flat scan of the same grid
-    (the score the factorised planner uses) the posterior is the same to 1e-6. The enumeration
-    planner scores its grid as a prefix tree, whose novelty leaf (``transition:map``, about 44
-    nats summed over 256 cells) differs from the flat scan's by float reassociation, 2.4e-4 nats
-    at most (5e-6 relative); at the scheduler's ``gamma`` of 16 that is 2.3e-4 in ``q_pi``
+    """The one-rover scheduler, horizon 4, ``N_OPTIONS ** 4`` sequences (625 at five options,
+    2,401 at seven). Against the flat scan of the same grid (the score the factorised planner
+    uses) the posterior is the same to 1e-6. The enumeration planner scores its grid as a prefix
+    tree, whose novelty leaf (``transition:map``, about 44 nats summed over 256 cells) differs
+    from the flat scan's by float reassociation, 2.4e-4 nats at most (5e-6 relative); at the
+    scheduler's ``gamma`` of 16 that is 2.3e-4 in ``q_pi`` at five options and 2.0e-4 at seven
     (measured 2026-11-18), pinned at 1e-3."""
     ss, sm = survey
     grid, centres = sm.field_grid()
@@ -213,10 +214,11 @@ def test_one_node_is_the_enumeration_planner(survey):
     assert system.policy_len == ss.HORIZON == 4
     beliefs = dict(params.initial_state_prior)
     q, tree, joint = _plan(system, params, beliefs, get_planner("enumeration"))
-    assert joint.shape == (625, 4, 1)
+    n = sm.N_OPTIONS
+    assert joint.shape == (n**4, 4, 1)
     qf, _, fp = _plan(system, params, beliefs, make_factorised_planner())
-    want = action_marginals(q, joint, (5,))[0].probs
-    assert qf.probs.shape == (5,)
+    want = action_marginals(q, joint, (n,))[0].probs
+    assert qf.probs.shape == (n,)
     np.testing.assert_allclose(qf.probs, want, atol=1e-3)
     assert int(jnp.argmax(qf.probs)) == int(jnp.argmax(want))
     #  against the flat scan of the same grid: the same posterior, to float tolerance
@@ -228,7 +230,7 @@ def test_one_node_is_the_enumeration_planner(survey):
     )
     q_flat = policy_posterior(flat, system.gamma)
     np.testing.assert_allclose(fp.posteriors[0].probs, q_flat.probs, atol=TOL)
-    np.testing.assert_allclose(qf.probs, action_marginals(q_flat, joint, (5,))[0].probs, atol=TOL)
+    np.testing.assert_allclose(qf.probs, action_marginals(q_flat, joint, (n,))[0].probs, atol=TOL)
     assert float(fp.movement) == 0.0  # one node: the second sweep scores what the first did
 
 
@@ -236,7 +238,8 @@ def test_one_node_is_the_enumeration_planner(survey):
 
 
 def two_rovers(ss, sm, gamma=None):
-    """The two-rover scheduler at horizon 2 (25 sequences a rover, 625 joint), the field learned
+    """The two-rover scheduler at horizon 2 (``N_OPTIONS ** 2`` sequences a rover, their square
+    joint: 25 and 625 at five options, 49 and 2,401 at seven), the field learned
     within the plan, durations and readings as the demo declares them, and a field holding some
     counts (a third of the cells read three times, at seeded terrain levels), so that the novelty
     the two rovers share depends on where each goes. ``gamma`` replaces the System's (16)."""
@@ -268,26 +271,29 @@ def test_the_coupled_scheduler_against_the_product(survey):
     largest absolute difference of a first-step marginal from the enumeration planner's: 1.0e-9
     at ``gamma`` 16 (the posteriors near one-hot: rover 1 surveys sector 4, rover 2 charges;
     3.2e-6 after one sweep), 1.6e-4 at ``gamma`` 1 (1.1e-3 after one sweep, the rovers planned
-    against each other's uniform marginals). The argmax agrees in both. The gap is the mean
+    against each other's uniform marginals), at five options; at seven (a charge option per
+    sunny region) 1.0e-9 and 4.1e-4. The argmax agrees in both. The gap is the mean
     field's: the field's novelty is evaluated at the other rover's expected readings, not
     averaged over its plans (F2)."""
     ss, sm = survey
     gaps = {}
     for gamma, bound in ((None, 1e-7), (1.0, 5e-4)):
         system, params, beliefs = two_rovers(ss, sm, gamma)
-        assert system.policies(params).shape == (625, 2, 2)
+        n = sm.N_OPTIONS
+        assert system.policies(params).shape == (n**4, 2, 2)
         gap, agree, fp = _marginal_gap(system, params, beliefs, sweeps=3)
         gaps[gamma] = gap
         print(f"gamma {gamma or system.gamma}: largest marginal gap after 3 sweeps {gap:.3g}")
         assert agree
         assert gap < bound
-        assert [g.shape for g in fp.grids] == [(25, 2), (25, 2)]
+        assert [g.shape for g in fp.grids] == [(n**2, 2), (n**2, 2)]
     assert gaps[1.0] > 1e-5  # coupled: the gap is not zero
 
 
 def test_the_sweeps_move_and_settle(survey):
     """On the coupled case at ``gamma`` 1, the movement (the largest change of a marginal in the
-    last sweep) of one, two and three sweeps, measured 2026-11-18: 0.395, 9.0e-4, 8.9e-8."""
+    last sweep) of one, two and three sweeps, measured 2026-11-18: 0.395, 9.0e-4, 8.9e-8 at five
+    options; 0.377, 4.9e-4, 8.3e-7 at seven."""
     ss, sm = survey
     system, params, beliefs = two_rovers(ss, sm, 1.0)
     moves = []
@@ -298,6 +304,50 @@ def test_the_sweeps_move_and_settle(survey):
     assert moves[0] > 0.1  # the first sweep leaves the uniform start
     assert moves[0] > moves[1] > moves[2]
     assert moves[1] < 5e-3 and moves[2] < 1e-5
+
+
+def _intermediate_sizes(jaxpr, out):
+    """Every intermediate's shape in ``jaxpr`` and the jaxprs nested in its equations."""
+    for eqn in jaxpr.eqns:
+        out.extend(tuple(getattr(v.aval, "shape", ())) for v in eqn.outvars)
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, tuple | list) else (param,):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    _intermediate_sizes(inner, out)
+    return out
+
+
+def test_the_other_nodes_marginals_are_read_once_per_step_not_once_per_sequence(survey):
+    """The cost pin. Node ``k``'s sequences are scored with the other nodes' marginals closed
+    over, not vmapped, so every reader of another node contracts its table against the marginal
+    once per step. Broadcast to ``(P, H, n_j)`` and vmapped (the first build), the two-rover
+    scheduler at horizon 3 and seven options materialised the rover transition table's
+    contraction per sequence, ``(343, 256, 256, 8, 7)``, and one decision of three sweeps took
+    30.8 s against the enumeration planner's 0.03 s; scored once per step it takes 0.46 s
+    (measured 2026-11-18). Pinned on the jaxpr of one sweep: no intermediate carrying the
+    sequence axis is as large as ``P`` copies of the largest unbatched one (the table)."""
+    ss, sm = survey
+    grid, centres = sm.field_grid()
+    system, params = ss.scheduler(
+        grid,
+        centres,
+        rovers=2,
+        policy_len=ss.JOINT_HORIZON,
+        durations=True,
+        readings=True,
+        plan_learning=("parameter:field",),
+    )
+    beliefs = dict(params.initial_state_prior)
+    count = sm.N_OPTIONS**ss.JOINT_HORIZON
+    closed = jax.make_jaxpr(
+        lambda p, b: system.infer_policies(p, b, planner=make_factorised_planner(sweeps=1))
+    )(params, beliefs)
+    shapes = _intermediate_sizes(closed.jaxpr, [])
+    batched = max(int(np.prod(s)) for s in shapes if len(s) > 1 and s[0] == count)
+    unbatched = max(int(np.prod(s)) for s in shapes if not s or s[0] != count)
+    print(f"largest per-sequence intermediate {batched:,}, largest unbatched {unbatched:,}")
+    assert batched < count * unbatched
 
 
 # --------------------------------------------------------------------------- 5. the refusals

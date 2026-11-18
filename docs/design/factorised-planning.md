@@ -174,9 +174,9 @@ two-rover scheduler declaring `"factorised"`, pin 6) is the next commit's.
 - `planning/factorised.py`: `FactorisedPolicies` (the F3 fields), `factorised_plan(ctx, sweeps,
   use_bound, metrics) -> (q_pi, FactorisedPolicies)`, `make_factorised_planner(sweeps=3)`, and
   `factorised_planner` registered as `"factorised"` (three sweeps). Each node's sequences are
-  scored by `evaluate_policies` (under `metrics`) or `evaluate_policies_total` over a
-  `ControlStep` holding the node's own levels `(n_k^H, H)` and every other node's step marginals
-  broadcast `(n_k^H, H, n_j)`; Gauss–Seidel in node order, the sweeps an unrolled Python loop.
+  scored by `_score_node`, the flat scan of `evaluate_policies` (under `metrics`) or
+  `evaluate_policies_total` over a `ControlStep` holding the node's own level and every other
+  node's step marginal `(n_j,)`, closed over (see below); Gauss–Seidel in node order, the sweeps an unrolled Python loop.
   `q_pi` is over `enumerate_policies(num_controls, 1)`, its logits the sum of the nodes'
   first-step log-marginals (by logsumexp over each posterior). Exported from `hybrid_aif.planning`.
 - `planning/enumerate.py` `sample_action` reads a `FactorisedPolicies` as its `first`, so both
@@ -186,7 +186,16 @@ two-rover scheduler declaring `"factorised"`, pin 6) is the next commit's.
   through the registry, and `plan()` / `run` needed no change: `_Plan._enumerated` gives `None`,
   `Trace.plans` holds the NamedTuple, and the carry's structure is that of every round (pinned
   over three rounds of `run`'s scan).
-- Tests: `tests/test_factorised_planner.py`, 11 tests.
+- Tests: `tests/test_factorised_planner.py`, 12 tests.
+- *The other nodes' marginals are read once per step* (fixed the same day): scoring through
+  `evaluate_policies` broadcast them to `(n_k^H, H, n_j)` and vmapped them, so every reader of
+  node j contracted its table once per sequence (the rover transition's `(343, 256, 256, 8, 7)`),
+  and one two-rover decision at seven options and horizon 3 took 30.8 s for three sweeps (6.5 s
+  for one) against the enumeration planner's 0.03 s. `_score_node` now writes the flat scan
+  (both the tree and the folded-total forms) with the marginals closed over, unbatched under the
+  vmap (policy-independent-leaves.md H2): 0.46 s for three sweeps, 0.17 s for one, the
+  posteriors bit-identical, pinned on the jaxpr (no per-sequence intermediate as large as `P`
+  copies of the table).
 
 **The pins, measured.**
 
