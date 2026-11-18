@@ -1893,14 +1893,19 @@ def _row_of(tree, i: int):
     return jax.tree_util.tree_map(lambda x: x[i] if eqx.is_array(x) else x, tree)
 
 
-def _swapper(a: str, b: str, keep: frozenset) -> Callable:
+def _swapper(a: str, b: str, keep: frozenset, pairs: dict | None = None) -> Callable:
     """A renaming of every name in a tree from component ``a``'s to ``b``'s and back (the swap
     of the two prefixes, an involution), the names in ``keep`` (the parameter variables both
-    views share) left as they are: dict keys, string leaves and the strings in a dataclass's or
-    a module's fields, a ``<head>:<name>`` key by its name. Arrays are untouched."""
+    views share) left as they are and the names in ``pairs`` (the ports of the members'
+    partners, paired by ``_partner_pairs``; closed under inversion) taken to their pair before
+    any prefix is read: dict keys, string leaves and the strings in a dataclass's or a module's
+    fields, a ``<head>:<name>`` key by its name. Arrays are untouched."""
     pa, pb = f"{a}{SEPARATOR}", f"{b}{SEPARATOR}"
+    pairs = pairs or {}
 
     def name(s: str) -> str:
+        if s in pairs:
+            return pairs[s]
         if s in keep:
             return s
         if s == a:
@@ -1957,13 +1962,95 @@ def _same_tree(a, b) -> bool:
     )
 
 
+def _equal(x, y) -> bool:
+    """Whether two static declarations are equal (``False`` where comparing them is not a
+    truth value, as for arrays)."""
+    try:
+        return bool(x == y)
+    except (TypeError, ValueError):
+        return False
+
+
+def _partner_pairs(names, a: str, b: str, lead_view, view, keep: frozenset) -> dict:
+    """The ports of member ``b``'s partners paired with those of the first member ``a``'s (design
+    batched-run.md R12, amended 2026-11-18), so that copies of one node wired to different ports
+    of their partners are one view up to the swap: a driven control node's driver by the
+    member's own port (the ``identified`` pair whose own node is the swap of the first's), an
+    emission by its declaration (the member's one emission equal to the first's under the swap,
+    its parents, realisation and kernel). Each pair ``x <-> y`` comes with the pair of their
+    prefix swaps, so the swap stays an involution. Refused, naming the port: a driven node the
+    member does not have, an emission whose declaration two of the first's share, a name paired
+    with two, and a pair holding a parameter variable both views share. Returns the pairs,
+    closed under inversion."""
+    prefix = _swapper(a, b, keep)
+    pairs: dict[str, str] = {}
+
+    def pair(x: str, y: str, port: str) -> None:
+        if prefix(x) == y:
+            return
+        for u, v in ((x, y), (prefix(x), prefix(y))):
+            for s, w in ((u, v), (v, u)):
+                if s in keep or pairs.get(s, w) != w:
+                    clash = (
+                        "a parameter variable both views share"
+                        if s in keep
+                        else f"paired with {pairs[s]!r} already"
+                    )
+                    raise ValueError(
+                        f"run: the group {names} renames {b!r} to {a!r} by its partners' ports "
+                        f"as well as its name, and at {port!r} the pairing is inconsistent: "
+                        f"{s!r} would be paired with {w!r}, and it is {clash}; a group holds "
+                        "copies of one node, each wired to its own port of a partner: wire the "
+                        "copies to distinct ports, or step them ungrouped"
+                    )
+                pairs[s] = w
+
+    theirs = dict(view.subsystems)
+    for component, sub in lead_view.subsystems:
+        other = theirs.get(prefix(component))
+        if other is None:
+            continue  # the views differ in structure: refused by the caller
+        for own, partner in sub.identified:
+            found = [p for o, p in other.identified if o == prefix(own)]
+            if len(found) != 1:
+                raise ValueError(
+                    f"run: the group {names} steps copies of one node, and {a!r}'s control node "
+                    f"{own!r} is driven by {partner!r} while {b!r} has no control node "
+                    f"{prefix(own)!r} driven by another node; a group's members are driven at "
+                    "the same own ports: group only copies wired alike, or step them ungrouped"
+                )
+            pair(partner, found[0], prefix(own))
+    swap = _swapper(a, b, keep, pairs)
+    mine = {e: swap(d) for e, d in lead_view.emissions}
+    for e, declared in mine.items():
+        target = swap(e)
+        if _equal(declared, dict(view.emissions).get(target)):
+            continue
+        found = [m for m, d in view.emissions if _equal(declared, d)]
+        alike = [f for f, d in mine.items() if f != e and _equal(declared, d)]
+        if len(found) > 1 or alike:
+            raise ValueError(
+                f"run: the group {names} pairs each emission of {a!r} with the emission of "
+                f"{b!r} declared alike, and the emission {e!r} is ambiguous (declared alike "
+                f"by {[e, *alike]!r} of {a!r} and {found!r} of {b!r}); give the copies' "
+                "emissions distinct declarations, or step them ungrouped"
+            )
+        if found:
+            pair(e, found[0], e)
+    return pairs
+
+
 def _check_groups(system, params, nodes, groups, schedule, tick_order):
     """The groups of ``steps`` (tuple keys, design batched-run.md R12), checked in the structure
     pass: members all driven by another node's action or none, all clocked on one schedule or
-    none, and views equal up to their names (the System and the params' structure, the test
-    ``plan()`` makes to share one compiled program); two ``plan()`` learners of a variable that
+    none, and views equal up to their names and their partners' ports (the System and the
+    params' structure, the test ``plan()`` makes to share one compiled program, after the swap
+    of the members' prefixes and of the ports ``_partner_pairs`` pairs: the drivers of their
+    control nodes and the names of their emissions); two ``plan()`` learners of a variable that
     is not counts within one group are refused under every order, since a group's members are
-    simultaneous among themselves. Returns ``{first member: (members, swaps)}``."""
+    simultaneous among themselves. Returns ``{first member: (members, swaps)}``, ``swaps[i]``
+    the swap the runtime renames member ``i``'s inputs and returns by, partners' ports
+    included."""
     by_name = {n.name: n for n in nodes}
     out = {}
     for group in groups:
@@ -1994,18 +2081,22 @@ def _check_groups(system, params, nodes, groups, schedule, tick_order):
         swaps: list[Callable] = [lambda x: x]
         for m, (view, vparams) in zip(members[1:], views[1:], strict=True):
             keep = frozenset(lead_params.parameters) & frozenset(vparams.parameters)
-            swap = _swapper(members[0].name, m.name, keep)
-            same = jax.tree_util.tree_structure(swap(lead_view)) == jax.tree_util.tree_structure(
-                view
-            ) and _same_tree(swap(vparams), lead_params)
+            pairs = _partner_pairs(names, members[0].name, m.name, lead_view, view, keep)
+            swap = _swapper(members[0].name, m.name, keep, pairs)
+            structure = jax.tree_util.tree_structure
+            same = (
+                structure(swap(lead_view)) == structure(view)
+                and structure(swap(view)) == structure(lead_view)
+                and _same_tree(swap(vparams), lead_params)
+            )
             if not same:
                 raise ValueError(
                     f"run: the group {names} steps its members by one vmapped call of one step, "
                     f"and the views of {members[0].name!r} and {m.name!r} differ in static "
-                    "structure beyond their names (their Systems, or their params' forms and "
-                    "shapes, the test plan() makes to share one compiled program); a group "
-                    "holds copies of one node: group only components built alike, or step them "
-                    "ungrouped"
+                    "structure beyond their names and their partners' ports (their Systems, or "
+                    "their params' forms and shapes, the test plan() makes to share one compiled "
+                    "program); a group holds copies of one node: group only components built "
+                    "alike, or step them ungrouped"
                 )
             swaps.append(swap)
         if tick_order != "simultaneous":

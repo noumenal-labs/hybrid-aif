@@ -233,8 +233,15 @@ black boxes with `jnp` outputs must batch (R8). `Env`, `GenerativeEnv`,
 ## Out of scope, noted
 
 Nested rounds (a schedule as a step over a non-leaf node, per-subsystem tick orders) need the
-structure-pass/body split of R2 and an open round body fed its in-ports; they are the next
-build, not this one. The multi-rover survey model is the demo build that follows.
+structure-pass/body split of R2 and an open round body fed its in-ports; they were to be the
+next build, and were shelved on 2026-11-18 (`nested-rounds.md`: groups give the vmapped
+simultaneous update already). The multi-rover survey model is the demo build that followed.
+
+Pass sizing from the memory estimator (deferred past 0.22.0 by Alex, 2026-11-17). `run(...,
+batch=B)` could size `replicas_per_pass` from `branching_tree_memory` (the sophisticated
+planner's memory estimate) instead of the caller choosing. It needs a design that attends to the
+worst-case failures of a bad estimate: an underestimate exhausts memory mid-run, an overestimate
+serialises a batch that would fit. The caller sets the number by hand.
 
 ## Build plan
 
@@ -746,3 +753,61 @@ added).
 `examples/demo.ipynb` re-executed by nbconvert, exit 0, no error output (it never touched
 `rollout`; it imports `compose_minds`, whose import is unchanged). The survey regression pins,
 `tests/test_batched_run.py` and the parity fixtures pass as stated under item 1.
+
+## Replica reproducibility, measured (2026-11-17, after 0.22.0)
+
+A batched replica is not a bitwise reproduction of the unbatched run under its key on the survey
+(the fixtures of pin 2 are tabular and bitwise; the survey's gradient planner is not). Two-tier
+and one-level cases of `tests/test_survey_run.py`, 60 ticks, unbatched against replica 0 of
+`batch=2` on two host devices, the largest absolute difference of any recorded array per tick
+(and relative to the array's scale): two-tier, round 0 the plan at 1.4e-4 relative (the descent
+amplifies a last-place difference within the round), the camera's log evidence at 1e-7 by tick
+5, images differing by one grey level by tick 10, the free energy at 3e-3 by tick 40 and the log
+evidence at 3e-2 by tick 59 (5870 of 7890 arrays bitwise, the rest the closed loop's drift);
+one-level, round 0 at 1.5e-6, within 1e-6 through tick 10, 4e-3 by tick 30 and 4e-2 by tick 59.
+The cause is the one Phase A's re-pin found: the vmapped program fuses the step's reductions
+differently from the unbatched one, a float32 last-place difference that a closed loop grows
+into a different trajectory. So replicas compare with replicas (the multi-rover arms are each
+run batched, five seeds each), a single-seed unbatched number is not reproduced by a batched
+replica of the same seed (seen on the multi-rover arms: 0.848 against 0.766 at 800 ticks), and
+the capabilities entry says bitwise only of the tabular fixtures.
+
+
+Checked again after the scheduler's tuning (2026-11-17, late): three unbatched seeds of the one-rover two-tier run fall within 0.04 of their batched replicas' coverage at every 200-tick mark and take the same first decisions, while the seed-0 pair differs by 0.12 at the end; the two programs are the same distribution with different draws, not two distributions.
+
+## R12 amended: a group's partners' ports (2026-11-18)
+
+A group held copies of one node equal up to their own names, and the two-tier two-rover survey
+was refused: rover `k`'s option control node is identified with the scheduler's
+`agent.mission.u_option_k` and its cell emission feeds the scheduler's in-port `cell_obs_k`,
+named `agent.rover{k}.cell_obs_k`, so after the swap of the prefixes the copies' views still
+differed in those two names, the names of their partners' ports. Now accepted: copies whose
+views are equal up to their own names and the names of their partners' ports, so copies driven
+by different option nodes of one driver, or feeding different in-ports of one partner (or
+ports of different partners), are one group.
+
+The pairing (`_partner_pairs`, in the structure pass, per member against the first): a driven
+control node's driver by the member's own port, the first's `Subsystem.identified` pair
+`(own, partner)` matched with the member's pair whose own node is the swap of `own`, and
+`partner` paired with the member's; an emission by its declaration, the first's emission paired
+with the member's one emission whose `Emission` (parents, realisation, kernel) is the first's
+under the swap. A pair `x <-> y` comes with the pair of their prefix swaps, so the swap stays an
+involution; the swap reads the pairs before the prefixes, and the check now asks of both
+directions (the first's view swapped has the member's structure, and the member's the
+first's). The runtime renames by the same swap, so a member's driven input, keyed
+`agent.mission.u_option_2`, is handed to the first's program as `u_option_1`, and its emission,
+returned as `agent.rover1.cell_obs_1`, is written back as `agent.rover2.cell_obs_2`.
+
+Still refused: views that differ in anything else (after both swaps); a member with no control
+node driven at the swap of the first's driven node; an emission of the first declared alike
+by another of its emissions, or matching two of the member's (ambiguous: emissions are not
+paired by position); a pairing that takes one name to two, or pairs a parameter variable both
+views share (inconsistent); and the earlier refusals (driven with undriven, clocked with
+unclocked, a group not contiguous in the order). `examples/survey_run.py` `run_multi` groups the
+two-tier rovers (`group=False` steps them one by one). Pinned in `tests/test_batched_run.py`:
+the two-tier rovers grouped under simultaneous equal them ungrouped in every recorded stream and
+the learned home bitwise, the carries to float32 rounding (the camera's log evidence fused
+differently by the vmapped call); copies emitting under different names, bitwise; and the two
+new refusals. Under `"sequential"` (the order `run_multi` runs) grouped and ungrouped are two
+semantics, not one number: ungrouped, rover 2 reads the field rover 1 has just counted into;
+grouped, both read the field as the group's turn began (R12's semantics above).

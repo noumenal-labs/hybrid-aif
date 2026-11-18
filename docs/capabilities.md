@@ -1230,13 +1230,18 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
 
 - **v0.22.0**: **`run` takes `batch=`.** `run(..., batch=B)` runs `B` replicas of a closed
   System by one program: replica `b` is the unbatched run under `fold_in(key, b)` (or `key[b]`
-  for a stack of keys), bitwise under simultaneous and sequential; `per_replica=["params", ...]`
+  for a stack of keys): bitwise on the tabular fixtures under simultaneous and sequential, and
+  to float32 rounding where the vmapped program fuses a step differently (the survey rover's
+  gradient planner differs from round 0 at the last place), which a long closed loop grows into
+  different trajectories, so replicas compare with replicas; `per_replica=["params", ...]`
   names the inputs with a leading replica axis (params, a node's seed in `carries`); `record=`
   names the fields stacked over rounds, `chunk=` runs the scan in compiled chunks and
   `replicas_per_pass=` in host passes, one program for all. A tuple key of `steps`,
   `steps={("agent.rover1", "agent.rover2"): step}`, steps copies of one leaf by one vmapped call
   of the step, simultaneous among themselves, their Dirichlet write-backs summed (equal to the
-  ungrouped simultaneous run). Every round, round 0 included, is one compiled `lax.scan` from the
+  ungrouped simultaneous run); copies driven by different option nodes of one driver, or
+  feeding different in-ports, are grouped too, the swap pairing their partners' ports as it
+  pairs their names. Every round, round 0 included, is one compiled `lax.scan` from the
   reset: a step is a traced function, a check of a value inside it is recorded in
   `Trajectory.faults` (a non-positive Dirichlet sum, two writers of a non-counts variable, a
   level out of range) where it used to refuse on round 0, and `Trajectory.timing` holds the

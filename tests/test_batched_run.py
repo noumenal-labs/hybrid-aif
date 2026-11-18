@@ -36,6 +36,7 @@ from hybrid_aif.composition import (
 from hybrid_aif.composition import runner as runner_module
 from hybrid_aif.controls import LEVEL
 from hybrid_aif.envs.generative import broadcast_params
+from hybrid_aif.reads import Emission
 from hybrid_aif.system.mirror import mirror
 from tests.test_action_nodes import pusher
 from tests.test_clocks import robots, steps_of
@@ -367,6 +368,41 @@ def test_groups_are_refused_naming_the_fix():
     clocked, cparams = robots([4.0, 2.0, 4.0])
     with pytest.raises(ValueError, match=r"mixes clocked nodes \['a'\] with unclocked ones"):
         run(clocked, cparams, 2, KEY, {("a", "b"): plan(), "world": sample()})
+    #  emissions paired by their declarations: two of the first's declared alike are ambiguous,
+    #  and a pairing that takes one name to two (the first's ``f`` is the swap's image of the
+    #  member's ``e`` once ``e`` is paired with the member's ``f``) is inconsistent
+    for first, second, refusal in (
+        ((("e", "s1"), ("f", "s1")), (("g", "s1"), ("h", "s1")), r"'A.e' is ambiguous"),
+        ((("e", "s1"), ("f", "s2")), (("f", "s1"), ("g", "s2")), r"the pairing is inconsistent"),
+    ):
+        system, params = emitting_leaves(first, second)
+        with pytest.raises(ValueError, match=refusal):
+            run(system, params, 2, KEY, {("A", "B"): plan()})
+
+
+def emitting_leaves(first, second):
+    """Two copies of :func:`two_node_leaf` merged as ``A`` and ``B``, each emitting the levels of
+    its states under the names given, ``((name, state), ...)`` per copy."""
+    leaf, params = two_node_leaf()
+
+    def emitting(named):
+        return dataclasses.replace(
+            leaf, emissions=tuple((n, Emission((s,), "mode", "identity")) for n, s in named)
+        )
+
+    return merge({"A": emitting(first), "B": emitting(second)}, {"A": params, "B": params})
+
+
+def test_copies_emitting_under_different_names_grouped_equal_the_ungrouped_run():
+    """A group's emissions are paired by their declarations, not their names (R12, amended
+    2026-11-18): ``A`` emits ``s1`` as ``e``, ``B`` as ``f``, and grouped they equal the two
+    stepped apart, bitwise, each emission recorded under its own name."""
+    system, params = emitting_leaves([("e", "s1")], [("f", "s1")])
+    apart = run(system, params, 4, KEY, {"A": plan(), "B": plan()}, record_carries=True)
+    group = run(system, params, 4, KEY, {("A", "B"): plan()}, record_carries=True)
+    assert {"A.e", "B.f"} <= set(group.emitted)
+    for (path, x), (_, y) in zip(record_of(apart), record_of(group), strict=True):
+        np.testing.assert_array_equal(x, y, err_msg=jax.tree_util.keystr(path))
 
 
 def survey_example(name):
@@ -423,6 +459,93 @@ def test_two_survey_rovers_sharing_their_field_grouped_equal_the_ungrouped_run()
         apart.params.parameters["agent.r1.field"].concentration,
         group.params.parameters["agent.r1.field"].concentration,
         rtol=1e-5,
+    )
+
+
+def two_tier_rovers():
+    """The two-tier two-rover survey at the size of ``tests/test_survey_multi.py``: the scheduler
+    ``agent.mission`` over two rovers, rover ``k`` driven by option node ``k`` and emitting its
+    cell reading into the scheduler's in-port ``k``. Returns ``(system, params, steps without the
+    rovers, rover step, run keywords)``."""
+    from tests.test_survey_run import GRID, STARTS, STEPS, small_camera
+
+    sr, ss, wd = (survey_example(n) for n in ("survey_run", "survey_scheduler", "survey_world"))
+    setting = dict(next(s for s in sr.settings_multi() if s["id"] == "two-rover-two-level"))
+    penalty = ss.terminal_penalty(2, setting["field_strength"], rovers=2)
+    setting.update(grid=GRID, slow_ticks=2, horizon=2, terminal_penalty=penalty)
+    system, params = sr.multi_system(small_camera(wd.IMG_PIXELS), setting)
+    world, _ = sr.sensors(sr.camera_mode(setting), None, vehicles=2)
+    mission = plan(
+        trace=True,
+        selection="deterministic",
+        replace={"policy_len": 2},
+        learn=ss.learn_rates("agent.mission."),
+    )
+    keywords = dict(
+        clocks={"agent.mission": setting["slow_ticks"] / ss.SURVEY_TICKS},
+        carries=sr.world_carries(setting),
+        record_carries=True,
+    )
+    rover = sr.rover_plan(setting, STEPS, STARTS, "agent.rover1.")
+    return system, params, {"agent.mission": mission, "world": world}, rover, keywords
+
+
+def test_two_tier_rovers_driven_by_two_option_nodes_are_one_group(monkeypatch):
+    """Each two-tier rover is driven by its own option node of the scheduler and emits into its
+    own in-port of it: the group's swap pairs those ports (R12, amended 2026-11-18), the
+    member's ``u_option_2`` and ``cell_obs_2`` with the first's ``u_option_1`` and ``cell_obs_1``,
+    an involution under which the first's view has the member's structure. Grouped under
+    simultaneous the rovers equal the rovers stepped apart: what every node received, emitted
+    and intended, the decisions, the faults and the learned home bitwise; the carries (the
+    planner's and the camera's traces) to float32 rounding, the vmapped program's arithmetic.
+    Each rover reads its own option and its reading reaches its own in-port."""
+    system, params, steps, rover, keywords = two_tier_rovers()
+    rovers = ("agent.rover1", "agent.rover2")
+    checked = {}
+    check_groups = runner_module._check_groups
+
+    def check(system, params, nodes, groups, *rest):
+        out = check_groups(system, params, nodes, groups, *rest)
+        checked.update(out, params=params)
+        return out
+
+    monkeypatch.setattr(runner_module, "_check_groups", check)
+    group = run(system, params, 3, KEY, {rovers: rover, **steps}, **keywords)
+    monkeypatch.undo()
+    apart = run(system, params, 3, KEY, {**dict.fromkeys(rovers, rover), **steps}, **keywords)
+
+    (lead, member), (_, swap) = checked[rovers[0]]
+    assert swap("agent.mission.u_option_2") == "agent.mission.u_option_1"
+    assert swap("agent.rover1.cell_obs_1") == "agent.rover2.cell_obs_2"
+    lead_view, _ = runner_module._reset_view(system, lead, checked["params"])
+    view, _ = runner_module._reset_view(system, member, checked["params"])
+    structure = jax.tree_util.tree_structure
+    assert structure(swap(lead_view)) == structure(view)
+    assert structure(swap(swap(lead_view))) == structure(lead_view)
+
+    for (path, x), (_, y) in zip(record_of(apart), record_of(group), strict=True):
+        name = jax.tree_util.keystr(path)
+        if name.startswith("[0][5]") or name.startswith("[0][6]"):  # carries, the final carry
+            np.testing.assert_allclose(x, y, rtol=1e-4, atol=1e-5, err_msg=name)
+        else:
+            np.testing.assert_array_equal(x, y, err_msg=name)
+    for x, y in zip(
+        jax.tree_util.tree_leaves(apart.params),
+        jax.tree_util.tree_leaves(group.params),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(x, y)
+    for k in (1, 2):
+        np.testing.assert_array_equal(
+            group.received[f"agent.rover{k}.u_opt"][:3],
+            group.intended[f"agent.mission.option_{k}"],
+        )
+        np.testing.assert_array_equal(
+            group.emitted[f"agent.rover{k}.cell_obs_{k}"],
+            group.received[f"agent.mission.cell_obs_{k}"][1:],
+        )
+    assert not np.array_equal(
+        group.intended["agent.mission.option_1"], group.intended["agent.mission.option_2"]
     )
 
 
