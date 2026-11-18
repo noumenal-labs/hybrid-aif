@@ -458,12 +458,18 @@ def sample_action(
     first step, dtype preserved, and ``"marginal"`` raises. A mixed policy set, a
     :class:`~hybrid_aif.controls.ControlStep` with leading axes ``(P, policy_len)``, takes
     ``mode="policy"`` and returns the drawn policy's first step as a ``ControlStep`` with one
-    entry per control node.
+    entry per control node. The factorised planner's
+    :class:`~hybrid_aif.planning.factorised.FactorisedPolicies` is read as its joint first-step
+    grid ``first``, ``(A, 1, K)``, which its ``q_pi`` is over: both modes act on it.
 
     ``selection`` is the action's realisation: ``"stochastic"`` corresponds to the realisation
     ``sample`` (a draw) and ``"deterministic"`` to ``mode`` (the argmax); a mixed strategy
     (``stats``) is not emitted here. Design: nesting-and-coupling.md N3.
     """
+    from hybrid_aif.planning.factorised import FactorisedPolicies
+
+    if isinstance(policies, FactorisedPolicies):
+        policies = policies.first
     stepped = isinstance(policies, ControlStep)
     continuous = (
         policies is not None

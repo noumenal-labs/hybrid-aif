@@ -68,6 +68,7 @@ from hybrid_aif.planning.enumerate import (
     legal_steps,
     sample_action,
 )
+from hybrid_aif.planning.factorised import FactorisedPolicies
 from hybrid_aif.planning.gradient import PlanPosterior
 from hybrid_aif.planning.habit import habit_action
 from hybrid_aif.system import keyed
@@ -1122,6 +1123,14 @@ def _plan(
     q_pi, tree, policies = planner_fn(ctx, use_bound=use_bound, metrics=metrics)
     if isinstance(policies, PlanPosterior):
         return q_pi, tree, policies
+    if isinstance(policies, FactorisedPolicies):
+        #  q_pi is over the joint first-step grid: a first-step mask applies to it, as for the
+        #  enumerated set (design: factorised-planning.md F6)
+        if legal is not None:
+            _refuse_per_step_legal(system, params, legal, ctx.policy_len, face)
+            indicator = system._legal_logits(params, legal, policies.first, face)
+            q_pi = Categorical(logits=q_pi.log_probs + indicator)
+        return q_pi, tree, policies
     clamped_steps = isinstance(policies, ControlStep) and _is_clamped(policies, ctx.kinds)
     if not clamped_steps and (
         isinstance(policies, Mapping | ControlStep)
@@ -1151,6 +1160,26 @@ def _plan(
             indicator = system._legal_logits(params, legal, positional, face)
         q_pi = Categorical(logits=q_pi.log_probs + indicator)
     return q_pi, tree, policies
+
+
+def _refuse_per_step_legal(system, params: SystemParams, legal, policy_len: int, face: str):
+    """Refuse a keyed ``legal=`` entry masking per step of the plan: the factorised planner's
+    ``q_pi`` is over the first step alone, and it reads no per-depth mask (design:
+    factorised-planning.md F6)."""
+    if isinstance(legal, list):
+        legal = keyed.legal_list(legal, face)
+    if not isinstance(legal, Mapping | tuple):
+        return
+    names = system._names(params)
+    entries = keyed.legal_in(names, legal, face)
+    for name, entry in zip(names.controls, entries, strict=True):
+        if entry is not None and jnp.ndim(entry) == 2 and jnp.shape(entry)[0] > 1:
+            raise ValueError(
+                f"{face}: legal[{name!r}] masks each of the plan's {policy_len} steps, and the "
+                "factorised planner's posterior is over the first step alone and reads no "
+                f"per-step mask: pass a ({jnp.shape(entry)[-1]},) mask over this tick's levels, "
+                'or plan with the "enumeration" planner'
+            )
 
 
 def _is_clamped(policies: ControlStep, kinds: tuple[str, ...]) -> bool:
@@ -1405,6 +1434,18 @@ def act_and_policies(
             policies.mode[jnp.argmax(q_pi.logits), 0]
             if selection == "deterministic"
             else policies.first_step(key)
+        )
+        return keyed.actions_out(names, action), q_pi, tree, policies
+    if isinstance(policies, FactorisedPolicies):
+        #  q_pi is over the joint first-step grid; sample_action reads it as the policy set
+        action = sample_action(
+            key,
+            q_pi,
+            policies=policies.first,
+            num_controls=system._control_levels(params),
+            mode="marginal" if mode is None else mode,
+            selection=selection,
+            alpha=alpha,
         )
         return keyed.actions_out(names, action), q_pi, tree, policies
     mixed_set = isinstance(policies, ControlStep)

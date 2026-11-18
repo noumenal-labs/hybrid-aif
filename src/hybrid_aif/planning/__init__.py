@@ -1,15 +1,18 @@
-"""Planning backends: enumeration, CEM, gradient, mixed, habit and sophisticated.
+"""Planning backends: enumeration, factorised, CEM, gradient, mixed, habit and sophisticated.
 
 Planners are resolved through the registry in :mod:`hybrid_aif.planning.base`
 (Systems own a planner *name*, never a planner); importing this package
-registers the built-in ``"enumeration"``, ``"cem"``, ``"gradient"``, ``"mixed"``, ``"habit"``
-and ``"sophisticated"`` backends.
+registers the built-in ``"enumeration"``, ``"factorised"``, ``"cem"``, ``"gradient"``, ``"mixed"``,
+``"habit"`` and ``"sophisticated"`` backends.
 Enumeration serves the discrete level-index action space, CEM and the gradient planner the
 continuous one (``docs/design/amortization.md`` A9; the gradient planner descends G to the mode
 of the policy posterior), ``mixed`` a space of discrete and continuous nodes together (it
 enumerates the discrete policies and descends the continuous controls of each), and ``habit``
 acts from the policy prior E without ranking anything by G — the three settings of A3's
 search-habit dial.
+``factorised`` keeps one policy posterior per discrete control node and updates each against the
+others' per-step marginals by mean-field sweeps, at the sum rather than the product of the nodes'
+sequence counts (``docs/design/factorised-planning.md``).
 ``sophisticated`` scores an action by what the agent would do after each outcome
 of the System's ``branch_on`` modalities.
 """
@@ -38,6 +41,12 @@ from hybrid_aif.planning.enumerate import (
     evaluate_policies,
     policy_posterior,
     sample_action,
+)
+from hybrid_aif.planning.factorised import (
+    FactorisedPolicies,
+    factorised_plan,
+    factorised_planner,
+    make_factorised_planner,
 )
 from hybrid_aif.planning.gradient import (
     GradientResult,
@@ -71,6 +80,7 @@ from hybrid_aif.planning.tree import (
 __all__ = [
     "BranchingTreeMemory",
     "CEMResult",
+    "FactorisedPolicies",
     "GradientResult",
     "MixedResult",
     "PlanPosterior",
@@ -88,12 +98,15 @@ __all__ = [
     "evaluate_policy_tree",
     "evaluate_policy_tree_total",
     "expand_level",
+    "factorised_plan",
+    "factorised_planner",
     "get_planner",
     "gradient_plan",
     "gradient_planner",
     "habit_action",
     "habit_planner",
     "make_cem_planner",
+    "make_factorised_planner",
     "make_gradient_planner",
     "make_mixed_planner",
     "make_sophisticated_planner",

@@ -193,7 +193,13 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   plan scored returned), the **`mixed` planner** (a control space of discrete and continuous
   nodes: it enumerates the discrete policies and descends the continuous controls of each with
   the gradient planner's descent, the posterior over the discrete policies taken over their
-  optimised `G`), the **`sophisticated` planner** —
+  optimised `G`), the **`factorised` planner** (several discrete control nodes planned by
+  mean-field sweeps: one posterior per node over its own sequences, each scored against the
+  others' per-step marginals, at the sum rather than the product of the nodes' sequence counts;
+  `q_pi` over the joint first step, the per-node posteriors in `FactorisedPolicies`; exact for
+  nodes that share no factor, a measured small gap where a parameter learned within the plan
+  couples them; `make_factorised_planner(sweeps=3)`, design `docs/design/factorised-planning.md`),
+  the **`sophisticated` planner** —
   Friston et al. 2021's recursion over what the agent will observe: each
   first action scored by its step terms plus the softmax-weighted value of
   the next decision after every outcome of the System's `branch_on`

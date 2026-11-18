@@ -833,6 +833,33 @@ change of state is written `[flagged 2026-08-19 → landed 2026-09-18]`.
   REBUS reply (gist, 2026-11-16), with no design record:
   - a continuous precision state: expressible since 0.20.0, inferable only by an HGF-class update;
   - named blocks within one Gaussian factor: one exact stacked block, not `B_deps` parents.
+- **[flagged 2026-11-18 → landed 2026-11-18] Factorised planning.** A System with several
+  discrete control nodes planned over their product costs `(Π_k n_k)^H` sequences a decision; the
+  two-rover scheduler at seven options held 117,649 joint sequences' trace, 19 GB resident. The
+  `"factorised"` planner keeps one posterior per node over its own sequences and sweeps them in
+  node order, each scored against the others' per-step marginals entered as probability vectors
+  (every reader of a control node consumes one), at the sum of the nodes' sequence counts; exact
+  for nodes that share no factor, a measured small gap under a table learned within the plan
+  (`design/factorised-planning.md`, F1–F9, "As built"). Named and not built there: a warm start
+  from the previous round, damping, a per-depth legal mask, structured mean field over pairs.
+- **[flagged 2026-11-18] Decision-relevant novelty.** The field's novelty is the exact mutual
+  information of a reading with the cell's row, so a cell that straddles a terrain boundary stays
+  worth 1.8x a pure one at equal counts: its mixing proportion is a real unlearned parameter that
+  nothing the mission decides depends on (`design/terrain-field.md`, "The survey after 0.21.0").
+  The principled form is information about what the map serves, the class a planner acts on or a
+  traversal cost, which saturates once no decision would change: information-directed sampling
+  (Russo and Van Roy 2014, information about the optimal action), the expected value of sample
+  information (Raiffa and Schlaifer 1961; Bernardo 1979), predictive and max-value entropy search
+  in Bayesian optimisation. A different objective, not a correction to the novelty term; no gate.
+- **[flagged 2026-11-18] Natural-parameter write-backs.** `run` combines simultaneous write-backs
+  of one variable by summing the deltas of its concentration, so only the two Dirichlet forms
+  combine (`_conjugate`), and the sum applies a forgetting learner's decay once per writer rather
+  than once. Every learnable family is stats-then-absorb with additive sufficient statistics (the
+  inverse-gamma and inverse-Wishart a scatter and a count, the matrix normal two cross-moment sums
+  and a count), so the exact rule for all of them is: a write-back carries the statistic and the
+  rate, the home sums the statistics of a variable's writers and absorbs once. A change to the
+  write-back path, not to the families. **Gate: the first non-Dirichlet shared learner, or the
+  first forgetting learner, in a group or a simultaneous round.**
 
 Licensing note for anything above: AXIOM/CAVI-CMN/VBGS are academic-license
 (reimplement ideas only); Fountas and k-cybulski/dem are GPL (ideas only);
