@@ -35,16 +35,40 @@ fix arrives and is never read); ``--camera look`` has the rover observe the reco
 the terrain instead of the image. The runs are written to one bundle for the project page, and a
 REPORT.md summarises them.
 
+Several rovers (``settings_multi``, step one of the multi-rover survey). Two rovers are two
+readers of one field: copies of the one rover, the first from ``survey_world.START`` and the
+second from ``survey_world.SECOND_START`` (the first mirrored through the field's centre), in a
+world of two vehicles (``survey_world.world_system(vehicles=2)``). The rovers do not see each
+other and the world has no rover-to-rover physics: no collision, no occlusion, no reading of one
+rover by the other; they are joined only by the field they both count into (and, under the
+scheduler, the energy table). Three arms: ``two-rover-one-level``, the two rovers merged with
+their field one variable and no scheduler, stepped by one vmapped call (a group of ``steps``);
+``two-rover-two-level``, the two rovers under one scheduler with an option node per rover, so its
+policies are joint (``25 ** survey_scheduler.JOINT_HORIZON`` sequences), the field learned within
+its plan so that one rover's planned readings of the cells the other's plan reads first are worth
+less, the rovers again one group; and the independent-rover baseline,
+the union of two one-rover runs from the two starts (``one-level`` and ``one-level-second-start``,
+``union_rows``: a cell is mapped where either rover's own map is confident of it). A multi-rover
+run's part file holds one row per tick of the shared field and each rover's own rows
+(``_multi_result``); ``--multi-report`` prints the comparison of the part files in ``--out``
+(``multi_report``). A collision servo and nested rounds are later builds.
+
     python examples/survey_run.py --out DIR [--settings id,id] [--ticks 200] [--seed 0]
     python examples/survey_run.py --out DIR --replicas 10   # seeds 0..9 by one batched run
+    python examples/survey_run.py --out DIR --ticks 800 --settings two-rover-two-level
+    python examples/survey_run.py --out DIR --ticks 800 --settings two-rover-one-level
+    python examples/survey_run.py --out DIR --ticks 800 --settings one-level-second-start
+    python examples/survey_run.py --out DIR --multi-report  # their coverage, and the union
     python examples/survey_run.py --out DIR --assemble     # merge the part files into bundle
     python examples/survey_trim.py DIR/bundle.json OUT_DIR   # the page's bundle.js
 """
 
 import argparse
+import dataclasses
 import functools
 import json
 import math
+import re
 import sys
 import time
 from pathlib import Path
@@ -259,13 +283,15 @@ def unread(step, slot):
     return wrapper
 
 
-def rover_record(carry, setting, pre, decoder, policy_len):
+def rover_record(carry, setting, pre, decoder, policy_len, field=None):
     """The page's record of one round of the rover, read from the carry its ``plan()`` step
     left (``MindCarry``): the posterior (``previous``), and from the round's ``Trace`` every
     start's plan with its term tree, ``G`` and ``q_pi``, the inference detail (the image's log
     evidence, the free energy) and the field the round planned with. ``decoder`` renders the
     picture it predicts at the belief. The wall preference's leaf and the position risk's leaf
-    are recorded less constants (``wall_offset``, ``position_risk_offset``), as is ``G``."""
+    are recorded less constants (``wall_offset``, ``position_risk_offset``), as is ``G``.
+    ``field`` is the name of the field's parameter variable in the view, ``pre + "field"`` by
+    default (a rover sharing its field with others reads it under the name of its home)."""
     outer = pre.split(".", 1)[0] + "."  # the coupling's prefix of the agent's names
     beliefs, trace = carry.previous, carry.trace
     q_pi, tree, v_plans = trace.q_pi, trace.tree, np.asarray(trace.plans)
@@ -296,7 +322,7 @@ def rover_record(carry, setting, pre, decoder, policy_len):
         for i in range(v_plans.shape[0])
     ]
     table, counts, coverage, seen = field_record(
-        trace.parameters[pre + "field"], setting["field_strength"]
+        trace.parameters[field or pre + "field"], setting["field_strength"]
     )
     return dict(
         #  the constants the page's records are shown less
@@ -315,7 +341,7 @@ def rover_record(carry, setting, pre, decoder, policy_len):
     )
 
 
-def tick_rows(rec, rover, ticks, record, seconds, extra=None, recognise=None):
+def tick_rows(rec, rover, ticks, record, seconds, extra=None, recognise=None, vehicle=None):
     """The per-tick records of a run, read from its ``Trajectory``: the world's true state at the
     start of the tick (its carry), the readings the rover was handed and the command it chose
     (the record of the stepped node ``rover``), the rover's record of the tick (``record`` of its
@@ -323,16 +349,18 @@ def tick_rows(rec, rover, ticks, record, seconds, extra=None, recognise=None):
     the compiled scan of rounds, compile excluded: ``run_seconds``). The camera
     image is the one the rover was handed, or, when its model has no image, the one the world
     emitted for that round; ``recognise`` (an image to the recogniser's class probabilities) adds
-    the recogniser's readout of it."""
+    the recogniser's readout of it. ``vehicle`` is the rover's index in a world of several
+    (``None`` in a world of one): its true state and its image are read under that index."""
     world, mind = rec["world"], rec[rover]
+    img = wd.vehicle_name("img", vehicle)
     rows = []
     for t in range(ticks):
-        state = world.carries[t]
+        state = wd.vehicle_state(world.carries[t], vehicle)
         energy = float(wd.level_of(state))
         if "img" in mind.received:
             image = mind.received["img"][t]
         else:  # the world's emission the round before (its start for round 0)
-            image = world.start["img"] if t == 0 else world.emitted["img"][t - 1]
+            image = world.start[img] if t == 0 else world.emitted[img][t - 1]
         row = dict(
             t=t,
             v=[float(c) for c in mind.intended["a_v"][t]],
@@ -375,33 +403,38 @@ def sees_image(mode):
     return mode == "image"
 
 
-def world_bindings(agent, mode="image"):
+def world_bindings(agent, mode="image", vehicle=None):
     """The identifications that couple the world to the rover inside the component ``agent``
     (``"agent.rover"`` or ``"rover"``): the rover's command drives the world's ``v``, and the
     world's emissions feed the rover's modalities (the image or the recogniser's reading, by the
-    camera ``mode``)."""
+    camera ``mode``). ``vehicle`` is the rover's index in a world of several
+    (``survey_world.vehicle_name``: ``v_1``, ``fix_1``, ...), ``None`` in a world of one."""
+
+    def port(name):
+        return f"world.{wd.vehicle_name(name, vehicle)}"
+
     return [
-        Identify(f"{agent}.a_v", "world.v"),
-        Identify("world.fix", f"{agent}.fix"),
-        *([Identify("world.img", f"{agent}.img")] if sees_image(mode) else []),
-        *([Identify("world.look", f"{agent}.look")] if mode == "look" else []),
-        Identify("world.gauge", f"{agent}.gauge"),
+        Identify(f"{agent}.a_v", port("v")),
+        Identify(port("fix"), f"{agent}.fix"),
+        *([Identify(port("img"), f"{agent}.img")] if sees_image(mode) else []),
+        *([Identify(port("look"), f"{agent}.look")] if mode == "look" else []),
+        Identify(port("gauge"), f"{agent}.gauge"),
     ]
 
 
-def sensors(mode, encoder):
+def sensors(mode, encoder, vehicles=1):
     """``(world step, readout)`` for a camera ``mode``: the world's step (reporting the
     recogniser's class for ``"look"``) and the recogniser's class probabilities of an image for
-    the page (``None`` without a recogniser)."""
+    the page (``None`` without a recogniser); ``vehicles`` is the world's number of rovers."""
     if encoder is None:
-        return wd.world_stepper(), None
+        return wd.world_stepper(vehicles=vehicles), None
 
     def readout(image):
         return cam.terrain_probs(encoder, image)
 
     if mode != "look":
-        return wd.world_stepper(), readout
-    return wd.world_stepper(lambda image: jnp.argmax(readout(image))), readout
+        return wd.world_stepper(vehicles=vehicles), readout
+    return wd.world_stepper(lambda image: jnp.argmax(readout(image)), vehicles=vehicles), readout
 
 
 def epistemic_terms(setting):
@@ -498,16 +531,19 @@ def run_setting(
     reading of the recogniser ``encoder`` through its ``confusion`` table, or none. With
     ``replicas``, the seeds ``seed`` to ``seed + replicas - 1`` by one batched ``run``
     (``run_keys``), a list of their results, the timing harness run once."""
+    if setting.get("rovers", 1) > 1:
+        return run_multi(setting, ticks, decoder, steps, starts, encoder, confusion, replicas)
     if setting.get("tiers") == 2:
         return run_tiered(setting, ticks, decoder, steps, starts, encoder, confusion, replicas)
     mode = camera_mode(setting)
     rs, rp, _, _ = rover_of(setting, decoder, confusion)
+    if "start" in setting:  # a rover alone from another start: its belief and the world's state
+        rp = rover_at(rp, wd.STARTS[setting["start"] - 1])
     system, params = couple(
         {"rover": (rs, rp), "world": wd.world_system(look=mode == "look")},
         world_bindings("rover", mode),
     )
     world_step, readout = sensors(mode, encoder)
-    start = setting.get("start_energy")
     batched = run(
         system,
         params,
@@ -515,7 +551,7 @@ def run_setting(
         run_keys(setting["seed"], replicas),
         steps={"rover": rover_plan(setting, steps, starts, "rover."), "world": world_step},
         tick_order="sequential",
-        carries=None if start is None else {"world": {"energy": start}},
+        carries=world_carries(setting),
         record_carries=True,
         batch=replicas,
     )
@@ -533,6 +569,27 @@ def run_setting(
             harness = timing(rec, "rover", setting, decoder, confusion, steps, starts)
         results.append(dict(ticks=rows, planner=dict(steps=steps, starts=starts), timing=harness))
     return results[0] if replicas is None else results
+
+
+def world_carries(setting):
+    """The world's seeded carry for a setting, ``run``'s ``carries``: the start's energy level
+    (``start_energy``) and, for a rover alone from another start (``start``, an index into
+    ``survey_world.STARTS``), its position; ``None`` when the world starts as declared."""
+    given = {}
+    if setting.get("start_energy") is not None:
+        given["energy"] = setting["start_energy"]
+    if "start" in setting:
+        given["x"] = jnp.asarray(wd.STARTS[setting["start"] - 1], jnp.float32)
+    return {"world": given} if given else None
+
+
+def rover_at(params, start):
+    """The rover's params (``survey_model.rover``'s) with its initial position belief centred on
+    ``start`` instead of ``survey_world.START``: every component's mean moved, its spread kept."""
+    x0 = params.initial_state_prior["x"]
+    means = x0.means.at[:, :2].set(jnp.asarray(start, x0.means.dtype))
+    prior = {**params.initial_state_prior, "x": dataclasses.replace(x0, means=means)}
+    return dataclasses.replace(params, initial_state_prior=prior)
 
 
 def run_keys(seed, replicas=None):
@@ -801,6 +858,448 @@ def _tiered_result(
         energy_table=energy_record(learned),
         energy_counts=np.asarray(learned.concentration, np.float64).tolist(),
     ), harness
+
+
+# --------------------------------------------------------------------------- several rovers
+
+
+def settings_multi():
+    """The settings of the multi-rover comparison, step one: two rovers that are two readers of
+    one field. ``two-rover-two-level``: the scheduler over both rovers, its option nodes one per
+    rover so its policies are joint, looking ``survey_scheduler.JOINT_HORIZON`` options ahead with
+    the field learned within the plan (``plan_learning``), its terminal penalty the two rovers'.
+    ``two-rover-one-level``: the two rovers alone, merged with their field one variable, no
+    scheduler. ``one-level-second-start``: the rover alone from the second start
+    (``survey_world.SECOND_START``); with ``one-level`` it makes the independent-rover baseline,
+    the union of two one-rover runs (``union_rows``)."""
+    base = {s["id"]: s for s in settings_grid_l2()}
+    two, one = base["two-level"], base["one-level"]
+    horizon = ss.JOINT_HORIZON
+    return [
+        dict(
+            two,
+            id="two-rover-two-level",
+            label="Two rovers, one field, a scheduler over both",
+            rovers=2,
+            horizon=horizon,
+            terminal_penalty=ss.terminal_penalty(horizon, FIELD_STRENGTH, rovers=2),
+            plan_learning=True,
+        ),
+        dict(one, id="two-rover-one-level", label="Two rovers, one field, no scheduler", rovers=2),
+        dict(one, id="one-level-second-start", label="Rover alone from the second start", start=2),
+    ]
+
+
+def multi_agent_system(decoder, setting, confusion=None):
+    """The agent of a multi-rover setting, ``((System, SystemParams), grid)``: ``rovers`` copies
+    of the rover, ``rover1`` from ``survey_world.START`` and ``rover2`` from ``SECOND_START``
+    (``rover_at``), merged with their field one parameter variable. In the two-tier setting the
+    merge also holds the scheduler ``mission`` over both (``survey_scheduler.scheduler(...,
+    rovers=2)``): option node ``k`` drives rover ``k``'s option control node, the field is one
+    variable read by the rovers' terrain and the scheduler's two ``map`` factors (named
+    ``mission.field``, so that neither rover owns the name), and the scheduler's cell modality
+    ``k`` observes rover ``k``'s position belief through the cell indicator (the ``Link`` sugar).
+    The rovers do not see each other: no modality of either reads the other, and nothing but the
+    field (and, through the scheduler, the energy table) joins them."""
+    n = setting["rovers"]
+    tiered = setting.get("tiers") == 2
+    rs, rp, grid, centres = rover_of(setting, decoder, confusion, tiered=tiered)
+    names = [f"rover{k}" for k in range(1, n + 1)]
+    systems = {name: rs for name in names}
+    params = {
+        name: rp if k == 1 else rover_at(rp, wd.STARTS[k - 1]) for k, name in enumerate(names, 1)
+    }
+    if not tiered:
+        bindings = [Identify("rover1.field", f"{name}.field") for name in names[1:]]
+        return merge(systems, params, bindings), grid
+    ms, mp = ss.scheduler(
+        grid,
+        centres,
+        terminal=setting["terminal_penalty"],
+        field_strength=setting["field_strength"],
+        policy_len=rs.policy_len,  # the rover's, as ``agent_system`` gives it
+        energy_counts=setting.get("energy_counts"),
+        durations=True,
+        readings=setting.get("readings", False),
+        rovers=n,
+        plan_learning=("parameter:field",) if setting.get("plan_learning") else (),
+    )
+    bindings = []
+    for k, name in enumerate(names, 1):
+        bindings += [
+            Identify(f"mission.{ss.indexed('option', k, n)}", f"{name}.u_opt"),
+            Identify("mission.field", f"{name}.field"),
+            Link(
+                f"{name}.x", f"mission.{ss.indexed('cell_obs', k, n)}", realise="mode", kernel=grid
+            ),
+        ]
+    return merge({"mission": ms, **systems}, {"mission": mp, **params}, bindings), grid
+
+
+def multi_system(decoder, setting, confusion=None):
+    """The closed System of a multi-rover run: the agent (``multi_agent_system``) coupled to a
+    world of as many vehicles (``survey_world.world_system(vehicles=...)``), rover ``k`` bound to
+    vehicle ``k``, and in the two-tier setting band meter ``k`` read by the scheduler's ``gauge_k``.
+    Returns ``(System, SystemParams)``."""
+    agent, _ = multi_agent_system(decoder, setting, confusion)
+    mode = camera_mode(setting)
+    n = setting["rovers"]
+    bindings = []
+    for k in range(1, n + 1):
+        bindings += world_bindings(f"agent.rover{k}", mode, vehicle=k)
+        if setting.get("tiers") == 2:
+            bindings.append(Identify(f"world.band_{k}", f"agent.mission.gauge_{k}"))
+    world = wd.world_system(look=mode == "look", vehicles=n)
+    return couple({"agent": agent, "world": world}, bindings)
+
+
+def run_multi(
+    setting,
+    ticks,
+    decoder,
+    steps=PLANNER_STEPS,
+    starts=PLANNER_STARTS,
+    encoder=None,
+    confusion=None,
+    replicas=None,
+    group=True,
+):
+    """A run of a multi-rover setting: one ``run`` call over the closed System
+    (``multi_system``) steps the rovers (``rover_plan``), the scheduler when the setting has one
+    (``plan()`` once per option, its trace recorded, its field learned within the plan where the
+    setting says so) and the world. The rovers are one group (``steps`` keyed by the tuple of
+    their names): one vmapped call of the planner steps both, the copies simultaneous among
+    themselves. In the two-tier setting each rover is driven by its own option node and emits
+    its own cell reading, and ``run`` pairs those ports of the copies' partners as it pairs
+    their own names. ``group=False`` steps the rovers one by one, each reading the field the one
+    before left. With ``replicas``, a list, as ``run_setting`` gives."""
+    system, params = multi_system(decoder, setting, confusion)
+    n = setting["rovers"]
+    world_step, readout = sensors(camera_mode(setting), encoder, vehicles=n)
+    rovers = tuple(f"agent.rover{k}" for k in range(1, n + 1))
+    tiered = setting.get("tiers") == 2
+    plans, clocks = {}, None
+    if tiered:
+        plans["agent.mission"] = plan(
+            trace=True,
+            selection="deterministic",
+            replace={"policy_len": setting["horizon"]},
+            learn=ss.learn_rates("agent.mission."),
+        )
+        clocks = {"agent.mission": setting["slow_ticks"] / ss.SURVEY_TICKS}
+    if group:
+        plans[rovers] = rover_plan(setting, steps, starts, rovers[0] + ".")
+    else:
+        for node in rovers:
+            plans[node] = rover_plan(setting, steps, starts, node + ".")
+    plans["world"] = world_step
+    batched = run(
+        system,
+        params,
+        ticks,
+        run_keys(setting["seed"], replicas),
+        steps=plans,
+        clocks=clocks,
+        tick_order="sequential",
+        carries=world_carries(setting),
+        record_carries=True,
+        batch=replicas,
+    )
+    seconds = run_seconds(batched, ticks)
+    harness = None
+    results = []
+    for rec in replicas_of(batched, replicas, params):
+        result, harness = _multi_result(
+            rec,
+            setting,
+            ticks,
+            params,
+            seconds,
+            steps,
+            starts,
+            readout,
+            confusion,
+            harness,
+            grouped=group,
+        )
+        results.append(result)
+    return results[0] if replicas is None else results
+
+
+def field_name(params):
+    """The name of the field's parameter variable in a System's params (the one ending in
+    ``field``)."""
+    (name,) = [k for k in params.parameters if k.rpartition(".")[2] == "field"]
+    return name
+
+
+def shared_fields(rec, rovers, params, grouped):
+    """The shared field's concentration after each round, ``ticks`` arrays ``[terrain, cell]``,
+    from the rovers' traces (each the field its round planned with, after its own learning). Under
+    a group the copies read the round's starting field and their counts are summed at the end of
+    the turn, so the field after the round is the sum of their traces less the starting field
+    counted once per extra copy; stepped one by one each reads the field the one before left, so
+    the field after the round is the trace with the most counts (the last learner's). Checked
+    against the run's parameter home after its last round."""
+    name = field_name(params)
+    home = np.asarray(params.parameters[name].concentration, np.float64)
+    out = []
+    ticks = len(rec[rovers[0]].carries) - 1
+    for t in range(ticks):
+        traces = [
+            np.asarray(rec[node].carries[t + 1].trace.parameters[name].concentration, np.float64)
+            for node in rovers
+        ]
+        if grouped:
+            home = sum(traces) - (len(traces) - 1) * home
+        else:
+            home = max(traces, key=lambda c: float(c.sum()))
+        out.append(home)
+    final = np.asarray(rec.params.parameters[name].concentration, np.float64)
+    if out and not np.allclose(out[-1], final, rtol=1e-4, atol=1e-3):
+        raise ValueError("the shared field read off the rovers' traces is not the run's home")
+    return out
+
+
+class _Counts:
+    """A field's concentration in the form ``field_record`` reads."""
+
+    def __init__(self, concentration):
+        self.concentration = concentration
+
+
+def joint_decision_record(carry, options, readings, seconds, pre="agent.mission.", rovers=2):
+    """The record of one decision of the multi-rover scheduler, read from its ``plan(trace=True)``
+    carry: compact, since its policies are joint (``25 ** horizon`` of them) and a record per
+    policy would be most of the part file. The options chosen (one per rover) and the readings of
+    the cell modalities (``None`` where absent); the joint sequence chosen with its term tree and
+    ``G``; the best ``G`` (the midpoint of its interval) per joint first option (``efe_by_option``,
+    ``[option of rover 1][option of rover 2]``); each rover's probability of each first option;
+    the posterior over each rover's energy band and visited cell; the energy table as the decision
+    planned with it."""
+    q_pi, tree, sequences = carry.trace.q_pi, carry.trace.tree, np.asarray(carry.trace.policies)
+    g = total(tree)
+    midpoint = (np.asarray(g.lower) + np.asarray(g.upper)) / 2
+    probs = np.asarray(q_pi.probs, np.float64)
+    first = sequences[:, 0, :]  # (policies, rovers)
+    n = sm.N_OPTIONS
+    flat = first[:, 0] * n + first[:, 1]
+    efe = np.full(n * n, np.inf)
+    np.minimum.at(efe, flat, midpoint)
+    best = int(np.argmax(probs))
+    beliefs = carry.previous
+    return dict(
+        decision=True,
+        options=[int(o) for o in options],
+        cells=readings,
+        chosen=dict(
+            options=np.asarray(sequences[best]).T.astype(int).tolist(),
+            terms=term_record(tree, best, pre.split(".", 1)[0] + "."),
+            G=interval_pair(g, best),
+            q_pi=float(probs[best]),
+        ),
+        efe_by_option=np.round(efe.reshape(n, n), 4).tolist(),
+        q_by_option=[
+            [float(probs[first[:, k] == o].sum()) for o in range(n)] for k in range(rovers)
+        ],
+        policies=int(sequences.shape[0]),
+        belief=[
+            dict(
+                energy=[float(p) for p in np.asarray(beliefs[pre + f"energy_{k}"].probs)],
+                visit=[float(p) for p in np.asarray(beliefs[pre + f"visit_{k}"].probs)],
+            )
+            for k in range(1, rovers + 1)
+        ],
+        energy_table=energy_record(carry.trace.parameters[pre + "energy_table"]),
+        seconds=seconds,
+    )
+
+
+def _multi_result(
+    rec, setting, ticks, params, seconds, steps, starts, readout, confusion, harness, grouped
+):
+    """One replica's result of ``run_multi``, and the timing harness (run on the first rover of
+    the first replica). ``ticks`` holds one row per tick of the shared field (its map, counts,
+    coverage and seen cells after the round), with the options and the scheduler's decisions in
+    the two-tier setting; ``rovers`` holds each rover's own rows (``tick_rows`` of its vehicle,
+    without the field, which is the shared rows')."""
+    n = setting["rovers"]
+    rovers = tuple(f"agent.rover{k}" for k in range(1, n + 1))
+    name = field_name(params)
+    fields = shared_fields(rec, rovers, params, grouped)
+    shared = []
+    for t, conc in enumerate(fields):
+        table, counts, coverage, seen = field_record(_Counts(conc), setting["field_strength"])
+        shared.append(
+            dict(t=t, map=table, counts=counts, coverage=coverage, seen=seen, seconds=seconds)
+        )
+    options = {}
+    if setting.get("tiers") == 2:
+        scheduler = rec["agent.mission"]
+        options = {k: scheduler.intended[f"option_{k}"] for k in range(1, n + 1)}
+        for t in range(ticks):
+            shared[t]["options"] = [int(options[k][t]) for k in range(1, n + 1)]
+            if not bool(scheduler.decided[t]):
+                shared[t]["slow"] = dict(decision=False)
+                continue
+            cells = []
+            for k in range(1, n + 1):
+                present = bool(scheduler.present[f"cell_obs_{k}"][t])
+                cells.append(int(scheduler.received[f"cell_obs_{k}"][t]) if present else None)
+            shared[t]["slow"] = joint_decision_record(
+                scheduler.carries[t + 1], shared[t]["options"], cells, seconds, rovers=n
+            )
+    decoder = params.likelihood.get(rovers[0] + ".img")
+    horizon = setting.get("policy_len", sm.POLICY_LEN)
+    per_rover = {}
+    for k, node in enumerate(rovers, 1):
+
+        def record(carry, node=node):
+            #  a grouped copy's carry is keyed by the first copy's names
+            pre = node + "." if node + ".x" in carry.previous else rovers[0] + "."
+            out = rover_record(carry, setting, pre, decoder, horizon, field=name)
+            for key in ("map", "counts", "coverage", "seen"):
+                out.pop(key)
+            return out
+
+        def extra(t, k=k):
+            return dict(option=int(options[k][t])) if options else {}
+
+        per_rover[node.rpartition(".")[2]] = tick_rows(
+            rec, node, ticks, record, seconds, extra, recognise=readout, vehicle=k
+        )
+    if harness is None:
+        harness = timing(rec, rovers[0], setting, decoder, confusion, steps, starts)
+    result = dict(
+        ticks=shared,
+        rovers=per_rover,
+        starts=[list(map(float, wd.STARTS[k])) for k in range(n)],
+        planner=dict(steps=steps, starts=starts),
+        timing=harness,
+        grouped=grouped,
+    )
+    if setting.get("tiers") == 2:
+        learned = rec.params.parameters["agent.mission.energy_table"]
+        result["energy_table"] = energy_record(learned)
+    return result, harness
+
+
+def covered_cells(row):
+    """The cells a one-rover tick row counts as covered (its field's top probability over
+    ``COVERED_MAX``) and as seen (``SEEN_COUNTS`` counts or more), as two boolean arrays, read off
+    its ``map`` (the posterior mean as uint8) and ``counts``."""
+    mean = np.asarray(row["map"], np.float64) / 255.0
+    return mean.max(axis=1) > COVERED_MAX, np.asarray(row["counts"]) >= SEEN_COUNTS
+
+
+def union_rows(rows_a, rows_b):
+    """The independent-rover baseline over the ticks of two one-rover runs: per tick the share of
+    cells covered by either rover's own field (``covered_cells``), and seen by either; two rovers
+    that map apart and pool their maps afterwards, a cell counted as mapped where either map is
+    confident of it. Read off the published uint8 means, so a cell within half a step of
+    ``COVERED_MAX`` may be miscounted (``union_check`` measures it against the runs' own
+    coverage)."""
+    out = []
+    for a, b in zip(rows_a, rows_b, strict=True):
+        cov_a, seen_a = covered_cells(a)
+        cov_b, seen_b = covered_cells(b)
+        out.append(
+            dict(
+                t=a["t"],
+                coverage=float(np.mean(cov_a | cov_b)),
+                seen=float(np.mean(seen_a | seen_b)),
+            )
+        )
+    return out
+
+
+def union_check(rows):
+    """The largest gap between a one-rover run's recorded coverage and the coverage
+    ``covered_cells`` reads off its uint8 map, over its ticks."""
+    return max(abs(float(np.mean(covered_cells(r)[0])) - r["coverage"]) for r in rows)
+
+
+def multi_report(out_dir, marks=(200, 400, 600, 800), pair=("one-level", "one-level-second-start")):
+    """The multi-rover comparison from the part files in ``out_dir``: coverage of the field at the
+    ticks ``marks`` for each run there (a multi-rover run's of its shared field), and the union of
+    the two one-rover runs ``pair`` (``union_rows``) where both are present. Printed and written to
+    ``MULTI.md``; returns the text. Where ``out_dir`` holds the part files of batched runs
+    (``part_<id>_s<k>.json``, ``--replicas``), a second table gives each setting's coverage as
+    mean ± sd over its seeds, and the union of ``pair`` over the seeds both hold."""
+    runs = {}
+    seeds = {}
+    for path in sorted(Path(out_dir).glob("part_*.json")):
+        part = json.loads(path.read_text())
+        tag = path.stem.removeprefix("part_")
+        replica = re.fullmatch(r"(.+)_s(\d+)", tag)
+        for sid, one in part["runs"].items():
+            if replica:
+                seeds.setdefault(replica.group(1), {})[int(replica.group(2))] = one
+            else:
+                runs[tag] = (sid, one)
+    curves = {tag: [r["coverage"] for r in one["ticks"]] for tag, (_, one) in runs.items()}
+    if all(p in runs for p in pair):
+        a, b = (runs[p][1]["ticks"] for p in pair)
+        curves[f"union({pair[0]}, {pair[1]})"] = [r["coverage"] for r in union_rows(a, b)]
+        check = max(union_check(a), union_check(b))
+    else:
+        check = None
+    #  the seeds of ``--replicas`` part files (``part_<id>_s<k>.json``): coverage per seed, and
+    #  the union of the pair over the seeds both hold
+    spread = {
+        sid: {k: [r["coverage"] for r in one["ticks"]] for k, one in by_seed.items()}
+        for sid, by_seed in seeds.items()
+        if len(by_seed) > 1
+    }
+    if all(p in seeds for p in pair):
+        common = sorted(set(seeds[pair[0]]) & set(seeds[pair[1]]))
+        if len(common) > 1:
+            spread[f"union({pair[0]}, {pair[1]})"] = {
+                k: [
+                    r["coverage"]
+                    for r in union_rows(seeds[pair[0]][k]["ticks"], seeds[pair[1]][k]["ticks"])
+                ]
+                for k in common
+            }
+    head = "".join(f" tick {k} |" for k in marks)
+    lines = [
+        "# Multi-rover survey, step one",
+        "",
+        f"Coverage (cells whose field's top probability exceeds {COVERED_MAX}):",
+        "",
+        f"| run |{head}",
+        "|---|" + "---|" * len(marks),
+    ]
+    for tag, curve in curves.items():
+        cells = "".join(f" {curve[k - 1]:.3f} |" if k <= len(curve) else " - |" for k in marks)
+        lines.append(f"| {tag} |{cells}")
+    if check is not None:
+        lines += [
+            "",
+            f"The union's reading off the uint8 maps is within {check:.4f} of each run's own.",
+        ]
+    if spread:
+        lines += [
+            "",
+            "Over the seeds of the batched runs (mean ± sd over seeds; a batched replica is not "
+            "the unbatched run of its seed, see design/batched-run.md):",
+            "",
+            f"| run | seeds |{head}",
+            "|---|---|" + "---|" * len(marks),
+        ]
+        for tag, by_seed in spread.items():
+            values = np.asarray([curve for _, curve in sorted(by_seed.items())])
+            cells = "".join(
+                f" {values[:, k - 1].mean():.3f} ± {values[:, k - 1].std(ddof=1):.3f} |"
+                if k <= values.shape[1]
+                else " - |"
+                for k in marks
+            )
+            lines.append(f"| {tag} | {len(by_seed)} |{cells}")
+    text = "\n".join(lines) + "\n"
+    (Path(out_dir) / "MULTI.md").write_text(text)
+    print(text)
+    return text
 
 
 def downsampled_maps():
@@ -1404,7 +1903,6 @@ def assemble(out_dir, camera_report, decoder):
         cell_error_sd=float(ss.CELL_ERROR_SD),
         measured=dict(
             cruise_speed=float(ss.CRUISE),
-            survey_spread=float(ss.SURVEY_SPREAD),
             charge_speed=float(ss.CHARGE_SPEED),
             survey_readings=ss.SURVEY_READINGS,
             charge_readings=ss.CHARGE_READINGS,
@@ -1439,6 +1937,11 @@ def main():
     ap.add_argument("--out", required=True, help="output directory (also holds the camera cache)")
     ap.add_argument("--settings", default=None, help="comma-separated setting ids")
     ap.add_argument("--assemble", action="store_true", help="merge the part files and stop")
+    ap.add_argument(
+        "--multi-report",
+        action="store_true",
+        help="the multi-rover comparison of the part files (multi_report), and stop",
+    )
     ap.add_argument("--steps", type=int, default=PLANNER_STEPS, help="descent steps per plan")
     ap.add_argument("--starts", type=int, default=PLANNER_STARTS, help="warm starts per plan")
     ap.add_argument(
@@ -1465,15 +1968,24 @@ def main():
     args = ap.parse_args()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.multi_report:
+        multi_report(out_dir)
+        return
     decoder, encoder, camera_report = cam.load_or_train(out_dir)
     confusion = camera_report.get("recogniser_confusion")
     if args.assemble:
         assemble(out_dir, camera_report, decoder)
         return
     settings = settings_grid_l2()
-    if args.settings:
+    if args.settings:  # any setting by id, the multi-rover ones (``settings_multi``) included
         keep = set(args.settings.split(","))
-        settings = [s for s in settings if s["id"] in keep]
+        known = settings_grid_l2() + settings_multi()
+        unknown = keep - {s["id"] for s in known}
+        if unknown:
+            raise SystemExit(
+                f"unknown settings {sorted(unknown)}; known: {[s['id'] for s in known]}"
+            )
+        settings = [s for s in known if s["id"] in keep]
     for s in settings:
         if args.seed is not None:
             s["seed"] = args.seed

@@ -189,3 +189,66 @@ with the option pinned to a single survey sector, which is level 1 as run.
 
 MNLR; the upward message F2; a spatial prior over the field; a learnable energy table; cross-
 factor continuous parents.
+
+## The survey after 0.21.0 (2026-11-17)
+
+**Plan learning on the rover.** `plan_learning` on the shipped rover is +0.15 coverage alone and
+removes the scheduler's early lead, so the two-tier story becomes energy management (measured
+2026-11-17, record kept outside the repo). The wall belongs in the vehicle step (a clip,
+propagated unscented), after which the Gaussian-mixture preference is a constraint no longer
+needed but still the carrier of the page's G bracket. Open; 0.22.0 shipped without deciding it.
+
+**Multi-rover, step one (examples only, no library change).** Two rovers as two readers of one
+`field`: `survey_scheduler.scheduler(..., rovers=2)` (per-rover factors, nodes and modalities
+under `_1`/`_2`, one `field`, one `energy_table` counted by both, the durations on the first
+option node), `survey_world.world_system(vehicles=2)` (two vehicles side by side, no
+rover-to-rover physics), and `survey_run.settings_multi` with three arms: the two rovers merged
+without a scheduler (stepped as one group), under one scheduler with joint options
+(`JOINT_HORIZON` 3, 15,625 sequences, the field learned within the plan; the rovers stepped one
+by one under `"sequential"`, each driven by its own option node and emitting its own cell
+reading), and the union of two one-rover runs from mirrored starts. Five seeds by
+`--replicas 5`, 800 ticks, coverage mean ± sd:
+
+| Arm | 200 | 400 | 600 | 800 |
+|-----|-----|-----|-----|-----|
+| Two rovers, one scheduler (two-tier) | 0.543±0.026 | 0.735±0.026 | 0.791±0.030 | 0.818±0.030 |
+| Two rovers, no scheduler | 0.457±0.013 | 0.703±0.043 | 0.835±0.050 | 0.866±0.058 |
+| Union of two independent rovers | 0.377±0.031 | 0.603±0.028 | 0.738±0.026 | 0.805±0.050 |
+| One rover | 0.259 | 0.452 | 0.579 | 0.684±0.049 |
+| One rover, scheduler | 0.341 | 0.478 | 0.588 | 0.657±0.019 |
+
+**The two-tier row is not what the default program now runs.** It was measured with the two
+rovers stepped one by one under `"sequential"`, since `run` refused the group then: rover 2 read
+the field rover 1 had just counted into. Since 2026-11-18 (`batched-run.md`, "R12 amended")
+`run_multi` groups both arms by default, which makes the two rovers simultaneous among
+themselves, both reading the field as the group's turn began. The default program will not
+reproduce the two-tier numbers; `run_multi(..., group=False)` restores the stepping they were
+measured under. The arm without a scheduler was a group already.
+
+Sharing the field beats pooling two independent maps at every mark; the scheduler leads every
+arm to tick 400 and ends level with the union, behind the shared map without it.
+
+**Tuned on the way.** The first build lost late on every seed (0.798±0.058), both rovers held to
+the sector above the charger, because the survey option predicted its readings as a Gaussian of
+sd 0.66 about the sector's centre, so once the centres were read no option saw a sector's unread
+edge cells. The readings are now uniform over the sector (the form "The slow tier" gives above),
+and the travel to a sector is measured to its nearest cell, not its centre, since a 24-tick
+option could not reach the far sector's centre (25 ticks at cruise). What remains of the pull:
+six cells of that sector straddle a terrain boundary and their readings alternate (ice itself is
+the easiest class to recognise, 98 percent of ticks), and the charger is next door.
+
+**Spread and reproducibility.** One seed says nothing at this spread, and the same seed
+unbatched is a different draw (float rounding of the batched program grown over 800 closed-loop
+ticks: 0.508 against 0.625 for the one-rover scheduler; three further unbatched seeds fall within
+0.04 of their replicas at every mark; `batched-run.md`, "Replica reproducibility, measured").
+
+**Cost.** Wall: 894 s and 71 GB peak for five two-tier two-rover replicas with their traces,
+659 s and 8.7 GB for five one-level, 396 s for the two single-seed two-tier runs.
+
+**Fixture.** The one-rover declarations are as before; the two-level case of
+`tests/data/survey_run.npz` is re-recorded (a different first option from the start cell), the
+one-level case bitwise unchanged.
+
+**Next.** `run` grouping copies driven by different option nodes, which landed 2026-11-18 as
+"R12 amended"; a collision servo. Nested rounds were under review and are shelved
+(`nested-rounds.md`, 2026-11-18).

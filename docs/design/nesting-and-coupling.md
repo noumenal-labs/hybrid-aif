@@ -437,6 +437,12 @@ The receiver's expected free energy under a soft supplied node inherits the conv
 `mixed-control-planning.md`, for which no bound is stated. A `stats` value into a process input is
 the mean-field departure the physics paragraph names, and is allowed on those terms.
 
+*2026-11-17, on A5's refusal of a probability vector into a nonlinear reader: the switching
+mixture of 0.21.0 lifts it exactly. Push the belief through the transition per level of the held
+node and weight the results by the vector. The linear bank's table average is the
+Jensen-bounded mean-dynamics reading; it could be offered the same mixture. Not built; the
+refusal stands.*
+
 **A6. Planning over reads and reports.** The information-gain estimators score hard outcomes;
 under `stats` they overstate a soft datum by the Jensen gap (N3, as amended). A count report
 (N6) has no estimator entry; its information gain is novelty about the reader's variable reached

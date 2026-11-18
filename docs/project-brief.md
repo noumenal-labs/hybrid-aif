@@ -347,6 +347,13 @@ observations, estimator registry, serialization, dataset columns).
 
 ## Build status (as of 2026-07-21, commit ef38398; audited — STALE below this line: for current shipped capabilities see docs/capabilities.md, maintained per release)
 
+*Note (2026-11-18): after v0.1 the work followed the post-v0.1 roadmap below, not this list.
+Parts of the v0.1 workstreams were never developed: K (behavioural fitting: no `fit`, no
+NumPyro), D's `SamplerBackend` seam and the epistemic-priors formulation, G's Lance format and
+goal relabeling, and H's SIGReg/JEPA pseudo-observation node. The remaining workstream items
+stay queued, subject to a review for their relevance. The figures below are as of the date in
+the heading.*
+
 Adopted designs are in `design/`.
 Statuses below come from a design-conformance audit, not self-report.
 284+ tests, all green; pymdp parity holds at function, term, and policy
@@ -447,12 +454,16 @@ exist; H and I are the research tier.
 ## Post-v0.1 roadmap candidates (from the landscape survey)
 
 Harvested from the packages surveyed; none block v0.1, all are cheap-to-
-moderate extensions of machinery we're already building. Items marked
-**[deferred]** are different in kind: decided deferrals of work we have
-already designed, carrying a stated gate on when they must be paid.
+moderate extensions of machinery we're already building. Each entry opens
+with one label, `[state YYYY-MM-DD]`: **flagged** (named, not designed),
+**deferred** (designed, with a stated gate on when it must be paid),
+**landed** (built; the commit or release is in the body) or **dropped**; a
+change of state is written `[flagged 2026-08-19 → landed 2026-09-18]`.
 
-- **[ACTIVE 2026-08 → LANDED 2026-10-10: the R-AIF acceptance met, 1ef76b8, `experiments/raif-mountain-car/acceptance-report.md`] Amortization program** (`design/amortization.md`,
-  A1–A9 adjudicated): the search↔habit slider — neural conditional
+- **[landed 2026-10-10] Amortization program** (`design/amortization.md`,
+  A1–A9 adjudicated; active from 2026-08-04, landed when the R-AIF acceptance
+  was met, 1ef76b8, `experiments/raif-mountain-car/acceptance-report.md`):
+  the search↔habit slider — neural conditional
   families, gradient learning, habits/E in every planner, learned
   G-tail (`derived` flag on Interval), learned preferences, trainers.
   **R-AIF replication is the binding acceptance** (arXiv:2409.14216).
@@ -462,7 +473,7 @@ already designed, carrying a stated gate on when they must be paid.
   **Debt introduced by the arc is tracked in
   `design/amortization-debt-ledger.md`** (live; opened 2026-08-27).
 
-- **[framing, 2026-08-20] The objective-term lattice**
+- **[deferred 2026-08-20] The objective-term lattice**
   (`design/objective-terms.md`): every term-tree leaf is a point in
   *(declared conditional) × (functional) × (sign)*, over a closed
   four-functional vocabulary — which places `ambiguity` and the new
@@ -485,9 +496,9 @@ already designed, carrying a stated gate on when they must be paid.
   moment a user-defined row needs the infogain machinery. Known debt,
   deliberately not paid mid-arc.
 
-- **[deferred → PAID 2026-08-03, v0.4.0] Per-variable info-gain terms
-  in the objectives layer** (`design/per-variable-infogain.md`, V1–V8;
-  owed 2026-07-25, from `design/parameter-learning.md` D6). The term tree
+- **[deferred 2026-07-25 → landed 2026-08-03] Per-variable info-gain terms
+  in the objectives layer** (v0.4.0; `design/per-variable-infogain.md`, V1–V8;
+  owed from `design/parameter-learning.md` D6). The term tree
   is organized by EFE decomposition with per-term static toggles, so
   epistemic value about *states* and about *parameters* are separate code
   paths behind separate switches. Treating parameters as variables gives
@@ -502,8 +513,8 @@ already designed, carrying a stated gate on when they must be paid.
   `System._term_targets` resolves every term-participation selector to
   index tuples in one place, and both planning paths consume them — the
   refactor re-bases the TermTree on top of that single resolver.
-- **[deferred] Generic message-passing layer: `infer(query, clamped)`**
-  (owed 2026-07-26; the fork is open question 13). A lower API layer
+- **[deferred 2026-07-26] Generic message-passing layer: `infer(query, clamped)`**
+  (the fork is open question 13). A lower API layer
   speaking variables and factors, with parameters as variables one chooses
   to query, and the AIF vocabulary layered above it. **Motivation:** It makes
   the code/math structure cleaner, enables finer-grained querying (and 
@@ -522,7 +533,7 @@ already designed, carrying a stated gate on when they must be paid.
   pair** so the compiled path keeps hoisting loop invariants out of the
   planning scan; cheap now, expensive to retrofit.
 
-  **Gate: blocked on the per-variable info-gain refactor above** — PAID
+  **Gate: blocked on the per-variable info-gain refactor above** — landed
   2026-08-03 (v0.4.0), so this item is unblocked; the amortization program
   it queued behind closed 2026-10-10 (entry 113), and its gate is now open
   question 13 below (Alex's word). *Note (2026-10-17):* the forward rule for a
@@ -540,8 +551,8 @@ already designed, carrying a stated gate on when they must be paid.
   `LinearGaussianObservation` bakes a role into a mathematically
   role-free linear-Gaussian conditional (the v0.2 restriction's
   fossil); roles are slot vocabulary, not class ontology.
-- **[deferred] Batched updates across same-family factors** (owed
-  2026-07-28). We batch across agents, modes, and policies — the idiom is
+- **[deferred 2026-07-28] Batched updates across same-family factors**.
+  We batch across agents, modes, and policies — the idiom is
   "hoist the batch into the model" — but a Python loop over modalities
   still unrolls at trace time (`inference/discrete.py`). Collapsing
   shape-identical factors into one stacked update is semantics-preserving
@@ -560,16 +571,17 @@ already designed, carrying a stated gate on when they must be paid.
   same-shape factors. Deferred indefinitely if that never materializes;
   if paid, sequence after the two refactors above, which reshape the same
   internals.
-- **[flagged 2026-08-19 → LANDED 2026-09-18 as `legal=`, `design/action-legality.md`]
-  Explicit `action_mask` input, separate from `policy_prior`.** Before
+- **[flagged 2026-08-19 → landed 2026-09-18] Explicit `action_mask` input,
+  separate from `policy_prior`.** Landed as `legal=` (`design/action-legality.md`). Before
   `legal=`, masking rode the habit prior (−inf leaves, the N2 pattern), a
   collision once E is *learned*; it now composes additively at the policy
   softmax (8c004c8, entry 073). Origin: the mission build's peer review — E's legitimate
   tenants are habits and declared action priors; the mask is the
   squatter.
-- **[flagged 2026-08-19; obs_targets half LANDED 2026-08-19; per-step targets conditional on
-  a discrete control node LANDED 2026-10-20, dba02aa, `C_deps`, ships in 0.15.0,
-  `design/step-durations.md` T5] Conditional continuous targets.** `obs_targets` on LG modalities is built —
+- **[flagged 2026-08-19] Conditional continuous targets.** Two halves landed: `obs_targets`
+  on 2026-08-19, and per-step targets conditional on a discrete control node on 2026-10-20
+  (dba02aa, `C_deps`, ships in 0.15.0, `design/step-durations.md` T5). `obs_targets` on LG
+  modalities is built —
   Gaussian/mixture C designations over a (possibly switching) LG
   modality's observation space, utility and risk/ambiguity leaves
   keyed by modality, decompositions coherent at both interval
@@ -595,7 +607,8 @@ already designed, carrying a stated gate on when they must be paid.
   mismatches** (`merge()` since b428329, `couple()` being the wiring API;
   one field per round-trip today, `composition/merge.py` `_agree` — policy_len, then
   gamma, then mixture_schedule; friction log positive-finding nit).
-- **LANDED (b2c58ae, ships in 0.14.0): Bayesian model reduction & online structure learning** (SPM
+- **[flagged 2026-07-19 → landed 2026-10-16] Bayesian model reduction & online structure
+  learning** (b2c58ae, ships in 0.14.0; SPM
   `spm_MDP_VB_sleep`/`spm_MDP_structure_learning`; AXIOM's component
   birth/merge rules): closed-form reduced-Dirichlet log evidence is pure
   tensor math, pairs naturally with mixture-node component birth/death, and
@@ -614,26 +627,26 @@ already designed, carrying a stated gate on when they must be paid.
   length item and the zeroth-harness brief), a modality whose datum is a
   previous-tick belief of a named factor (AXIOM's recurrent mixture, S8; `System.lagged`, generalised to a source in another component, with a kernel and a declared realisation, by `design/nesting-and-coupling.md` N3).
   Source: AXIOM (Heins et al. 2025, arXiv:2505.24784).
-- **AXIOM's pixel layer** (no priority set, 2026-10-13): the slot mixture
+- **[flagged 2026-10-13] AXIOM's pixel layer** (no priority set): the slot mixture
   over pixel tokens whose component parameters are latent states, the
   presence and moving gates, the unused counter, the nearest-object
   relation. Engine requirement if taken up: a likelihood whose per-component
   parameters are variables rather than clamps. Not needed by the structure
   learning above, which works on any categorical factor with conjugate
   emissions.
-- **Non-conjugate parameters in the learn face** (2026-10-14): a gradient
+- **[flagged 2026-10-14] Non-conjugate parameters in the learn face**: a gradient
   step on the closed-form evidence for a hyperparameter with no conjugate
   update (the growth propensity `α` first; the Dirichlet anchors and the
   MNIW priors are the same case), then the Laplace posterior around that
   maximum as the general facility; `design/model-description-0.3.md` 18.5e
   names the gap (a conjugate hyperparameter today has only a call-time rate
   of zero).
-- **Clone-structured cognitive graphs** (Raju, Guntupalli, Zhou,
+- **[flagged 2026-10-14] Clone-structured cognitive graphs** (Raju, Guntupalli, Zhou,
   Lázaro-Gredilla & George, [arXiv:2212.01508](https://arxiv.org/abs/2212.01508)): sequence learning
   over cloned discrete states, with Viterbi and Baum–Welch over the clone
   graph as the tools; later than the structure learning above, which it
   would sit on (a clone is a level).
-- **Controllability beliefs** (SPM `spm_MDP_VB_XXX`'s `k`): beliefs about
+- **[flagged 2026-07-19] Controllability beliefs** (SPM `spm_MDP_VB_XXX`'s `k`): beliefs about
   which factors are controllable, alongside the terminal-state priors (`H`
   — probabilistically grounded in arXiv:2312.07547: `h` as the
   final-state prior reciprocal to `d`, with the derived inductive policy
@@ -641,11 +654,11 @@ already designed, carrying a stated gate on when they must be paid.
   there and taken up by the composition build (`H_deps` across a merge boundary))
   already promoted into the preference-node family above — neither has been
   ported by any library.
-- **Threshold-free fault tolerance via online precision learning**
+- **[flagged 2026-07-19] Threshold-free fault tolerance via online precision learning**
   (Baioumy/Pezzato line): failing sensors auto-down-weighted through the
   per-block precision machinery we already plan — a production-robotics
   differentiator no library exposes.
-- **Generalized-coordinates variant of the Linear-Gaussian node** (SPM
+- **[flagged 2026-07-19] Generalized-coordinates variant of the Linear-Gaussian node** (SPM
   DEM/LAP — "generalised filtering"): a *constructor, not an engine* —
   `generalized(jacobian, embedding_order, smoothness) → (F, Q_chol)`
   embedding the derivative/shift operator and the smoothness-determined
@@ -655,7 +668,7 @@ already designed, carrying a stated gate on when they must be paid.
   no maintained Python equivalent exists. Nonlinear/hierarchical cases via
   the per-order deterministic-map rules rather than porting DEM's
   scaffolding.
-- **Surprise-weighted (prioritized) replay** (an internal poster;
+- **[flagged 2026-07-21] Surprise-weighted (prioritized) replay** (an internal poster;
   reference implementation in an internal repository, assessed):
   proportional PER with a surprise priority *re-scored under the current
   model* on a schedule — the re-scoring is the non-PER idea worth keeping.
@@ -665,19 +678,19 @@ already designed, carrying a stated gate on when they must be paid.
   `ReplayBuffer` + a trainer-owned re-scoring step; use per-step VFE (which
   we compute natively) as the score, per-clip granularity, applied IS
   weights. ~2–4 days once a training loop exists to own the refresh.
-- **Planner-layer extras**: free-energy Occam-window pruning (SPM `zeta`/
+- **[flagged 2026-07-19] Planner-layer extras**: free-energy Occam-window pruning (SPM `zeta`/
   `chi`) and EFE-guided incremental tree expansion (Champion's BTAI) as
   alternatives to visit-count expansion; habit-network distillation from
   MCTS visit counts (Fountas et al.) as the blueprint for the amortized
   backend; contrastive decoder-free EFE (Mazzaglia, MIT) on the estimator
   menu for JEPA latent nodes.
-- **Production interface patterns**: behavior-trees-as-priors (Pezzato's
+- **[flagged 2026-07-19] Production interface patterns**: behavior-trees-as-priors (Pezzato's
   T-RO 2023 design) for gating continuous controllers from discrete
   decisions; an edge latency/memory benchmark answering the
   hardware-oriented-AIF line (arXiv:2508.13177); a MuJoCo/Isaac bridge
   (greenfield — none exists).
 
-- **[flagged 2026-09-18] A discrete latent observed through continuous
+- **[flagged 2026-09-18 → landed 2026-10-16] A discrete latent observed through continuous
   features, declared directly.** The first model a composing agent writes
   for perceptual grounding is a categorical "which object / which mode"
   factor read off continuous features, and `validate_structure` refuses a
@@ -696,7 +709,9 @@ already designed, carrying a stated gate on when they must be paid.
   (`agent-composition-probe.md`, item c2) and by zeroth-control's model-patch
   loop, whose proposer will try this first. **Gate: the first composer that
   needs it** — zeroth-control's structural patches are the likely customer.
-  *Amendment 2026-10-14 (Alex): settled as S2 of `design/structure-learning.md`.*
+  *Amendment 2026-10-14 (Alex): settled as S2 of `design/structure-learning.md`; landed as
+  b2c58ae (a Gaussian emission over categorical parents, the mixture likelihood declared
+  directly; not the MNLR direction, a discrete observation of continuous latents).*
   No new family: the per-level Gaussian with a Normal-Inverse-Wishart prior
   is `LinearGaussianObservationMNIW` with an empty regressor block, so the
   build is the validation rule admitting zero continuous parents, the
@@ -752,9 +767,9 @@ already designed, carrying a stated gate on when they must be paid.
   its predictive distribution** (multimodal transitions where the mean belief
   lands between modes), or a consumer asking for it.
 
-- **[flagged 2026-09-20 → LANDED 2026-09-21 in three phases: 45d198e,
-  b165a0d, 540026e; entries 080–082] Tier-split review: what in the engine is still
-  R-AIF's.** The 2026-08-28 addendum (`design/system.md`) placed
+- **[flagged 2026-09-20 → landed 2026-09-21] Tier-split review: what in the engine is still
+  R-AIF's.** Landed in three phases: 45d198e, b165a0d, 540026e; entries 080–082. The
+  2026-08-28 addendum (`design/system.md`) placed
   `inference/rssm.py` in the engine as generic machinery and moved only its
   *placement* (`worlds.tiny_rssm`) to `reference/`; the module still opens
   "R-AIF's RSSM world model" and carries `RSSMCore.tiny`, their config row,
@@ -775,13 +790,14 @@ already designed, carrying a stated gate on when they must be paid.
   refactor round (one, reviewed, a minor version), then the filtering
   question with 6.5. The move waited for `crspp_init_100k` to
   reach its 500k gate, since a resume imported `reference.run_mc` by path; it did.
-  *[LANDED 2026-09-21, phase one of three: `reference/raif/` exists,
+  *[landed 2026-09-21, phase one of three: `reference/raif/` exists,
   `RSSMCore.tiny` is `reference.raif.world.tiny_core`, `seed_stats` is the
   engine's, and a resume imports nothing by path — only the launch command
   changed. Phase two (T1–T6) landed as b165a0d; phase three (T9, the prose
   pass) with the 0.9.0 bump.]*
 
-- **[flagged 2026-09-21; done 2026-09-30] Distil the docstring salvage.** The prose pass copied
+- **[flagged 2026-09-21 → landed 2026-09-30] Distil the docstring salvage.** Landed as 5b1cee5
+  (0.9.1). The prose pass copied
   what it removed, verbatim, into
   `experiments/raif-mountain-car/docstring-salvage-2026-09-21/` by module and
   symbol — the shape of the procedure, not of a history. Owed: for each section,
@@ -792,7 +808,7 @@ already designed, carrying a stated gate on when they must be paid.
   replication doc round**, or whenever the engine's `History:` pointers are next
   rewritten.
 
-- **[landed 2026-09-29, external] Sophisticated inference** (Friston et
+- **[landed 2026-09-29] Sophisticated inference** (PR #6, f4fde0c; Friston et
   al. 2021, arXiv:2006.04120): the `"sophisticated"` planner scores each
   first action by its step terms plus the expected value of the next
   decision over the outcomes of the System's `branch_on` modalities — the
@@ -805,54 +821,18 @@ already designed, carrying a stated gate on when they must be paid.
   repo's first external code PR. Since a0f4916 (entry 092) it folds
   over the shared expansion in `planning/tree.py`.
 
-- **[recorded 2026-11-17, after 0.21.0] Follow-ons the 0.21.0 release left open.** Each is
-  a bounded extension of machinery that shipped; the design record named in brackets holds
-  the reasoning. None blocks a user of the release: every one is a refusal with a sentence
-  today, not a silent approximation.
-  - *Process noise* (`design/process-noise-learning.md` D2, D3, as built). Learn `Q` on a
-    switching or mixture-carried factor (the pairwise posterior per component is needed
-    before the reduce, the O3 loss); the unscented statistic (pairwise moments under sigma
-    points); a belief-valued continuous control at learn time; the epistemic estimator for
-    `Q` (the transition-side twin of the observation noise's D10 estimator, so a planner can
-    seek information about its own process noise); `Q` carried inside `plan_learning`;
-    `durations.compose` under a learned noise, exact first for identity `F` (the composed
-    noise is `n Q`, and the inverse-Wishart is closed under scaling), non-conjugate in
-    general. The tabular twin of D2, the Dirichlet transition's pairwise statistic in place
-    of the product of marginals, is the same gap on the discrete side.
-  - *A probability vector into a nonlinear reader* (`design/nesting-and-coupling.md` N8, A5).
-    A held control node supplied with `stats` is refused by a nonlinear transition because it
-    has no table to average. The switching mixture of 0.21.0 lifts this exactly: push per
-    level, weight by the vector. The linear bank's table average is the Jensen-bounded
-    mean-dynamics reading; it could be offered the same mixture.
-  - *From the REBUS reply* (gist, 2026-11-16). A continuous precision state: expressible at
-    0.20.0 (`noise_scale="per_coordinate"`, `f` returning `(mean, scale)`) but not inferable
-    by a Gaussian filter, since a precision enters the covariance only; an HGF-class
-    variational update is the route, and the discrete ladder (levelled noise, mode-aligned
-    mixture, per-mode evidence) is native today. Named blocks within one Gaussian factor, so
-    a continuous-to-continuous hierarchy is one exact stacked block with block-wise
-    declarations and pricing, rather than `B_deps` parents under mean-field, which lose the
-    upward message. The noise register of `merge` (`noise_reads`, D4) folded into
-    `references` through a field entry.
-  - *The survey demo* (`build/step2C/C16-plan-learning/RESULTS.md`). `plan_learning` on the
-    shipped rover is +0.15 coverage alone and removes the scheduler's early lead, so the
-    two-tier story becomes energy management; the wall belongs in the vehicle step (a clip,
-    propagated unscented), after which the Gaussian-mixture preference is a constraint no
-    longer needed but still the carrier of the page's G bracket. A 0.22 decision.
-  - *A batch axis for `run`* (2026-11-17, the multi-rover survey). **Landed in 0.22.0**:
-    `run` is one compiled `lax.scan` of rounds from the reset, `batch=` runs replicas by one
-    program (per-replica keys, params and seeds, `record=`, `chunk=`, passes), spread over the
-    devices by `shard_map`, and a tuple key of `steps` steps copies of one leaf by one vmapped
-    call; `rollout` is retired. The record, its rulings, deviations and measurements:
-    `design/batched-run.md` (R1–R14, the as-built sections of Phases A–C).
-  - *Pass sizing from the memory estimator.* `run(..., batch=B)` could size
-    `replicas_per_pass` from `branching_tree_memory` (the sophisticated planner's memory
-    estimate) instead of the caller choosing. Deferred past 0.22.0 by Alex on 2026-11-17: it
-    needs a design that pays attention to the worst-case failures of a bad estimate (an
-    underestimate that exhausts memory mid-run, an overestimate that serialises a batch that
-    would fit); the caller sets the number by hand today.
-  - *Small.* `dataclasses.replace(s, branch_on=())` on a System declared through
-    `sophisticated=` re-lowers silently; nine Markdown files fail `ruff format` at HEAD
-    (ruff 0.17.3 formats code blocks in Markdown).
+- **[flagged 2026-11-17] Follow-ons the 0.21.0 release left open.** The open ones are
+  refusals with a sentence today, not silent approximations; the detail is in the homes.
+  Process noise (`Q` on switching factors, the unscented statistic, `noise_reads`):
+  `design/process-noise-learning.md`, "Deferred, named". A probability vector into a nonlinear
+  reader: `design/nesting-and-coupling.md`, after A5. The survey demo (plan learning, the
+  multi-rover step one): `design/terrain-field.md`, "The survey after 0.21.0". The batch axis
+  landed in 0.22.0 (`CHANGELOG.md`; `design/batched-run.md`, which defers pass sizing); nested
+  rounds are shelved (`design/nested-rounds.md`, 2026-11-18). Small: `dataclasses.replace(s,
+  branch_on=())` on a System declared through `sophisticated=` re-lowers silently. From the
+  REBUS reply (gist, 2026-11-16), with no design record:
+  - a continuous precision state: expressible since 0.20.0, inferable only by an HGF-class update;
+  - named blocks within one Gaussian factor: one exact stacked block, not `B_deps` parents.
 
 Licensing note for anything above: AXIOM/CAVI-CMN/VBGS are academic-license
 (reimplement ideas only); Fountas and k-cybulski/dem are GPL (ideas only);
@@ -860,7 +840,7 @@ the Priorelli and SR-AIF repos have no license (unusable as-is); gameworld,
 ambigym, contrastive-aif, bmr4pml, and the Pezzato ROS packages are
 permissive.
 
-## Open questions for the team
+## Open questions
 
 1. **Belief-object contract.** *[resolved: `design/conditional-families.md`; `Gaussian.from_natural` exists; no `ConstraintsSpec` was built]* Shapes declared upfront; but natural vs moment
    parameterization per node (conjugate updates want natural; collapse/EFE

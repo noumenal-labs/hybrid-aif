@@ -23,10 +23,13 @@ The tables:
 - ``visit[next, cell, band, option]``: the cells an option's readings fall in, declared from the
   field's geometry and the rover's measured motion. In the empty band the cell itself, whatever the
   option (a stalled rover stays where it is and reads only its own cell). Otherwise, under survey
-  sector k: from a cell in sector k, the sector's cells weighted by a Gaussian of sd
-  ``SURVEY_SPREAD`` about its centre (the rover's sector target pulls it there and its novelty
-  spreads it); from a cell outside, the cells along the straight path to the sector's centre for
-  the share of the option the travel takes at ``CRUISE`` and the sector's weights for the rest.
+  sector k: from a cell in sector k, the sector's cells uniformly (the rover's sector target
+  holds it in the sector and its own novelty takes it to the cells not yet read, so the option's
+  worth is the sector's remaining novelty; a Gaussian of sd 0.66 about the centre, the measured
+  spread of a survey's positions, was tried first and read only the centre, so once the centres
+  were done no option saw the unread edge cells and the scheduler held both rovers to one sector);
+  from a cell outside, the cells along the straight path to the sector's nearest cell for the
+  share of the option the travel takes at ``CRUISE`` and the sector's cells for the rest.
   Under charge: likewise, the path to the charging place for the share of the option the trip
   takes at ``CHARGE_SPEED`` and the charging place's cell for the rest. A far sector leaves fewer
   of the option's readings in the sector.
@@ -56,6 +59,23 @@ option pools) and, once at the end of the plan, a terminal target on the energy 
 of a mission, so that ending a plan stalled is never worth any amount of mapping. Within the plan a
 stall costs what the tables say: in the empty band no option moves the rover, so it reads only its
 own cell.
+
+With ``rovers=2`` the scheduler plans for two rovers at once, two readers of one field: each rover
+has its own ``visit``, ``energy`` and ``map`` state factors, option control node, cell reading and
+band meter, under its index (``visit_1``, ``energy_1``, ``map_1``, ``u_option_1``, ``cell_obs_1``,
+``gauge_1``; ``_2`` for the second), each pair of factors with the tables of one rover, the second
+rover's visit starting at ``survey_world.SECOND_START``. Both ``map`` factors read the one
+parameter variable ``field``, and both ``energy`` factors the one ``energy_table`` (the two rovers
+are one design, so the band changes of either are evidence about the same table, and both count
+into it). The planner enumerates the Cartesian product of the two option nodes' levels at each
+step, so a policy is a joint sequence: ``25 ** HORIZON`` of them, which is why the two-rover
+scheduler looks ``JOINT_HORIZON`` options ahead. The rovers do not see each other and the world
+has no rover-to-rover physics: the scheduler's model holds no collision, no occlusion and no term
+coupling the two rovers' positions; they are coupled only through the field, whose novelty one
+rover's planned readings use up for the other once the field is learned within the plan
+(``plan_learning``), and through the energy table they share. Only the first option node declares
+the durations: both rovers' options last ``SURVEY_TICKS``, and the second node's level is held
+with the node between decisions.
 """
 
 import jax
@@ -75,11 +95,16 @@ from hybrid_aif import (
 
 SURVEY_TICKS = 24  # fast ticks an option lasts
 HORIZON = 4  # options the scheduler looks ahead: 625 sequences (a decision under 1 s, measured)
+#  options the two-rover scheduler looks ahead: 25 ** 3 = 15,625 joint sequences. Measured on the
+#  16 by 16 field (one decision, compiled, M3 Max CPU): 7 ms at 2, 10 ms at 3, 42-58 ms at 4; the
+#  decision is not what binds. What binds is the record: a traced decision's term tree is 0.5 MB
+#  at 3 and 12.5 MB at 4, and the run keeps the carry every round, about 0.4 GB against 10 GB over
+#  800 rounds
+JOINT_HORIZON = 3
 #  measured on earlier two-tier runs (46 survey and 20 charge options outside the empty band): the
-#  travel speed toward a sector, the spread of its positions about the sector's centre and the
-#  distinct cells it crosses; the travel speed to the charging place and the cells a charge crosses
+#  travel speed toward a sector and the distinct cells it crosses; the travel speed to the charging
+#  place and the cells a charge crosses
 CRUISE = wd.CRUISE_SPEED  # the rover's measured travel speed (0.17)
-SURVEY_SPREAD = 0.66  # the measured spread (sd per axis) of a survey's positions about the centre
 CHARGE_SPEED = 0.15  # the measured travel speed to the charging place
 PATH_SAMPLES = 24
 CELL_ACC = 0.95  # the cell reading is right with this probability
@@ -114,20 +139,22 @@ def _path_cells(centres, here, there):
 def visit_table(centres):
     """``visit[next, cell, band, option]``."""
     zones = cell_zones(centres)
-    targets = sm.sector_centres()
     n = centres.shape[0]
     moving = np.zeros((n, n, sm.N_OPTIONS))
     for k in range(sm.N_SURVEY):
         inside = zones == k
-        w = np.exp(-0.5 * np.sum((centres - targets[k]) ** 2, axis=1) / SURVEY_SPREAD**2) * inside
-        w = w / w.sum()
+        w = inside / inside.sum()
         for c in range(n):
             if inside[c]:
                 moving[:, c, k] = w
                 continue
-            travel = float(np.linalg.norm(targets[k] - centres[c])) / CRUISE
+            #  the travel is to the sector's nearest cell (the rover's novelty takes it to the
+            #  nearest unread cells first); to its centre, the far sector was out of an option's
+            #  reach (25 ticks at CRUISE against SURVEY_TICKS) and offered only path readings
+            near = centres[inside][np.argmin(np.linalg.norm(centres[inside] - centres[c], axis=1))]
+            travel = float(np.linalg.norm(near - centres[c])) / CRUISE
             share = min(travel / SURVEY_TICKS, 1.0)
-            path = _path_cells(centres, centres[c], targets[k]) * ~inside
+            path = _path_cells(centres, centres[c], near) * ~inside
             path = path / path.sum() if path.sum() > 0 else w
             moving[:, c, k] = share * path + (1.0 - share) * w
     site_xy = sm.charge_site()
@@ -194,19 +221,24 @@ def energy_prior(count=PRIOR_COUNT, floor=PRIOR_FLOOR):
     return table
 
 
-def novelty_bound(horizon=HORIZON, field_strength=sm.FIELD_STRENGTH, n_cells=sm.GRID_SHAPE**2):
+def novelty_bound(
+    horizon=HORIZON, field_strength=sm.FIELD_STRENGTH, n_cells=sm.GRID_SHAPE**2, rovers=1
+):
     """The most novelty a plan of ``horizon`` options could earn at the start of a mission: the
     largest weight of the field's novelty under its uniform prior (the most one reading of one cell
     can be worth, ``ConditionalDirichlet.novelty``; the novelty term is an expectation of these
-    weights), times the most readings an option pools, times the horizon."""
+    weights), times the most readings an option pools, times the horizon, times the ``rovers``
+    reading the field in one plan."""
     uniform = jnp.full((sm.N_TERRAIN, n_cells), 1.0 / sm.N_TERRAIN)
     field = ConditionalDirichlet.from_table(uniform, 1, strength=field_strength)
-    return float(horizon * float(jnp.max(READINGS)) * float(jnp.max(field.novelty())))
+    return float(horizon * rovers * float(jnp.max(READINGS)) * float(jnp.max(field.novelty())))
 
 
-def terminal_penalty(horizon=HORIZON, field_strength=sm.FIELD_STRENGTH):
-    """The terminal target's penalty on the empty band: twice ``novelty_bound``."""
-    return 2.0 * novelty_bound(horizon, field_strength)
+def terminal_penalty(horizon=HORIZON, field_strength=sm.FIELD_STRENGTH, rovers=1):
+    """The terminal target's penalty on the empty band: twice ``novelty_bound``, which for two
+    rovers is the novelty both could earn, so that a plan ending with either rover stalled is never
+    worth the mapping of both."""
+    return 2.0 * novelty_bound(horizon, field_strength, rovers=rovers)
 
 
 def terminal_logits(penalty):
@@ -242,6 +274,29 @@ def table(probs, parent_ndims):
     )
 
 
+def indexed(name, rover, rovers):
+    """A name of the scheduler's for one rover: ``name`` itself for one rover, ``name_k`` for rover
+    ``k`` of several."""
+    return name if rovers == 1 else f"{name}_{rover}"
+
+
+def _per_rover(keys, rovers):
+    """``epistemic`` or ``plan_learning`` keys for ``rovers``: as given for one rover; for several,
+    a key naming one rover's factor or modality (``transition:map``) once per rover under its
+    index, any other key (``parameter:field``) as given."""
+    if rovers == 1:
+        return tuple(keys)
+    per = {"visit", "energy", "map", "cell_obs", "gauge"}
+    out = []
+    for key in keys:
+        slot, _, name = key.partition(":")
+        if name in per:
+            out += [f"{slot}:{name}_{k}" for k in range(1, rovers + 1)]
+        else:
+            out.append(key)
+    return tuple(out)
+
+
 def scheduler(
     grid,
     centres,
@@ -252,6 +307,8 @@ def scheduler(
     durations=False,
     readings=False,
     energy_counts=None,
+    rovers=1,
+    plan_learning=(),
 ):
     """``(System, SystemParams)`` for the scheduler over ``grid`` (the rover's ``Grid``) with the
     cell centres ``centres``. Its parameter variable ``field`` has the shape and prior of the
@@ -262,30 +319,72 @@ def scheduler(
     ``durations`` the control node declares a round of ``SURVEY_TICKS`` for every level; with
     ``readings`` the ``map`` state factor's novelty at each plan step is multiplied by the number
     of readings of the option selected at that step (``SURVEY_READINGS`` for a survey,
-    ``CHARGE_READINGS`` for charge), a slow step pooling the readings the fast tier takes in it."""
+    ``CHARGE_READINGS`` for charge), a slow step pooling the readings the fast tier takes in it.
+    ``rovers=2`` plans for two rovers, every factor, node and modality once per rover under its
+    index (``indexed``), the second starting at ``survey_world.SECOND_START``; the durations are
+    declared on the first option node alone; an ``epistemic`` key on one rover's factor names it
+    for every rover (``_per_rover``), and the default terminal penalty is the two rovers'.
+    ``plan_learning`` is the System's setting of that name (``("parameter:field",)``: the field
+    learned within the plan, so a cell one step of the plan reads is worth less to every later
+    step, of either rover); by default the field is read frozen."""
     n_cells = grid.n_cells
-    penalty = terminal_penalty(policy_len, field_strength) if terminal is None else terminal
+    if terminal is None:
+        penalty = terminal_penalty(policy_len, field_strength, rovers=rovers)
+    else:
+        penalty = terminal
     counts = energy_prior() if energy_counts is None else energy_counts
-    # state factors: visit 0, energy 1, map 2; u_option 3 (the option, a control node)
+    ks = range(1, rovers + 1)
+
+    def name(base, k):
+        return indexed(base, k, rovers)
+
+    # state factors: visit_k (k - 1), energy_k (R + k - 1), map_k (2R + k - 1); the option control
+    # nodes u_option_k (3R + k - 1); for one rover visit 0, energy 1, map 2, u_option 3
+    def visit(k):
+        return k - 1
+
+    def energy(k):
+        return rovers + k - 1
+
+    def option(k):
+        return 3 * rovers + k - 1
+
     system = System(
-        A_deps=((0,), (1,)),
-        B_deps=((0, 1, 3), (1, 3), (0,), ()),
-        controls=(3,),
-        action_names=("option",),
-        state_names=("visit", "energy", "map"),
-        control_names=("u_option",),
-        modality_names=("cell_obs", "gauge"),
+        A_deps=tuple((visit(k),) for k in ks) + tuple((energy(k),) for k in ks),
+        B_deps=tuple((visit(k), energy(k), option(k)) for k in ks)
+        + tuple((energy(k), option(k)) for k in ks)
+        + tuple((visit(k),) for k in ks)
+        + tuple(() for _ in ks),
+        controls=tuple(option(k) for k in ks),
+        action_names=tuple(name("option", k) for k in ks),
+        state_names=tuple(name(b, k) for b in ("visit", "energy", "map") for k in ks),
+        control_names=tuple(name("u_option", k) for k in ks),
+        modality_names=tuple(name(b, k) for b in ("cell_obs", "gauge") for k in ks),
         policy_len=policy_len,
         planner="enumeration",
         mixture_k=sm.MIXTURE_K,
         mixture_schedule="mode_aligned",
         planning_belief="prior",
-        epistemic=tuple(epistemic) if epistemic else False,
+        epistemic=_per_rover(epistemic, rovers) if epistemic else False,
         terms=(),
-        **({"readings": (("map", "u_option"),)} if readings else {}),
+        **(
+            {"readings": tuple((name("map", k), name("u_option", k)) for k in ks)}
+            if readings
+            else {}
+        ),
+        **({"plan_learning": _per_rover(plan_learning, rovers)} if plan_learning else {}),
     )
     uniform = jnp.full((sm.N_TERRAIN, n_cells), 1.0 / sm.N_TERRAIN)
-    start = int(np.argmin(np.linalg.norm(np.asarray(centres) - np.asarray(wd.START)[None], axis=1)))
+    starts = (wd.START,) if rovers == 1 else wd.STARTS[:rovers]
+
+    def start_cell(xy):
+        return int(np.argmin(np.linalg.norm(np.asarray(centres) - np.asarray(xy)[None], axis=1)))
+
+    visits = table(visit_table(centres), 3)
+    cells = table(cell_obs_table(centres), 1)
+    gauges = table(sm.gauge_table(), 1)
+    full = Categorical(logits=jnp.log(jnp.clip(jnp.eye(sm.N_BANDS)[-1], 1e-6)))
+    target = Categorical(logits=jnp.asarray(terminal_logits(penalty)))
     params = SystemParams(
         parameters={
             "field": ConditionalDirichlet.from_table(uniform, 1, strength=field_strength),
@@ -294,23 +393,28 @@ def scheduler(
             ),
         },
         likelihood={
-            "cell_obs": table(cell_obs_table(centres), 1),
-            "gauge": table(sm.gauge_table(), 1),
+            **{name("cell_obs", k): cells for k in ks},
+            **{name("gauge", k): gauges for k in ks},
         },
         transition={
-            "visit": table(visit_table(centres), 3),
-            "energy": Parameter("energy_table"),
-            "map": Parameter("field"),
+            **{name("visit", k): visits for k in ks},
+            **{name("energy", k): Parameter("energy_table") for k in ks},
+            **{name("map", k): Parameter("field") for k in ks},
         },
         initial_state_prior={
-            "visit": Categorical(logits=jnp.log(jnp.clip(jnp.eye(n_cells)[start], 1e-6))),
-            "energy": Categorical(logits=jnp.log(jnp.clip(jnp.eye(sm.N_BANDS)[-1], 1e-6))),
-            "map": Categorical(logits=jnp.zeros(sm.N_TERRAIN)),
+            **{
+                name("visit", k): Categorical(
+                    logits=jnp.log(jnp.clip(jnp.eye(n_cells)[start_cell(xy)], 1e-6))
+                )
+                for k, xy in zip(ks, starts, strict=True)
+            },
+            **{name("energy", k): full for k in ks},
+            **{name("map", k): Categorical(logits=jnp.zeros(sm.N_TERRAIN)) for k in ks},
         },
-        durations={"u_option": jnp.full(sm.N_OPTIONS, float(SURVEY_TICKS))}
+        durations={name("u_option", 1): jnp.full(sm.N_OPTIONS, float(SURVEY_TICKS))}
         if (durations or readings)
         else {},
-        **({"readings": {"map": READINGS}} if readings else {}),
-        terminal_targets={"energy": Categorical(logits=jnp.asarray(terminal_logits(penalty)))},
+        **({"readings": {name("map", k): READINGS for k in ks}} if readings else {}),
+        terminal_targets={name("energy", k): target for k in ks},
     )
     return system, params

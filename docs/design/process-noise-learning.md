@@ -178,3 +178,21 @@ The judgement calls the record left open, and the ones the build met:
   lowering keeps a transition's reference; a likelihood's becomes an emission kernel holding the
   variable's prior as it stands (no face learns an emission). `carry` carries the noise block
   (`transition:<f>:noise`) and a noise variable whole.
+
+## Deferred, named (2026-11-17)
+
+Left open by 0.21.0; the ones the build refuses are listed under "As built".
+
+- `Q` on a switching or mixture-carried factor: the pairwise posterior per component is needed
+  before the reduce (the O3 loss, D2).
+- The unscented statistic: the pairwise moments under sigma points (D2).
+- A belief-valued continuous control at learn time.
+- The epistemic estimator for `Q`, the transition-side twin of the observation noise's D10
+  estimator, so a planner can seek information about its own process noise (D3).
+- `Q` carried inside `plan_learning`.
+- `durations.compose` under a learned noise: exact first for identity `F` (the composed noise is
+  `n Q`, and the inverse-Wishart is closed under scaling), non-conjugate in general.
+- The tabular twin of D2, the Dirichlet transition's pairwise statistic in place of the product
+  of marginals: the same gap on the discrete side.
+- From the customer's reply (gist, 2026-11-16): the noise register of `merge` (`noise_reads`,
+  D4) folded into `references` through a field entry.

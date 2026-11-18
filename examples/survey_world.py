@@ -23,6 +23,15 @@ heading; it renders the scene from the field's geometry: the ground along each p
 ray-marched over the height map, lit by the sun, textured in world coordinates, under a sky; see
 ``render``.
 
+With ``vehicles=2`` (``world_system``, ``world_stepper``) the field holds two rovers, the first at
+``START`` and the second at ``SECOND_START``, each with its own state, command and readings under
+its index (the in-port ``v_1``, the out-ports ``fix_1``, ``img_1``, ``gauge_1``, ``band_1``, and the
+state ``x_1`` and ``terrain_1``; ``v_2`` and so on for the second). The two share the field and
+nothing else: the world has no rover-to-rover physics, so they never collide, never shade or
+occlude one another, and neither's camera ever shows the other. Each vehicle moves and is read
+exactly as a world of one vehicle would move and read it under the key ``fold_in(key, k)`` (``k``
+its index), so a world of two is two worlds of one stepped side by side.
+
     python examples/survey_world.py
 """
 
@@ -38,6 +47,11 @@ from hybrid_aif.description import register_transition
 
 FIELD = ((-1.0, 5.0), (-2.0, 4.0))  # the field, 6 by 6
 START = (-0.2, -0.6)
+#  the second rover's start in a world of two: START mirrored through the field's centre (2, 1), so
+#  the two begin in opposite quadrants (sector 1 and sector 4), as far apart as the field allows
+#  along its diagonal
+SECOND_START = (4.2, 2.6)
+STARTS = (START, SECOND_START)
 DT = 1.0
 GRID_N = 121  # the tabulated maps' points per axis, 0.05 apart
 
@@ -664,7 +678,27 @@ def move(key, state, command):
     return {"terrain": terrain_of(x[:2]), "x": x}
 
 
-def world_system(look=False):
+def vehicle_name(name, vehicle=None):
+    """A port or state name of one vehicle: ``name`` itself in a world of one (``vehicle`` None),
+    ``name_k`` for vehicle ``k`` of a world of several."""
+    return name if vehicle is None else f"{name}_{vehicle}"
+
+
+def vehicle_state(state, vehicle=None):
+    """One vehicle's state (``terrain`` and ``x``) out of a world's state: the state itself in a
+    world of one (``vehicle`` None), the entries under vehicle ``k``'s names otherwise."""
+    if vehicle is None:
+        return state
+    return {k: state[vehicle_name(k, vehicle)] for k in ("terrain", "x")}
+
+
+def _vehicles(vehicles):
+    """The vehicle indices of a world of ``vehicles``: ``(None,)`` for one (its bare names),
+    ``(1, ..., vehicles)`` otherwise."""
+    return (None,) if vehicles == 1 else tuple(range(1, vehicles + 1))
+
+
+def world_system(look=False, vehicles=1):
     """``(System, SystemParams)``: the world's declaration, for ``couple``: a black box, its
     ports and their types alone.
 
@@ -675,40 +709,73 @@ def world_system(look=False):
     (``N_BANDS`` levels, the band meter's reading), and with ``look`` the terrain class a
     recogniser reads off the image (three levels; ``world_stepper``). What lies between them is the
     hand-written step; the world states no factor and no table, so its description length is
-    reported unscored."""
-    outs = {
-        "fix": (FLOAT, 2),
-        "img": (FLOAT, IMG_PIXELS),
-        "gauge": (FLOAT, 1),
-        "band": (LEVEL, N_BANDS),
-    }
-    if look:
-        outs["look"] = (LEVEL, len(TERRAIN_NAMES))
-    return black_box(ins={"v": (FLOAT, 2)}, outs=outs)
+    reported unscored. With ``vehicles`` of two or more, every port once per vehicle under its
+    index (``v_1``, ``fix_1``, ...; ``vehicle_name``)."""
+    ins, outs = {}, {}
+    for k in _vehicles(vehicles):
+        ins[vehicle_name("v", k)] = (FLOAT, 2)
+        outs[vehicle_name("fix", k)] = (FLOAT, 2)
+        outs[vehicle_name("img", k)] = (FLOAT, IMG_PIXELS)
+        outs[vehicle_name("gauge", k)] = (FLOAT, 1)
+        outs[vehicle_name("band", k)] = (LEVEL, N_BANDS)
+        if look:
+            outs[vehicle_name("look", k)] = (LEVEL, len(TERRAIN_NAMES))
+    return black_box(ins=ins, outs=outs)
 
 
-def world_stepper(recognise=None):
+def _overrides(given, vehicle):
+    """The overrides of ``initial_state`` for one vehicle out of a world's carry: in a world of one
+    the carry itself; in a world of several, vehicle ``k`` starts at ``STARTS[k - 1]`` and takes
+    the carry's entries under its own names (``x_1``, ``energy_1``) and its unindexed entries
+    (``energy`` for every vehicle), its own winning."""
+    if vehicle is None:
+        return given
+    given = dict(given or {})
+    own = {k: v for k, v in given.items() if not k.rpartition("_")[2].isdigit()}
+    own = {"x": jnp.asarray(STARTS[vehicle - 1], jnp.float32), **own}
+    suffix = f"_{vehicle}"
+    own.update({k[: -len(suffix)]: v for k, v in given.items() if k.endswith(suffix)})
+    return own
+
+
+def world_stepper(recognise=None, vehicles=1):
     """The world's step for ``run``: the carry is the true state (keyed by name), ``obs`` holds
     the velocity command under the name of ``v`` in ``system``, and the readings are returned
     under the names of the emissions. The first call (``obs is None``) starts the world, from
     ``initial_state`` with the carry as its overrides; every other call moves it one tick
     (``move``) and reads it (``observe``). With ``recognise`` (an image to a terrain class) the
     camera's pipeline also reports that class, the ``look`` out-port. It never learns, so
-    ``params`` come back as given."""
+    ``params`` come back as given. With ``vehicles`` of two or more, each vehicle is stepped as a
+    world of one would step it under the key ``fold_in(key, k)``, from ``STARTS[k - 1]``, its
+    state and readings under its index (``vehicle_name``); nothing passes between vehicles."""
+
+    def one(key, obs, carry, vehicle):
+        if obs is None:
+            state = initial_state(_overrides(carry, vehicle))
+            readings = observe(key, state)
+        else:
+            k_move, k_obs = jax.random.split(key)
+            state = move(k_move, vehicle_state(carry, vehicle), obs)
+            readings = observe(k_obs, state)
+        if recognise is not None:
+            readings["look"] = jnp.asarray(recognise(readings["img"]), jnp.int32)
+        return readings, state
 
     def step(system, key, obs, carry, params):
         names = system.names
         name = {full.rpartition(".")[2]: full for full in (*names.emissions, *names.controls)}
-        if obs is None:
-            state = initial_state(carry)
-            readings = observe(key, state)
-        else:
-            k_move, k_obs = jax.random.split(key)
-            state = move(k_move, carry, obs[name["v"]])
-            readings = observe(k_obs, state)
-        if recognise is not None:
-            readings["look"] = jnp.asarray(recognise(readings["img"]), jnp.int32)
-        return {name[k]: value for k, value in readings.items() if k in name}, state, params
+        if vehicles == 1:
+            readings, state = one(key, None if obs is None else obs[name["v"]], carry, None)
+            return {name[k]: value for k, value in readings.items() if k in name}, state, params
+        out, states = {}, {}
+        for k in _vehicles(vehicles):
+            command = None if obs is None else obs[name[vehicle_name("v", k)]]
+            readings, state = one(jax.random.fold_in(key, k), command, carry, k)
+            for r, value in readings.items():
+                if vehicle_name(r, k) in name:
+                    out[name[vehicle_name(r, k)]] = value
+            states.update({vehicle_name(s, k): value for s, value in state.items()})
+        return out, states, params
 
     return step
 
