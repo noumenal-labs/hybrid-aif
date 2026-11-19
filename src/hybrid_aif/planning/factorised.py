@@ -9,10 +9,12 @@ marginal over levels, a ``(P_k, H, n_j)`` probability vector in a
 :class:`~hybrid_aif.controls.ControlStep` (each reader of a control node consumes a probability
 vector, design: nesting-and-coupling.md N8), and ``q(π_k) ∝ softmax(−γ G + log E_k)``. Sweep 0
 scores each node against the others' uniform marginals. The sweep count is static, so the program
-is one unrolled loop; its cost is ``sweeps · Σ_k n_k^H`` sequence evaluations (the flat scan of
-:func:`~hybrid_aif.planning.enumerate.evaluate_policies`, written here so that the other nodes'
-marginals stay unbatched under the vmap over node ``k``'s sequences: each reader's contraction
-is computed once per step, not once per sequence), against the product's ``(Π_k n_k)^H``.
+is one unrolled loop; its cost is ``sweeps · Σ_k n_k^H`` sequence evaluations, against the
+product's ``(Π_k n_k)^H``. Each node's sequences are scored as a prefix tree with the nesting of
+:func:`~hybrid_aif.planning.tree.expand_level` (inner vmap over the node's levels, outer over the
+tree's nodes), the other nodes' marginals closed over, unbatched by both: a reader's gather of
+the node's own table is computed once per level and its contraction against another node's
+marginal once per step, shared by every node of the tree, not once per sequence.
 
 The message is the expected sufficient statistic: the belief push is exact under the mixture of
 the other nodes' policies, and the nonlinear leaves (novelty, risk) are evaluated at the expected
@@ -56,6 +58,7 @@ from hybrid_aif.planning.enumerate import (
     enumerate_policies,
     policy_posterior,
 )
+from hybrid_aif.planning.tree import _repeat_nodes
 
 #: The default number of sweeps.
 DEFAULT_SWEEPS = 3
@@ -140,67 +143,75 @@ def _first_logits(q: Categorical, grid: Array, n: int) -> Array:
 
 
 def _score_node(
-    levels: Array,
+    n: int,
+    horizon: int,
     others: tuple[Array | None, ...],
     k: int,
     args: tuple,
     metrics: bool,
 ) -> TermTree | Interval:
-    """Score node ``k``'s sequences ``levels`` (int32 ``(P, H)``) with every other node ``j``
-    entered as its step marginals ``others[j]`` (``(H, n_j)``; ``None`` at ``k``).
+    """Score node ``k``'s ``n ** horizon`` sequences, in the order of
+    ``enumerate_policies((n,), horizon)``, with every other node ``j`` entered as its step
+    marginals ``others[j]`` (``(H, n_j)``; ``None`` at ``k``).
 
-    The flat scan of :func:`~hybrid_aif.planning.enumerate.evaluate_policies` (``metrics``: the
-    stacked step trees summed, the terminal tree merged) or of
-    :func:`~hybrid_aif.planning.enumerate.evaluate_policies_total` (G folded in the carry), with
-    one difference: the marginals are closed over rather than broadcast to ``(P, H, n_j)`` and
-    vmapped, so they stay unbatched under the vmap over the sequences and every reader of node
-    ``j`` contracts its table against them once per step, not once per sequence.
+    The prefix tree of :func:`~hybrid_aif.planning.tree.expand_level`, per node: at step ``t``
+    the level's node beliefs (leading axis ``n^t``) are pushed through each of node ``k``'s
+    ``n`` levels, the inner vmap over the levels and the outer over the tree's nodes, children of
+    ``i`` at ``i·n + a``. The action is a ``ControlStep`` holding node ``k``'s level (batched by
+    the inner vmap alone) and every other node's step-``t`` marginal (closed over: unbatched by
+    both), so a reader's gather of node ``k``'s table by level is computed once per level, and its
+    contraction against another node's marginal once per step, both shared by every node of the
+    tree. ``metrics``: the per-level step trees carried down to the leaves and summed, the
+    terminal tree merged at the leaves (as :func:`~hybrid_aif.planning.tree.evaluate_policy_tree`);
+    otherwise G accumulated per level (as
+    :func:`~hybrid_aif.planning.tree.evaluate_policy_tree_total`).
     """
     init_qs, transition_fn, step_terms, terminal_terms = args
-    horizon = levels.shape[1]
-    ts = jnp.arange(horizon, dtype=jnp.int32)
+    own = jnp.arange(n, dtype=jnp.int32)
 
-    def action_at(level_t: Array, margs_t: tuple[Array | None, ...]) -> ControlStep:
-        return ControlStep(entries=tuple(level_t if j == k else m for j, m in enumerate(margs_t)))
+    def action_at(level: Array, t: int) -> ControlStep:
+        return ControlStep(entries=tuple(level if j == k else m[t] for j, m in enumerate(others)))
 
+    def expand(qs_nodes, t: int):
+        width = jtu.tree_leaves(qs_nodes)[0].shape[0]
+        step = jnp.int32(t)
+
+        def one(qs, level):
+            action = action_at(level, t)
+            qs_next = transition_fn(qs, action)
+            return qs_next, step_terms(qs_next, action, step)
+
+        over_levels = jax.vmap(one, in_axes=(None, 0))
+        children, trees = jax.vmap(over_levels, in_axes=(0, None))(qs_nodes, own)
+
+        def flatten(x: Array) -> Array:
+            return x.reshape((width * n,) + x.shape[2:])
+
+        return jtu.tree_map(flatten, children), jtu.tree_map(flatten, trees)
+
+    qs = jtu.tree_map(lambda x: x[None], init_qs)
     if metrics:
-
-        def eval_one(policy: Array) -> TermTree:
-            def body(qs, xs):
-                level_t, t, margs_t = xs
-                action = action_at(level_t, margs_t)
-                qs_next = transition_fn(qs, action)
-                return qs_next, step_terms(qs_next, action, t)
-
-            qs_final, stacked = jax.lax.scan(body, init_qs, (policy, ts, others))
-            tree = jtu.tree_map(lambda x: jnp.sum(x, axis=0), stacked)
-            if terminal_terms is not None:
-                tree = _merge_trees(tree, terminal_terms(qs_final))
-            return tree
-
-        return jax.vmap(eval_one)(levels)
+        out: TermTree = {}
+        for t in range(horizon):
+            qs, tree = expand(qs, t)
+            out = _merge_trees(_repeat_nodes(out, n), tree)
+        if terminal_terms is not None:
+            out = _merge_trees(out, jax.vmap(terminal_terms)(qs))
+        return out
 
     example = ControlStep(
-        entries=tuple(levels if j == k else m[None] for j, m in enumerate(others))
+        entries=tuple(own[None, :1] if j == k else m[None] for j, m in enumerate(others))
     )
     warrant, approximate = _step_warrant(init_qs, transition_fn, step_terms, example)
-
-    def eval_total(policy: Array) -> Interval:
-        def body(carry, xs):
-            qs, g = carry
-            level_t, t, margs_t = xs
-            action = action_at(level_t, margs_t)
-            qs_next = transition_fn(qs, action)
-            tree = step_terms(qs_next, action, t)
-            return (qs_next, (g + total(tree)) if tree else g), None
-
-        init = (init_qs, Interval(jnp.zeros(()), jnp.zeros(()), warrant, approximate))
-        (qs_final, g), _ = jax.lax.scan(body, init, (policy, ts, others))
-        if terminal_terms is not None:
-            g = g + total(terminal_terms(qs_final))
-        return g
-
-    return jax.vmap(eval_total)(levels)
+    g = Interval(jnp.zeros((1,)), jnp.zeros((1,)), warrant, approximate)
+    for t in range(horizon):
+        qs, tree = expand(qs, t)
+        g = _repeat_nodes(g, n)
+        if tree:
+            g = g + total(tree)
+    if terminal_terms is not None:
+        g = g + total(jax.vmap(terminal_terms)(qs))
+    return g
 
 
 def factorised_plan(
@@ -230,7 +241,7 @@ def factorised_plan(
 
     def score(k: int) -> TermTree | Interval:
         others = tuple(None if j == k else marginals[j] for j in range(len(levels)))
-        return _score_node(grids[k], others, k, args, metrics)
+        return _score_node(levels[k], horizon, others, k, args, metrics)
 
     for sweep in range(sweeps):
         last = sweep == sweeps - 1

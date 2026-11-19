@@ -25,7 +25,6 @@ from hybrid_aif.planning import (
     FactorisedPolicies,
     action_marginals,
     enumerate_policies,
-    evaluate_policies,
     factorised_planner,
     get_planner,
     make_factorised_planner,
@@ -33,6 +32,7 @@ from hybrid_aif.planning import (
     policy_posterior,
 )
 from hybrid_aif.planning.enumerate import sample_action
+from hybrid_aif.planning.tree import evaluate_policy_tree
 from hybrid_aif.reference.envs.tmaze import tmaze
 from hybrid_aif.system import System, SystemParams
 from tests.test_mixed_planner import toy
@@ -201,13 +201,15 @@ def survey():
 
 
 def test_one_node_is_the_enumeration_planner(survey):
-    """The one-rover scheduler, horizon 4, ``N_OPTIONS ** 4`` sequences (625 at five options,
-    2,401 at seven). Against the flat scan of the same grid (the score the factorised planner
-    uses) the posterior is the same to 1e-6. The enumeration planner scores its grid as a prefix
-    tree, whose novelty leaf (``transition:map``, about 44 nats summed over 256 cells) differs
-    from the flat scan's by float reassociation, 2.4e-4 nats at most (5e-6 relative); at the
-    scheduler's ``gamma`` of 16 that is 2.3e-4 in ``q_pi`` at five options and 2.0e-4 at seven
-    (measured 2026-11-18), pinned at 1e-3."""
+    """The one-rover scheduler, horizon 4, ``N_OPTIONS ** 4`` sequences (2,401 at seven options).
+    The factorised planner scores a node's sequences as the enumeration planner scores its grid,
+    by the prefix tree (:func:`~hybrid_aif.planning.tree.evaluate_policy_tree`) with the same
+    nesting and child order, so with one node the two are the same computation: the node's G and
+    posterior equal the tree's bit for bit, and ``q_pi`` differs from the enumeration planner's
+    action marginal by 6.0e-8 (the marginal summed by ``action_marginals`` against the
+    factorised planner's logsumexp; measured 2026-11-18), pinned at 1e-6. (Under the flat scan of
+    the first build the novelty leaf, ``transition:map``, reassociated by 2.4e-4 nats and the
+    gap was 2.0e-4; the flat scan is no longer this planner's score, so it is not compared.)"""
     ss, sm = survey
     grid, centres = sm.field_grid()
     system, params = ss.scheduler(grid, centres, durations=True, readings=True)
@@ -219,18 +221,25 @@ def test_one_node_is_the_enumeration_planner(survey):
     qf, _, fp = _plan(system, params, beliefs, make_factorised_planner())
     want = action_marginals(q, joint, (n,))[0].probs
     assert qf.probs.shape == (n,)
-    np.testing.assert_allclose(qf.probs, want, atol=1e-3)
+    gap = float(jnp.abs(qf.probs - want).max())
+    print(f"q_pi gap to the enumeration planner {gap:.3g}")
+    np.testing.assert_allclose(qf.probs, want, atol=TOL)
     assert int(jnp.argmax(qf.probs)) == int(jnp.argmax(want))
-    #  against the flat scan of the same grid: the same posterior, to float tolerance
+    #  against the prefix tree of the same grid: the same G and posterior
     ctx = system.planner_context(params, beliefs)
-    flat = total(
-        evaluate_policies(
-            joint, ctx.init_beliefs, ctx.transition_fn, ctx.step_terms_fn, ctx.terminal_terms_fn
-        )
+    scored, order = evaluate_policy_tree(
+        ctx.num_controls,
+        (True,),
+        system.policy_len,
+        ctx.init_beliefs,
+        ctx.transition_fn,
+        ctx.step_terms_fn,
+        ctx.terminal_terms_fn,
     )
-    q_flat = policy_posterior(flat, system.gamma)
-    np.testing.assert_allclose(fp.posteriors[0].probs, q_flat.probs, atol=TOL)
-    np.testing.assert_allclose(qf.probs, action_marginals(q_flat, joint, (n,))[0].probs, atol=TOL)
+    np.testing.assert_array_equal(order[:, :, 0], fp.grids[0])
+    np.testing.assert_allclose(total(fp.trees[0]).midpoint, total(scored).midpoint, atol=TOL)
+    q_tree = policy_posterior(total(scored), system.gamma)
+    np.testing.assert_allclose(fp.posteriors[0].probs, q_tree.probs, atol=TOL)
     assert float(fp.movement) == 0.0  # one node: the second sweep scores what the first did
 
 
@@ -319,14 +328,19 @@ def _intermediate_sizes(jaxpr, out):
 
 
 def test_the_other_nodes_marginals_are_read_once_per_step_not_once_per_sequence(survey):
-    """The cost pin. Node ``k``'s sequences are scored with the other nodes' marginals closed
-    over, not vmapped, so every reader of another node contracts its table against the marginal
-    once per step. Broadcast to ``(P, H, n_j)`` and vmapped (the first build), the two-rover
-    scheduler at horizon 3 and seven options materialised the rover transition table's
-    contraction per sequence, ``(343, 256, 256, 8, 7)``, and one decision of three sweeps took
-    30.8 s against the enumeration planner's 0.03 s; scored once per step it takes 0.46 s
-    (measured 2026-11-18). Pinned on the jaxpr of one sweep: no intermediate carrying the
-    sequence axis is as large as ``P`` copies of the largest unbatched one (the table)."""
+    """The cost pin. Node ``k``'s sequences are scored as a prefix tree, the inner vmap over the
+    node's ``n`` levels and the outer over the tree's nodes, with the other nodes' marginals closed
+    over: a reader gathers node ``k``'s table by level once per level (``(n, 256, 256, 8)``) and
+    contracts another node's table against its marginal once per step, both shared by every node
+    of the tree. The first build vmapped the marginals and contracted the rover transition per
+    sequence, ``(343, 256, 256, 8, 7)``: 30.8 s a decision (two rovers, horizon 3, seven
+    options, three sweeps) against the enumeration planner's 0.03 s. The second closed them over
+    but scored a flat scan vmapped over the sequences, which gathered the node's own table per
+    sequence, ``(343, 256, 256, 8)`` (180M floats; 33 GB at 15,625 sequences): 0.46 s. The tree:
+    0.01 s (measured 2026-11-18). Pinned on the jaxpr of one sweep: the largest intermediate
+    batched over the sequences or over the deepest level's nodes is smaller than ``n`` copies of
+    the largest unbatched one (measured 263,424 against 7 × 3,670,016; the flat scan's
+    179,830,784), and none carries a table of ``cells²`` entries per sequence or node."""
     ss, sm = survey
     grid, centres = sm.field_grid()
     system, params = ss.scheduler(
@@ -339,15 +353,20 @@ def test_the_other_nodes_marginals_are_read_once_per_step_not_once_per_sequence(
         plan_learning=("parameter:field",),
     )
     beliefs = dict(params.initial_state_prior)
-    count = sm.N_OPTIONS**ss.JOINT_HORIZON
+    n = sm.N_OPTIONS
+    count = n**ss.JOINT_HORIZON
+    cells = int(centres.shape[0])
     closed = jax.make_jaxpr(
         lambda p, b: system.infer_policies(p, b, planner=make_factorised_planner(sweeps=1))
     )(params, beliefs)
     shapes = _intermediate_sizes(closed.jaxpr, [])
-    batched = max(int(np.prod(s)) for s in shapes if len(s) > 1 and s[0] == count)
-    unbatched = max(int(np.prod(s)) for s in shapes if not s or s[0] != count)
+    lead = (count, count // n)  # the sequences, the deepest level's nodes
+    per_node = [s for s in shapes if len(s) > 1 and s[0] in lead]
+    batched = max(int(np.prod(s)) for s in per_node)
+    unbatched = max(int(np.prod(s)) for s in shapes if not s or s[0] not in lead)
     print(f"largest per-sequence intermediate {batched:,}, largest unbatched {unbatched:,}")
-    assert batched < count * unbatched
+    assert batched < n * unbatched
+    assert not [s for s in per_node if int(np.prod(s[1:])) >= cells * cells]
 
 
 # --------------------------------------------------------------------------- 5. the refusals

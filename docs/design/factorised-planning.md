@@ -76,10 +76,12 @@ policy module acts through the `"habit"` planner, as for enumeration.
 
 **F5. Discrete nodes only, exhaustive per node.** A continuous or mixed control space is refused
 as the enumeration planner refuses it (`refuse_mixed`, the same sentences). Each node's sequences
-are scored by `evaluate_policies` / `evaluate_policies_total` over a `ControlStep` policy set
-(`(n_k^H, H)` levels for node `k`, `(n_k^H, H, n_j)` broadcast marginals for every other node),
-the flat scan, since the sets are small; the prefix tree is not used. A node with one level
-contributes a constant marginal and is never swept.
+are scored as a prefix tree with the enumeration planner's nesting (`tree.expand_level`): at each
+step the level's node beliefs are pushed through the node's own levels, the inner vmap over
+the levels and the outer over the tree's nodes, the other nodes' step marginals closed over, so
+a sliced table is read once per level and shared by every node (amended 2026-11-18, "As
+built": the flat scan built first gathered the node's own table once per sequence). A node
+with one level contributes a constant marginal and is never swept.
 
 **F6. Legality.** A first-step `legal=` mask on the joint grid is applied by the face after the
 planner returns, as now, on `first`. A per-depth mask is not read (`legal_depth=False`); a node
@@ -160,8 +162,7 @@ cells and the pin (below) looks for it.
 
 ## Out of scope, named
 
-A warm start from the previous round (F7); damping (F8); a per-depth legal mask (F6); the
-prefix tree per node (F5, unneeded at these sizes); structured mean field over subsets of nodes
+A warm start from the previous round (F7); damping (F8); a per-depth legal mask (F6); structured mean field over subsets of nodes
 (a pair of nodes planned jointly against the rest), the natural extension when two nodes are
 tightly coupled; the exact expectation of a nonlinear leaf under the other nodes' posteriors
 (F2), which would cost the product again and is what the pin in item 3 bounds.
@@ -196,6 +197,26 @@ two-rover scheduler declaring `"factorised"`, pin 6) is the next commit's.
   vmap (policy-independent-leaves.md H2): 0.46 s for three sweeps, 0.17 s for one, the
   posteriors bit-identical, pinned on the jaxpr (no per-sequence intermediate as large as `P`
   copies of the table).
+- *Each node is scored by the prefix tree* (F5's named extension, built the same day): the flat
+  scan vmapped over the sequences gathered the node's own table at each sequence's level, so the
+  survey's visit table was materialised per sequence (`(343, 256, 256, 8)` at seven options; 33
+  GB at the 21-site charger's 25 options, 15,625 sequences, which paged). `_score_node` now
+  expands a per-node tree with `expand_level`'s nesting: at step t the level's node beliefs are
+  pushed through each of the node's n levels, the inner vmap over the levels (a `ControlStep`
+  holding the level) and the outer over the nodes, every other node's step-t marginal closed
+  over (unbatched by both), children at `i·n + a` so the leaves are in
+  `enumerate_policies((n,), H)` order; metrics by per-level step trees carried down
+  (`_repeat_nodes`), the total form by G accumulated per level. One two-rover decision (horizon
+  3, three sweeps): **0.01 s** at seven options (was 0.46 s; enumeration 0.03 s), **0.04 s** at
+  the charger's 25 options (compile 0.9 s, peak resident 1.18 GB for the whole process, one sweep
+  1.11 GB; it had stalled at 36 GB). With one node the planner is now the enumeration planner's
+  computation: G and posterior equal `evaluate_policy_tree`'s bit for bit and `q_pi` is within
+  6.0e-8 of its action marginal, so pin 2 is tightened from 1e-3 to 1e-6 and compares with the
+  tree instead of the flat scan (which now differs by 1.9e-5 in the posterior, reassociation).
+  The jaxpr pin: the largest intermediate batched over the sequences or the deepest nodes is
+  263,424 floats against 7 × 3,670,016 (the flat scan's was 179,830,784), and none holds
+  `cells²` entries per sequence; it fails on the flat scan. The coupled pins move within their
+  bounds (seven options: 6.1e-10 at γ = 16, 4.1e-4 at γ = 1; movement 0.377, 4.9e-4, 6.4e-7).
 
 **The pins, measured.**
 
