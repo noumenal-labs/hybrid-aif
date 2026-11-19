@@ -252,3 +252,226 @@ one-level case bitwise unchanged.
 **Next.** `run` grouping copies driven by different option nodes, which landed 2026-11-18 as
 "R12 amended"; a collision servo. Nested rounds were under review and are shelved
 (`nested-rounds.md`, 2026-11-18).
+
+## The charger, rethought (2026-11-18)
+
+**Diagnosis**, on the five-seed runs of the table above. In the two-tier two-rover arm 79 charge
+options over five seeds and two rovers; 73 started more than 2.0 from the charging place and
+gained -0.02 of a level (the whole 24-tick option was the drive there, at 0.15 a tick), the six
+that started near it gained +1.0. Each rover spent 24 percent of its ticks under charge, mostly
+driving; end levels 1.3 to 2.9 of 4. The scheduler's energy transition was
+`energy[next, band, option]`, with no dependence on where the option starts, learned at rate 1
+from its band beliefs: it learned a charge as +0.06 of a level, the average of fruitless drives
+and real charges, and could not price a far survey's travel either. Hence the loop "one far
+survey, drive home, charge, repeat". The rovers without a scheduler never went to the charging
+place (5 to 10 percent of their ticks within 1.0 of it): they parked about half their ticks in
+cells of yield 0.3 to 0.4 (+0.015 of a level a tick) and ended at 3.4 to 3.95. In the world,
+parked, `net_rate` is +0.005 a tick at the median yield (0.22), +0.039 at 0.7 and +0.057 at the
+charging place (0.96); cruising at the median yield, -0.017. The sectors' yields (mean/max): 0.41/0.96
+(sector 1, the charging place's), 0.18/0.29, 0.24/0.64, 0.26/0.77.
+
+**Two designs.** A, the soft charge: under charge the rover's target leaves the position free
+and holds the speed at rest (A': a looser rest, speed sd 0.5, so that it may creep to light within
+its plan); the scheduler's visit table under charge is the identity (the rover stays on its cell)
+and its charge readings one (the rover stands on one cell, as "The pooled reading" above has it);
+the energy prior prices a charge parked at the field's median yield, a yield the scheduler states
+since it does not know where the rover will stop. The bet: the image preference on
+`(energy, option)` and the energy preference over the gauge draw a stopped rover to the light near
+it, as they do for the rover alone. B, the energy table's cell dependence: the energy transition
+reads `(energy, visit, option)`, the parameter variable `energy_table` is `[next, band, cell,
+option]` (8 by 8 by 256 by 5), its prior per band, cell and option from the geometry: a survey
+drives its travel to the sector's nearest cell at the cruising speed (0.17) and the rest of the
+option at the measured survey speed (0.13, the mean true speed of the ticks a survey spent inside
+its sector), both at the median yield, so a far survey drains up to 0.05 of a level more than one
+from inside; a charge (in the form it is given) drives its trip to the charging place at 0.15 and
+parks the rest on the charging place's yield, so a charge from a cell more than an option's trip
+away is priced at -0.37 and one from the charging place's cell at +1.37. Learned at rate 1 as
+before, the counts landing on the visited cells' rows: within a mission they barely move a row,
+and the table's value is the travel cost its prior declares. The page reads the table per band and
+option: the decision records hold it at the believed cell (the two rovers' visit beliefs averaged
+in the joint record), the run's end the cell-marginal, and the counts summed over the cells.
+
+**Measured**, seed 0, 800 ticks, unbatched, the two rovers grouped (coverage at 200/400/600/800;
+per rover: share of ticks under charge, level gained per charge option, yield of the cell it
+charged on, share of ticks within 1.0 of the charging place, min band, end level, stall ticks):
+
+| Variant | Coverage | Under charge | Gain/option | Yield | Near site | Min band | End level | Stalls |
+|---|---|---|---|---|---|---|---|---|
+| Before (charge to the site) | 0.500/0.699/0.836/0.898 | 0.24, 0.24 | -0.12, +0.36 | 0.77, 0.79 | 0.27, 0.23 | 1, 0 | 1.50, 1.46 | 0, 21 |
+| A (soft charge, parked) | 0.531/0.645/0.641/0.645 | 0.67, 0.42 | +0.03, -0.05 | 0.19, 0.09 | 0.05, 0.03 | 1, 0 | 1.43, 0.12 | 0, 446 |
+| A' (soft charge, rest sd 0.5) | 0.535/0.664/0.656/0.656 | 0.55, 0.64 | -0.05, +0.02 | 0.14, 0.20 | 0.05, 0.03 | 0, 0 | 0.09, 0.67 | 179, 16 |
+| A + B | 0.531/0.645/0.641/0.715 | 0.55, 0.36 | +0.02, -0.06 | 0.18, 0.09 | 0.05, 0.03 | 0, 0 | 0.40, 0.12 | 26, 446 |
+| A' + B | 0.535/0.664/0.738/0.801 | 0.55, 0.52 | -0.04, +0.06 | 0.15, 0.31 | 0.05, 0.07 | 0, 0 | 0.17, 0.17 | 177, 108 |
+| A' + B, charge priced at the best yield within a cell (0.38) | 0.535/0.766/0.809/0.793 | 0.34, 0.45 | -0.04, +0.19 | 0.22, 0.32 | 0.05, 0.05 | 0, 0 | 0.20, 1.81 | 420, 16 |
+| Site charge + B, charge prior parked on the site's yield from every cell | 0.500/0.695/0.812/0.844 | 0.30, 0.30 | +0.16, +0.26 | 0.80, 0.85 | 0.32, 0.31 | 1, 2 | 1.59, 1.85 | 0, 0 |
+| **Site charge + B, the trip priced (kept)** | 0.551/0.715/0.836/0.875 | 0.27, 0.27 | +0.59, +0.50 | 0.90, 0.86 | 0.35, 0.31 | 1, 2 | 1.91, 1.89 | 0, 0 |
+
+**The soft charge lost.** A stopped rover stays where the option found it: it charged on cells of
+yield 0.1 to 0.3, gained nothing an option, and every soft variant stalled one rover or both for
+hundreds of ticks; neither the image preference nor the energy preference moved it to light within
+its 12-tick plan, at rest or creeping. The rover alone finds light because nothing holds it still
+and its plans keep it moving through the field; a held "stop here" removes exactly that. The
+diagnosis's arithmetic (parking in a sector's light earns more than the trip) holds only where the
+rover parks in the light, which the soft option does not bring about. A second prior for the
+blind charge (the mean over cells of the best yield within one cell, 0.38) changed the timing,
+not the outcome. The soft form is not kept as a keyword (its visit table, readings and prior
+differ from the site form's in four places); its numbers are recorded here.
+
+**Kept: the site charge with B**, the one variant without a stall, best at 800 among those. B
+with the trip priced is what the diagnosis asked for: the scheduler now sees that a charge from
+afar is the drive, so it charges from nearby. The charge options starting more than 2.0 from the
+charging place fall from 92 to 51 percent, and the mean gain of a charge option rises from +0.06
+to +0.44 of a level (five seeds, two rovers: 79 options either way; the far ones still gain -0.02,
+the near ones +0.91). With the charge priced flat at the site's yield (the first B) the scheduler
+still drove to the site from afar.
+
+**Five seeds** by `--replicas 5`, 800 ticks, the rovers grouped (the default program; the
+two-tier two-rover row above was measured with the rovers stepped one by one, so the change of
+that row is the charger and the grouping together; the one-rover row is the charger alone):
+
+| Arm | 200 | 400 | 600 | 800 |
+|-----|-----|-----|-----|-----|
+| Two rovers, one scheduler (two-tier), before (sequential) | 0.543±0.026 | 0.735±0.026 | 0.791±0.030 | 0.818±0.030 |
+| Two rovers, one scheduler (two-tier), now (grouped) | 0.577±0.031 | 0.780±0.046 | 0.839±0.047 | 0.859±0.054 |
+| Two rovers, no scheduler (unchanged) | 0.457±0.013 | 0.703±0.043 | 0.835±0.050 | 0.866±0.058 |
+| Union of two independent rovers (unchanged) | 0.377±0.031 | 0.603±0.028 | 0.738±0.026 | 0.805±0.050 |
+| One rover, scheduler, before | 0.341 | 0.478 | 0.588 | 0.657±0.019 |
+| One rover, scheduler, now | 0.338±0.033 | 0.468±0.030 | 0.618±0.021 | 0.706±0.025 |
+
+Under charge 24 percent of the two rovers' ticks and 29 percent of the one rover's; end levels
+1.19 to 3.12 (two rovers) and 1.29 to 2.06 (one); one stall in ten rovers (38 ticks, seed 1,
+rover 2), none for the one rover (11 stall ticks before). The scheduler now leads every arm to
+tick 600 and ends level with the shared map without it (0.859 against 0.866, within a seed's
+spread). Wall: 855 s and 68 GB peak for the five two-rover replicas, 714 s and 33 GB for the one.
+
+**Still open.** Whether grouping alone moves the two-tier row (the "before" charger was not
+re-run grouped over five seeds; on seed 0 grouped it reached 0.898 at 800 with a 21-tick stall,
+the kept form 0.875 without); a charge that finds light near the rover would want a target over
+the light itself (a yield map the rover reads), not only a rest; the survey speed is a measured
+constant of the old charger's runs.
+
+**Superseded in part, the same day: one charge option per sunny region** (below). What stays
+true of the kept design: the energy table's cell axis and its geometric prior, the trip priced,
+the site charge's target at rest. What changes: one charging place becomes one per sunny region,
+and the two-rover scheduler plans with the factorised planner.
+
+### One charge option per sunny region
+
+**The rule.** A grid cell is sufficiently sunny when its mean solar yield (`cell_yields`) is at
+least `SUNNY_YIELD` = 0.5; a sunny region is a 4-connected patch of such cells of at least
+`MIN_REGION_CELLS` = 4 (`sunny_regions`); each region's charging place is its sunniest cell
+(`charge_site_cells`, `charge_sites`), in order of that yield, so site 1 is the old
+`charge_site()`. One charge option per site after the four surveys: `N_CHARGE` = 3, `N_OPTIONS`
+= 7, the charge levels `CHARGE_LEVELS` (`is_charge`). Each charge option's target is its own
+site at rest; its visit column is the path to its site then the site; its energy prior is its
+own trip at the charge speed, then parked on its own site's yield (`charge_travel` is
+`(cells, N_CHARGE)`). This is the declared-model form of the showcase's "charge on the nearest
+sunny ground" (48a8a63), which patched the target from Python each tick.
+
+**The regions found** on the 16 by 16 field:
+
+| Site | Cell | Position | Yield | Region cells | Where |
+|---|---|---|---|---|---|
+| 1 | 86 | (1.06, 0.44) | 0.96 | 20 | the old charging place's cluster, sector 1 |
+| 2 | 1 | (-0.81, -1.44) | 0.84 | 5 | bottom-left patch |
+| 3 | 189 | (3.31, 3.06) | 0.77 | 17 | top-right cluster, sector 4 |
+
+**The planner.** At seven options the two-rover scheduler's joint enumeration is 7^6 = 117,649
+sequences (15,625 at five): a seed-0 run held 19 GB resident (5.2 GB at five options) and two
+replicas 52 to 58 GB, so five replicas no longer fit a 128 GB host. The two-rover scheduler now
+declares the factorised planner (`factorised-planning.md`): one posterior per rover over its own
+7^3 = 343 sequences, three Gauss–Seidel sweeps, 3 · 2 · 343 = 2,058 sequence evaluations a round.
+The one-rover scheduler keeps the enumeration planner (one node: the two agree). Measured, seed 0,
+800 ticks, unbatched, two rovers grouped:
+
+| Planner (seven options) | Coverage 200/400/600/800 | s/tick (compiled rounds) | Peak resident |
+|---|---|---|---|
+| Enumeration, 117,649 joint sequences | 0.559/0.750/0.848/0.887 | 0.29 (0.22) | 19.1 GB |
+| Factorised, 2 · 343 sequences, 3 sweeps | 0.559/0.750/0.848/0.887 | 0.33 (0.24) | 3.3 GB |
+
+Memory is below the five-option figure (5.2 GB) and time is within a seventh of the enumeration's.
+The seed-0 runs are decision for decision the same (34 decisions; the scheduler's posteriors are
+near one-hot at γ = 16). The first measurement of the factorised run (1.63 s/tick) was a batching
+bug in the planner, the other nodes' marginals read once per sequence rather than once per step,
+fixed in 8a63c8f (`factorised-planning.md`, "As built").
+
+**Five seeds** by `--replicas 5`, 800 ticks, the rovers grouped; the two-rover replicas now fit
+one batch (47.9 GB peak resident, 2,445 s wall before the planner fix; the enumeration
+planner's five ran as batches of 2, 2 and 1, 52 to 58 GB each for two). Kept design: the single
+charging place, enumeration.
+
+| Arm | 200 | 400 | 600 | 800 |
+|-----|-----|-----|-----|-----|
+| Two rovers, kept design | 0.577±0.031 | 0.780±0.046 | 0.839±0.047 | 0.859±0.054 |
+| Two rovers, per region, enumeration | 0.576±0.032 | 0.776±0.037 | 0.839±0.026 | 0.863±0.016 |
+| Two rovers, per region, factorised (now) | 0.579±0.034 | 0.764±0.048 | 0.832±0.033 | 0.863±0.008 |
+| One rover, kept design | 0.338±0.033 | 0.468±0.030 | 0.618±0.021 | 0.706±0.025 |
+| One rover, per region (now) | 0.317±0.030 | 0.464±0.073 | 0.614±0.048 | 0.713±0.030 |
+
+The charge behaviour over the five seeds (all charge options; "far": starting more than 2.0
+from the chosen site):
+
+| Arm | Charges | Far share | Gain all / far / near | Yield charged on | Under charge | End level | Stall ticks | Site 1 / 2 / 3 |
+|---|---|---|---|---|---|---|---|---|
+| Two rovers, kept | 79 | 0.51 | +0.44 / -0.02 / +0.91 | 0.86 | 0.24 | 2.11 (1.19-3.12) | 38 | 79 / - / - |
+| Two rovers, per region, enumeration | 97 | 0.58 | +0.33 / -0.11 / +0.93 | 0.74 | 0.30 | 1.89 (0.95-2.50) | 0 | 47 / 2 / 48 |
+| Two rovers, per region, factorised | 95 | 0.56 | +0.34 / -0.08 / +0.87 | 0.75 | 0.29 | 1.70 (0.95-2.38) | 30 | 43 / 4 / 48 |
+| One rover, kept | 47 | 0.53 | +0.48 / -0.02 / +1.05 | 0.87 | 0.29 | 1.79 (1.29-2.06) | 0 | 47 / - / - |
+| One rover, per region | 54 | 0.52 | +0.36 / -0.02 / +0.77 | 0.79 | 0.33 | 1.73 (1.05-2.63) | 0 | 30 / 5 / 19 |
+
+**Read, honestly.** Coverage is a tie: every row is within a seed's spread of the kept design's at
+every mark, the per-region design neither better nor worse at 800 (0.863 against 0.859 for two
+rovers, 0.713 against 0.706 for one). What it changes is where the rovers charge: site 3, in
+sector 4, takes half the two-rover charges (mostly from sectors 3 and 4), so a rover in the far
+half of the field no longer drives to sector 1 to charge; site 2, a five-cell patch, is seldom
+chosen. The far share of charges did not fall (0.51 to 0.58) and the gain per charge fell (+0.44
+to +0.33), since site 3 yields 0.77 against site 1's 0.96. The two planners agree on seeds 1 and
+2 decision for decision and part at near-ties on 0, 3 and 4 (rover 2's split 0.48/0.52 between
+sectors 2 and 3 in the enumeration planner is 0/1 in the factorised one; the last sweep's movement
+there 0.03, three sweeps not quite settled); the factorised five lose the per-region
+enumeration's zero stalls (18 ticks, seed 0 rover 2; 12 ticks, seed 3 rover 1), about the kept
+design's 38. Both stalls have one shape: a survey chosen at band 2 (level 1.07 and 1.19, the charge
+0.37 and 2.4 nats behind it) drained the rover to band 1 on the far side of the field, and the
+charge that followed, 2.9 and 2.8 from its site, stalled en route (13 and 11 ticks) and on arrival
+before it took, where the enumeration's rover on the same seed had charged earlier (seed 0) or
+entered the same survey-then-charge pair at band 3 (seed 3, level 1.78). The factorised five's
+seed sd at 800 (0.008) is the smallest of the three, on five seeds.
+
+**Density of sites, measured in scratch (the tree's rule unchanged).** The scratch rule replaces
+`charge_site_cells` by greedy suppression: of the sunny cells (yield >= 0.5) in order of yield, a
+cell is a site when no site already taken lies within `SITE_RADIUS` cells (Euclidean, cell units).
+Radius 2 gives 7 sites (11 options): the three regions' sites plus cells 55 (0.73) and 119 (0.62)
+and 100 (0.51) in region 1 and cell 143 (0.65) in region 3. Radius 1 gives 21 sites (25 options,
+15,625 sequences a rover a sweep), runnable once the factorised planner scored each node as a
+prefix tree (8a63c8f's successor commit; under the flat per-node scan the run made no progress in
+1 h 45 at 36 GB). Two rovers, five seeds by `--replicas 5`, 800 ticks, factorised planner:
+
+| Sites | Coverage 200 | 400 | 600 | 800 | Stall ticks | Charges | Far share | Gain all / far / near | Yield charged on | Under charge | Sites used (chosen) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Regions, 3 | 0.579±0.034 | 0.764±0.048 | 0.832±0.033 | 0.863±0.008 | 30 | 95 | 0.56 | +0.34 / -0.08 / +0.87 | 0.75 | 0.29 | 1: 43, 2: 4, 3: 48 |
+| Radius 2, 7 | 0.561±0.020 | 0.752±0.046 | 0.819±0.035 | 0.847±0.038 | 0 | 166 | 0.70 | +0.12 / -0.07 / +0.59 | 0.58 | 0.51 | 1: 21, 2: 0, 3: 17, 4: 32, 5: 56, 6: 36, 7: 4 |
+| Radius 1, 21 | 0.551±0.043 | 0.722±0.060 | 0.777±0.068 | 0.811±0.047 | 0 | 195 | 0.82 | +0.06 / -0.03 / +0.45 | 0.53 | 0.59 | 1: 4, 2: 36, 3: 14, 4: 2, 5: 1, 6: 2, 7: 1, 8: 3, 9: 0, 10: 4, 11: 3, 12: 17, 13: 42, 14: 8, 15: 18, 16: 6, 17: 0, 18: 24, 19: 0, 20: 9, 21: 1 |
+
+Seed 0 alone, unbatched: 7 sites 0.41 s/tick (compiled 0.33), 5.1 GB resident, coverage 0.867
+(3 sites: 0.33 (0.24), 3.3 GB, 0.887; 21 sites, prefix-tree planner: 0.29 (0.22), 7.9 GB, 0.805).
+The five-replica batch peaked at 56.9 GB resident, 1,395 s wall (3 sites: 47.9 GB; 21 sites:
+65.9 GB, 936 s wall).
+
+Read: seven sites do not beat three. Coverage is lower at every mark, by less than the seed spread
+(0.847 ± 0.038 against 0.863 ± 0.008 at 800), so it is a tie at best. The extra sites change the
+charging, not the survey: the rovers charge almost twice as often (166 against 95), half their
+ticks under a charge option, more of them from far (0.70), on poorer ground (yield 0.58 against
+0.75), for a third of the gain a charge (+0.12 against +0.34). The stalls go (0 against 30 ticks;
+the end level rises to 2.04 from 1.70), bought with the time spent charging. The new sites 5 and 6
+take more charges than the regions' own; site 2 is never chosen. Over 3 / 7 / 21 sites the trend
+is one way: coverage at 800 falls 0.863 / 0.847 / 0.811, the 21-site loss (0.052) larger than its
+own seed sd (0.047), while charges rise 95 / 166 / 195, the far share 0.56 / 0.70 / 0.82, the time
+under charge 0.29 / 0.51 / 0.59 and the gain a charge falls +0.34 / +0.12 / +0.06 (far charges net
+-0.03), the 21-site rovers favouring the sites on the regions' inner edges (13, 2, 18, 15, 12) over the
+regions' sunniest (1: 4, 5: 1). The tree keeps the regions rule.
+
+**Fixture.** The one-rover declarations are as before and the one-level case of
+`tests/data/survey_run.npz` is bitwise unchanged (all 177 arrays against HEAD's); the two-level
+case is re-recorded with the per-region design: seven options, so 49 recorded sequences a
+decision where there were 25, and a different first option from the start cell (the surveys no
+longer tie: sector 1, from inside it, where a tie picked sector 2 before).

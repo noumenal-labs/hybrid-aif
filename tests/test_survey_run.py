@@ -22,9 +22,10 @@ shade, and driving drains more uphill than downhill or across (descending costs 
 costs), smoothly enough for the planner's gradient; the scheduler learns its energy table, a
 Dirichlet with a weak prior, at each decision, and its terminal target penalises the empty band
 alone; near empty the drive fails (the stall), in the world and in the model's own motion alike, and
-a rover started near empty stalls without losing its position; the charge option sends the rover to
-sunny ground and parks it there; the rover can observe the recogniser's reading instead of the image
-(experiment A).
+a rover started near empty stalls without losing its position; each charge option (one per sunny
+region) sends the rover to its region's sunniest cell and parks it there, and the scheduler's energy
+prior prices the travel of a survey and of a charge from the cell the option starts in; the rover
+can observe the recogniser's reading instead of the image (experiment A).
 """
 
 import dataclasses
@@ -45,7 +46,7 @@ CASES = ("two-level", "one-level")
 TICKS = {"two-level": 5, "one-level": 3}
 GRID = 4  # field cells per axis
 SLOW_TICKS = 2  # rounds an option lasts in the two-tier run: decisions at rounds 0, 2 and 4
-HORIZON = 2  # options the scheduler looks ahead in the two-tier run: 25 sequences, a small pin
+HORIZON = 2  # options the scheduler looks ahead in the two-tier run: 49 sequences, a small pin
 STEPS = 3  # descent steps of the rover's plan
 STARTS = 2  # its warm starts
 CELL = 0.375  # one cell of the showcase's 16 by 16 map grid over the 6 by 6 field
@@ -241,24 +242,99 @@ def test_a_rover_started_near_empty_stalls_without_losing_its_position():
     assert cal["max_error"] < wd.TOP_SPEED  # the belief never walks a tick's drive ahead
 
 
-def test_the_charge_option_goes_to_sunny_ground_and_parks_there():
+def test_the_charge_options_go_to_sunny_ground_and_park_there():
     sm = example("survey_model")
     ss = example("survey_scheduler")
     wd = example("survey_world")
     _, centres = sm.field_grid()
-    site = sm.charge_site()
-    assert float(wd.sun(jnp.asarray(site))) >= np.percentile(wd.SUN, 95)
-    # the rover's target under charge: the charging place, at rest
+    yields = sm.cell_yields()
+    # one charge option per sunny region, after the surveys; each region's site its sunniest cell,
+    # in order of that yield, the first the sunniest cell of the field
+    regions = sm.sunny_regions()
+    assert sm.N_CHARGE == len(regions) >= 2
+    assert sm.N_OPTIONS == sm.N_SURVEY + sm.N_CHARGE
+    assert list(sm.CHARGE_LEVELS) == list(range(sm.CHARGE, sm.N_OPTIONS))
+    assert [sm.is_charge(k) for k in range(sm.N_OPTIONS)] == [False] * sm.N_SURVEY + [
+        True
+    ] * sm.N_CHARGE
+    assert len(ss.OPTION_NAMES) == sm.N_OPTIONS
+    cells = sm.charge_site_cells()
+    for r, c in zip(regions, cells, strict=True):
+        assert len(r) >= sm.MIN_REGION_CELLS and np.all(yields[r] >= sm.SUNNY_YIELD)
+        assert c in r and yields[c] == yields[r].max()
+    assert np.all(np.diff(yields[cells]) < 0)
+    assert int(cells[0]) == int(np.argmax(yields))
+    np.testing.assert_allclose(sm.charge_site(), sm.charge_sites()[0])
+    assert float(wd.sun(jnp.asarray(sm.charge_site()))) >= np.percentile(wd.SUN, 95)
     target = sm.option_position_target()
-    assert np.allclose(np.asarray(target.loc[sm.CHARGE, :2]), site)
-    assert float(target.loc[sm.CHARGE, 4]) == 0.0 and float(target.chol[sm.CHARGE, 4, 4]) < 0.1
-    # the scheduler's, outside the empty band: the readings fall on the way and at the charging
-    # place, which holds the most of them from every cell less than half an option's trip away
-    visit = ss.visit_table(centres)[:, :, 1:, sm.CHARGE]
-    cell = int(np.argmin(np.linalg.norm(centres - site, axis=1)))
-    assert np.allclose(visit.sum(axis=0), 1.0)
-    trip = np.linalg.norm(centres - site, axis=1) / ss.CHARGE_SPEED
-    assert np.all(visit.argmax(axis=0)[trip < ss.SURVEY_TICKS / 2] == cell)
+    visits = ss.visit_table(centres)
+    trip = ss.charge_travel(centres)
+    assert trip.shape == (centres.shape[0], sm.N_CHARGE)
+    for j, (k, site) in enumerate(zip(sm.CHARGE_LEVELS, sm.charge_sites(), strict=True)):
+        # the rover's target under charge option k: its charging place, at rest
+        assert np.allclose(np.asarray(target.loc[k, :2]), site)
+        assert float(target.loc[k, 4]) == 0.0 and float(target.chol[k, 4, 4]) < 0.1
+        # the scheduler's, outside the empty band: the readings fall on the way and at the
+        # charging place, which holds the most of them from every cell less than half an option's
+        # trip away
+        visit = visits[:, :, 1:, k]
+        cell = int(np.argmin(np.linalg.norm(centres - site, axis=1)))
+        assert np.allclose(visit.sum(axis=0), 1.0)
+        assert np.all(visit.argmax(axis=0)[trip[:, j] < ss.SURVEY_TICKS / 2] == cell)
+
+
+def test_the_scheduler_s_energy_prior_prices_the_travel_from_the_cell():
+    sm = example("survey_model")
+    ss = example("survey_scheduler")
+    wd = example("survey_world")
+    _, centres = sm.field_grid()
+    shifts = ss.option_shifts(centres)
+    zones = ss.cell_zones(centres)
+    travel, _ = ss.survey_travel(centres)
+    median = float(np.median(wd.SUN))
+    inside = ss.SURVEY_TICKS * wd.net_rate(ss.SURVEY_SPEED, 0.0, median)
+    cruise = ss.SURVEY_TICKS * wd.net_rate(ss.CRUISE, 0.0, median)
+    for k in range(sm.N_SURVEY):
+        # from inside the sector the whole option at the survey speed, no travel
+        assert np.all(travel[zones == k, k] == 0.0)
+        np.testing.assert_allclose(shifts[zones == k, k], inside, rtol=1e-9)
+        # from outside, the farther the cell the more the option drains, up to an option of travel
+        out = zones != k
+        order = np.argsort(travel[out, k])
+        assert np.all(np.diff(shifts[out, k][order]) <= 1e-12)
+        assert shifts[out, k].min() >= cruise - 1e-9
+    near, far = np.argmin(np.where(zones != 0, travel[:, 0], np.inf)), np.argmax(travel[:, 0])
+    assert shifts[far, 0] < shifts[near, 0] - 0.03  # a far cell's survey shifts more
+    # a charge option: the trip to its charging place, then parked on that place's yield; from
+    # its own cell more than two bands, from afar (an option all trip) a drain, and never more
+    # from farther away
+    trips = ss.charge_travel(centres)
+    site_yields = sm.cell_yields()[sm.charge_site_cells()]
+    drive = ss.SURVEY_TICKS * wd.net_rate(ss.CHARGE_SPEED, 0.0, median)
+    assert drive < 0.0
+    for j, k in enumerate(sm.CHARGE_LEVELS):
+        trip = trips[:, j]
+        site = int(np.argmin(trip))
+        parked = ss.SURVEY_TICKS * wd.net_rate(0.0, 0.0, float(site_yields[j]))
+        assert shifts[site, k] == pytest.approx(parked, rel=0.05)
+        assert parked > 2 * wd.BAND_WIDTH
+        order = np.argsort(trip)
+        assert np.all(np.diff(shifts[order, k]) <= 1e-12)
+        np.testing.assert_allclose(shifts[trip >= ss.SURVEY_TICKS, k], drive)
+    # the sunnier the place, the more a charge parked on it gains
+    on_site = [shifts[int(np.argmin(trips[:, j])), k] for j, k in enumerate(sm.CHARGE_LEVELS)]
+    assert np.all(np.diff(on_site) < 0)
+    # the rows: the shift from the cell as band probabilities; the empty band's rule everywhere
+    prior = ss.energy_prior(centres)
+    n, count, floor = sm.N_BANDS, ss.PRIOR_COUNT, ss.PRIOR_FLOOR
+    for c in (near, far):
+        for k in (0, *sm.CHARGE_LEVELS):
+            for band in range(1, n):
+                want = floor + count * ss.shift_probabilities(shifts[c, k], band)
+                np.testing.assert_allclose(prior[:, band, c, k], want, rtol=1e-9)
+    want = np.full(n, floor)
+    want[:2] += count / 2
+    np.testing.assert_allclose(prior[:, 0], np.broadcast_to(want[:, None, None], prior[:, 0].shape))
 
 
 def test_the_scheduler_s_energy_prior_follows_the_declared_energy_rule_and_its_target_is_terminal():
@@ -270,36 +346,41 @@ def test_the_scheduler_s_energy_prior_follows_the_declared_energy_rule_and_its_t
     system, params = ss.scheduler(grid, centres)
     assert params.transition["energy"] == Parameter("energy_table")
     table = params.parameters["energy_table"]
-    assert isinstance(table, ConditionalDirichlet) and table.parent_ndims == 2
-    assert dict(zip(system.state_names, system.B_deps[:3], strict=True))["energy"] == (1, 3)
+    assert isinstance(table, ConditionalDirichlet) and table.parent_ndims == 3
+    # the energy transition reads the band, the visited cell and the option
+    assert dict(zip(system.state_names, system.B_deps[:3], strict=True))["energy"] == (1, 0, 3)
     conc = np.asarray(table.concentration)
     floor = ss.PRIOR_FLOOR
-    assert conc.shape == (sm.N_BANDS, sm.N_BANDS, sm.N_OPTIONS)
+    cells = GRID * GRID
+    assert conc.shape == (sm.N_BANDS, sm.N_BANDS, cells, sm.N_OPTIONS)
     np.testing.assert_allclose(conc.sum(axis=0), ss.PRIOR_COUNT + sm.N_BANDS * floor, rtol=1e-5)
     n, count = sm.N_BANDS, ss.PRIOR_COUNT
-    # from the empty band, under every option: half the same, half one higher
+    # from the empty band, under every option and from every cell: half the same, half one higher
+    want = np.full(n, floor)
+    want[:2] += count / 2
     for k in range(sm.N_OPTIONS):
-        want = np.full(n, floor)
-        want[:2] += count / 2
-        np.testing.assert_allclose(conc[:, 0, k], want, rtol=1e-5)
-    # elsewhere the declared energy rule over one option: a survey drives at cruise on flat ground
-    # at the median yield, a charge parks on the charging place's yield
-    shifts = ss.option_shifts()
+        np.testing.assert_allclose(conc[:, 0, :, k], np.tile(want[:, None], (1, cells)), rtol=1e-5)
+    # elsewhere the declared energy rule over one option from the cell (``option_shifts``)
+    shifts = ss.option_shifts(centres)
     wd = example("survey_world")
     survey = ss.SURVEY_TICKS * wd.net_rate(ss.CRUISE, 0.0, float(np.median(wd.SUN)))
-    assert np.allclose(shifts[: sm.N_SURVEY], survey) and survey == pytest.approx(-0.397, abs=0.005)
-    assert shifts[sm.CHARGE] > 2 * wd.BAND_WIDTH  # parked in full sun: more than two bands
+    assert survey == pytest.approx(-0.397, abs=0.005)  # an option all travel
     change = ss.expected_change(conc - floor)
-    for k in range(sm.N_OPTIONS):
-        for band in range(1, n):
-            p = ss.shift_probabilities(shifts[k], band)
-            np.testing.assert_allclose(conc[:, band, k], floor + count * p, rtol=1e-5)
-            assert np.count_nonzero(p) <= 2  # two neighbouring moves, the level uniform in a band
-            if 0 <= band + np.sign(shifts[k]) * np.ceil(abs(shifts[k]) / wd.BAND_WIDTH) < n:
-                # unfolded: the expected move is the declared shift in bands
-                assert change[band, k] == pytest.approx(shifts[k] / wd.BAND_WIDTH, abs=1e-4)
+    for c in range(cells):
+        for k in range(sm.N_OPTIONS):
+            for band in range(1, n):
+                p = ss.shift_probabilities(shifts[c, k], band)
+                np.testing.assert_allclose(conc[:, band, c, k], floor + count * p, rtol=1e-5)
+                assert np.count_nonzero(p) <= 2  # two neighbouring moves, the level uniform
+                step = np.sign(shifts[c, k]) * np.ceil(abs(shifts[c, k]) / wd.BAND_WIDTH)
+                if 0 <= band + step < n:
+                    # unfolded: the expected move is the declared shift in bands
+                    want_change = shifts[c, k] / wd.BAND_WIDTH
+                    assert change[band, c, k] == pytest.approx(want_change, abs=1e-4)
     # a survey from 0.5-1 ends in the empty band with probability |shift| / band width
-    assert conc[0, 1, 0] - floor == pytest.approx(count * abs(survey) / wd.BAND_WIDTH, rel=1e-4)
+    assert conc[0, 1, 0, 0] - floor == pytest.approx(
+        count * abs(shifts[0, 0]) / wd.BAND_WIDTH, rel=1e-4
+    )
     # no per-step energy target; a terminal one, the empty band alone lower, by twice the bound
     assert "energy" not in params.state_targets
     terminal = params.terminal_targets["energy"]

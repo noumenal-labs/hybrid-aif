@@ -1,12 +1,15 @@
 """The survey rover's slow tier: a scheduler that picks which sector of the field to survey, or
-to go and charge in the sun, every ``SURVEY_TICKS`` fast ticks.
+which sunny place to go and charge at, every ``SURVEY_TICKS`` fast ticks.
 
 State factors, in declaration order: ``visit`` (the cell the rover is at, one level per cell of the
 rover's grid, row-major over the grid shape, x first), ``energy`` (the
 ``N_BANDS`` bands of half a unit, band 0 the empty band) and ``map`` (the
-terrain at the visited cell, three levels). The control node ``u_option`` has five levels: survey
-sector 1 to 4 (the field's quadrants, in ``survey_world.zone_of`` order) and charge (drive to the
-charging place, ``survey_model.charge_site``, the cell of highest solar yield, and park there). Two
+terrain at the visited cell, three levels). The control node ``u_option`` has ``N_OPTIONS`` levels:
+survey sector 1 to 4 (the field's quadrants, in ``survey_world.zone_of`` order), then one charge
+option per sunny region (``survey_model.sunny_regions``: drive to the region's charging place, its
+cell of highest solar yield, ``survey_model.charge_sites``, and park there; charge at site 1 is the
+cell of highest yield on the field, the others in order of their yield), the levels from
+``CHARGE`` on (``survey_model.is_charge``). Two
 modalities: ``cell_obs`` (the cell the rover's position belief puts it in: in the merged
 composite, a sibling-belief read of the rover's position through the cell indicator, realised by
 ``mode`` and taken at each decision) and ``gauge`` (the band meter's reading of the energy band).
@@ -16,7 +19,7 @@ its novelty term (``transition:map``, the expected information about the field f
 plan visits) is honoured by the rover counting on the fast clock. The ``energy`` state factor reads
 the parameter variable ``energy_table``, a Dirichlet over its transition that the scheduler learns
 from its own band readings, decision to decision (``plan(learn=learn_rates(...))``). The planner
-enumerates the sequences of ``HORIZON`` options.
+(``"enumeration"``) scores every sequence of ``HORIZON`` options.
 
 The tables:
 
@@ -30,19 +33,29 @@ The tables:
   were done no option saw the unread edge cells and the scheduler held both rovers to one sector);
   from a cell outside, the cells along the straight path to the sector's nearest cell for the
   share of the option the travel takes at ``CRUISE`` and the sector's cells for the rest.
-  Under charge: likewise, the path to the charging place for the share of the option the trip
-  takes at ``CHARGE_SPEED`` and the charging place's cell for the rest. A far sector leaves fewer
-  of the option's readings in the sector.
-- ``energy[next, band, option]``: the parameter variable ``energy_table``, one Dirichlet per band
-  and option over the next band (``energy_prior``), ``PRIOR_COUNT`` pseudo-counts per case, derived
-  from the rover's declared energy rule over one option (``option_shifts``): a survey drives the
-  option at ``CRUISE`` on flat ground at the field's median solar yield, a charge parks the option
-  on the charging place's yield (the trip ignored); each level shift becomes band probabilities
-  under a uniform position within a band (``shift_probabilities``). From the empty band, under
-  every option, half on the same band and half on one higher (a stalled rover cannot drive, it can
-  only charge where it stands, at a yield it does not know). Every other entry holds
-  ``PRIOR_FLOOR``. The scheduler's learning counts each decision's band posterior against the band
-  posterior of the decision before, under the option taken then.
+  Under a charge option: likewise, the path to its charging place for the share of the option the
+  trip takes at ``CHARGE_SPEED`` and the charging place's cell for the rest. A far sector leaves
+  fewer of the option's readings in the sector.
+- ``energy[next, band, cell, option]``: the parameter variable ``energy_table``, one Dirichlet
+  per band, cell and option over the next band (``energy_prior``), ``PRIOR_COUNT`` pseudo-counts
+  per case, derived from the rover's declared energy rule over one option from that cell
+  (``option_shifts``): a survey of sector k from a cell outside it drives the travel to the
+  sector's nearest cell at ``CRUISE`` and the rest of the option at ``SURVEY_SPEED``, both on flat
+  ground at the field's median solar yield (from a cell inside, the whole option at
+  ``SURVEY_SPEED``), so a far sector costs more than a near one; a charge option drives the trip to
+  its charging place at ``CHARGE_SPEED`` at the median yield and parks the rest of the option on
+  that place's yield, so a charge from afar is mostly the drive and gains little or nothing, and one
+  from nearby gains about two to three bands (by the place's yield). Each level shift becomes band
+  probabilities under a uniform position within a band (``shift_probabilities``). From the empty
+  band, under every option and from every cell, half on the same band and half on one higher (a
+  stalled rover cannot drive, it can only charge where it stands, at a yield it does not know).
+  Every other entry holds ``PRIOR_FLOOR``. The scheduler's learning counts each decision's band
+  posterior against the band posterior of the decision before, into the cells of its visit posterior
+  then, under the option taken then. A mission's ten or so charges and thirty surveys spread over
+  256 cells and eight bands barely move a row of their own: what the cell axis carries is the travel
+  cost the prior declares, which a table over the band and option alone could not price (it learned
+  one average of near and far surveys, and of the fruitless drives toward the charging place and the
+  real charges at it, about +0.06 of a level a charge).
 - ``cell_obs`` is right with probability ``CELL_ACC``, the rest spread over the other cells in
   proportion to a Gaussian of sd ``CELL_ERROR_SD`` (one cell side) in the distance between cell
   centres: the reading is the mode of the rover's position belief, so its errors are local. This
@@ -67,10 +80,14 @@ band meter, under its index (``visit_1``, ``energy_1``, ``map_1``, ``u_option_1`
 rover's visit starting at ``survey_world.SECOND_START``. Both ``map`` factors read the one
 parameter variable ``field``, and both ``energy`` factors the one ``energy_table`` (the two rovers
 are one design, so the band changes of either are evidence about the same table, and both count
-into it). The planner enumerates the Cartesian product of the two option nodes' levels at each
-step, so a policy is a joint sequence: ``25 ** HORIZON`` of them, which is why the two-rover
-scheduler looks ``JOINT_HORIZON`` options ahead. The rovers do not see each other and the world
-has no rover-to-rover physics: the scheduler's model holds no collision, no occlusion and no term
+into it). The two-rover scheduler plans with the factorised planner (``"factorised"``,
+docs/design/factorised-planning.md): one posterior per rover over that rover's own ``N_OPTIONS **
+JOINT_HORIZON`` option sequences, each updated against the other rover's per-step option marginals
+by mean-field sweeps, so a round scores ``sweeps * rovers * N_OPTIONS ** JOINT_HORIZON`` sequences
+(2,058 at seven options) rather than the product's ``N_OPTIONS ** (2 * JOINT_HORIZON)`` joint
+sequences (117,649); the one-rover scheduler, one node, keeps the enumeration planner, which the
+factorised planner equals on one node. The rovers do not see each other and the world has no
+rover-to-rover physics: the scheduler's model holds no collision, no occlusion and no term
 coupling the two rovers' positions; they are coupled only through the field, whose novelty one
 rover's planned readings use up for the other once the field is learned within the plan
 (``plan_learning``), and through the energy table they share. Only the first option node declares
@@ -94,32 +111,44 @@ from hybrid_aif import (
 )
 
 SURVEY_TICKS = 24  # fast ticks an option lasts
-HORIZON = 4  # options the scheduler looks ahead: 625 sequences (a decision under 1 s, measured)
-#  options the two-rover scheduler looks ahead: 25 ** 3 = 15,625 joint sequences. Measured on the
-#  16 by 16 field (one decision, compiled, M3 Max CPU): 7 ms at 2, 10 ms at 3, 42-58 ms at 4; the
-#  decision is not what binds. What binds is the record: a traced decision's term tree is 0.5 MB
-#  at 3 and 12.5 MB at 4, and the run keeps the carry every round, about 0.4 GB against 10 GB over
-#  800 rounds
+#  options the scheduler looks ahead: N_OPTIONS ** 4 sequences (625 at five options, a decision
+#  under 1 s, measured; 2,401 at seven)
+HORIZON = 4
+#  options the two-rover scheduler looks ahead. Under the factorised planner a round scores
+#  sweeps * rovers * N_OPTIONS ** JOINT_HORIZON sequences (3 * 2 * 343 = 2,058 at seven options),
+#  each rover's term tree over its own 343. Under the enumeration planner it was the product,
+#  N_OPTIONS ** (2 * JOINT_HORIZON) joint sequences (15,625 at five options, 117,649 at seven: a
+#  19 GB seed-0 run at seven, 5.2 GB at five); measured then at five options on the 16 by 16 field
+#  (one decision, compiled, M3 Max CPU): 7 ms at 2, 10 ms at 3, 42-58 ms at 4, a traced decision's
+#  term tree 0.5 MB at 3 and 12.5 MB at 4
 JOINT_HORIZON = 3
 #  measured on earlier two-tier runs (46 survey and 20 charge options outside the empty band): the
 #  travel speed toward a sector and the distinct cells it crosses; the travel speed to the charging
 #  place and the cells a charge crosses
 CRUISE = wd.CRUISE_SPEED  # the rover's measured travel speed (0.17)
-CHARGE_SPEED = 0.15  # the measured travel speed to the charging place
+#  the rover's speed while it surveys inside the option's sector: the mean true speed over the
+#  6,105 such ticks of the five-seed two-tier runs of 2026-11-17 (0.131; outside the sector 0.151);
+#  the energy prior prices the rest of a survey option at it, the travel at ``CRUISE``
+SURVEY_SPEED = 0.13
+CHARGE_SPEED = 0.15  # the measured travel speed to the (first) charging place
 PATH_SAMPLES = 24
 CELL_ACC = 0.95  # the cell reading is right with this probability
 PRIOR_COUNT = 3.0  # pseudo-counts per band and option of the energy table's prior: three readings
 PRIOR_FLOOR = 1e-3  # pseudo-counts of every next band the prior gives no share
-OPTION_NAMES = [f"survey sector {k + 1}" for k in range(sm.N_SURVEY)] + ["charge"]
+OPTION_NAMES = [f"survey sector {k + 1}" for k in range(sm.N_SURVEY)] + [
+    f"charge at site {j + 1}" for j in range(sm.N_CHARGE)
+]
 SECTOR_NAMES = [f"sector {k + 1}" for k in range(sm.N_SURVEY)]
-CHARGE = sm.CHARGE  # the charge level
+CHARGE = sm.CHARGE  # the first charge level
 CELL_SIDE = (wd.FIELD[0][1] - wd.FIELD[0][0]) / sm.GRID_SHAPE
 CELL_ERROR_SD = CELL_SIDE  # the reach of the cell reading's errors: one cell side
 # readings of the map per option: an option pools one reading per distinct cell it crosses, the
 # median count measured over the options of the closed-loop runs (see the build record)
 SURVEY_READINGS = 11
 CHARGE_READINGS = 6
-READINGS = jnp.asarray([SURVEY_READINGS] * sm.N_SURVEY + [CHARGE_READINGS], jnp.float32)
+READINGS = jnp.asarray(
+    [SURVEY_READINGS] * sm.N_SURVEY + [CHARGE_READINGS] * sm.N_CHARGE, jnp.float32
+)
 
 
 def cell_zones(centres):
@@ -136,10 +165,42 @@ def _path_cells(centres, here, there):
     return near.any(axis=1).astype(float)
 
 
+def survey_travel(centres):
+    """The travel of a survey option from each cell to each sector: the ticks at ``CRUISE`` from
+    the cell's centre to the sector's nearest cell centre, zero from a cell inside the sector,
+    ``(cells, N_SURVEY)``, and those nearest centres, ``(cells, N_SURVEY, 2)``. The travel is to
+    the nearest cell (the rover's novelty takes it to the nearest unread cells first); to the
+    sector's centre, the far sector was out of an option's reach (25 ticks at ``CRUISE`` against
+    ``SURVEY_TICKS``)."""
+    zones = cell_zones(centres)
+    n = centres.shape[0]
+    ticks = np.zeros((n, sm.N_SURVEY))
+    near = np.repeat(np.asarray(centres, np.float64)[:, None, :], sm.N_SURVEY, axis=1)
+    for k in range(sm.N_SURVEY):
+        inside = zones == k
+        for c in range(n):
+            if inside[c]:
+                continue
+            near[c, k] = centres[inside][
+                np.argmin(np.linalg.norm(centres[inside] - centres[c], axis=1))
+            ]
+            ticks[c, k] = float(np.linalg.norm(near[c, k] - centres[c])) / CRUISE
+    return ticks, near
+
+
+def charge_travel(centres):
+    """The ticks of each charge option's trip from each cell to its charging place
+    (``survey_model.charge_sites``) at ``CHARGE_SPEED``, ``(cells, N_CHARGE)``."""
+    sites = np.asarray(sm.charge_sites(), np.float64)
+    c = np.asarray(centres, np.float64)
+    return np.linalg.norm(c[:, None, :] - sites[None], axis=-1) / CHARGE_SPEED
+
+
 def visit_table(centres):
     """``visit[next, cell, band, option]``."""
     zones = cell_zones(centres)
     n = centres.shape[0]
+    travel_ticks, nearest = survey_travel(centres)
     moving = np.zeros((n, n, sm.N_OPTIONS))
     for k in range(sm.N_SURVEY):
         inside = zones == k
@@ -148,24 +209,20 @@ def visit_table(centres):
             if inside[c]:
                 moving[:, c, k] = w
                 continue
-            #  the travel is to the sector's nearest cell (the rover's novelty takes it to the
-            #  nearest unread cells first); to its centre, the far sector was out of an option's
-            #  reach (25 ticks at CRUISE against SURVEY_TICKS) and offered only path readings
-            near = centres[inside][np.argmin(np.linalg.norm(centres[inside] - centres[c], axis=1))]
-            travel = float(np.linalg.norm(near - centres[c])) / CRUISE
-            share = min(travel / SURVEY_TICKS, 1.0)
+            near = nearest[c, k]
+            share = min(travel_ticks[c, k] / SURVEY_TICKS, 1.0)
             path = _path_cells(centres, centres[c], near) * ~inside
             path = path / path.sum() if path.sum() > 0 else w
             moving[:, c, k] = share * path + (1.0 - share) * w
-    site_xy = sm.charge_site()
-    site = int(np.argmin(np.linalg.norm(centres - site_xy[None], axis=1)))
-    for c in range(n):
-        travel = float(np.linalg.norm(site_xy - centres[c])) / CHARGE_SPEED
-        share = min(travel / SURVEY_TICKS, 1.0)
-        path = _path_cells(centres, centres[c], site_xy)
-        path[site] = 0.0
-        path = path / path.sum() if path.sum() > 0 else np.eye(n)[site]
-        moving[:, c, CHARGE] = share * path + (1.0 - share) * np.eye(n)[site]
+    trips = charge_travel(centres)
+    for j, site_xy in enumerate(sm.charge_sites()):
+        site = int(np.argmin(np.linalg.norm(centres - site_xy[None], axis=1)))
+        for c in range(n):
+            share = min(float(trips[c, j]) / SURVEY_TICKS, 1.0)
+            path = _path_cells(centres, centres[c], site_xy)
+            path[site] = 0.0
+            path = path / path.sum() if path.sum() > 0 else np.eye(n)[site]
+            moving[:, c, CHARGE + j] = share * path + (1.0 - share) * np.eye(n)[site]
     table = np.broadcast_to(moving[:, :, None, :], (n, n, sm.N_BANDS, sm.N_OPTIONS)).copy()
     table[:, :, 0, :] = np.eye(n)[:, :, None]  # the stall: the rover stays on its cell
     return table
@@ -179,14 +236,30 @@ def learn_rates(prefix=""):
     return {"lr": 0.0, "lr_by_slot": {"*:*": 0.0, f"parameter:{prefix}energy_table": 1.0}}
 
 
-def option_shifts():
-    """The expected change of the energy level over one option, ``(N_OPTIONS,)``, from the rover's
-    declared energy rule (``survey_world.net_rate``) times ``SURVEY_TICKS``: a survey drives at
-    ``CRUISE`` on flat ground at the field's median solar yield; a charge parks on the charging
-    place's yield (``survey_model.cell_yields`` at ``survey_model.charge_site``)."""
-    survey = SURVEY_TICKS * wd.net_rate(CRUISE, 0.0, float(np.median(wd.SUN)))
-    charge = SURVEY_TICKS * wd.net_rate(0.0, 0.0, float(np.max(sm.cell_yields())))
-    return np.asarray([survey] * sm.N_SURVEY + [charge], np.float64)
+def option_shifts(centres=None):
+    """The expected change of the energy level over one option from each cell, ``(cells,
+    N_OPTIONS)``, from the rover's declared energy rule (``survey_world.net_rate``) over
+    ``SURVEY_TICKS`` ticks, for the cells with centres ``centres`` (the showcase's grid,
+    ``survey_model.field_grid``, by default): a survey drives its travel to the sector
+    (``survey_travel``, at most the option) at ``CRUISE`` and the rest at ``SURVEY_SPEED``, on flat
+    ground at the field's median solar yield; a charge option drives its trip to its charging
+    place (``charge_travel``, at most the option) at ``CHARGE_SPEED`` at the median yield and parks
+    the rest on that place's yield (``survey_model.cell_yields`` at
+    ``survey_model.charge_site_cells``)."""
+    if centres is None:
+        centres = sm.field_grid()[1]
+    median = float(np.median(wd.SUN))
+    travel = np.minimum(survey_travel(centres)[0], SURVEY_TICKS)
+    out = np.zeros((len(centres), sm.N_OPTIONS))
+    out[:, : sm.N_SURVEY] = travel * wd.net_rate(CRUISE, 0.0, median) + (
+        SURVEY_TICKS - travel
+    ) * wd.net_rate(SURVEY_SPEED, 0.0, median)
+    trip = np.minimum(charge_travel(centres), SURVEY_TICKS)
+    site_yields = sm.cell_yields()[sm.charge_site_cells()]
+    out[:, CHARGE:] = trip * wd.net_rate(CHARGE_SPEED, 0.0, median) + (
+        SURVEY_TICKS - trip
+    ) * wd.net_rate(0.0, 0.0, site_yields[None])
+    return out
 
 
 def shift_probabilities(delta, band, n=sm.N_BANDS, width=wd.BAND_WIDTH):
@@ -205,19 +278,25 @@ def shift_probabilities(delta, band, n=sm.N_BANDS, width=wd.BAND_WIDTH):
     return out
 
 
-def energy_prior(count=PRIOR_COUNT, floor=PRIOR_FLOOR):
-    """The energy table's prior counts ``[next, band, option]``: per band and option ``count``
-    pseudo-counts over the next band. From a band but the empty one, the option's declared level
-    shift (``option_shifts``) as band probabilities (``shift_probabilities``); from the empty band,
-    under every option, half each on the same and one higher. ``floor`` on every entry."""
+def energy_prior(centres=None, count=PRIOR_COUNT, floor=PRIOR_FLOOR):
+    """The energy table's prior counts ``[next, band, cell, option]`` over the cells with centres
+    ``centres`` (the showcase's grid by default): per band, cell and option ``count`` pseudo-counts
+    over the next band. From a band but the empty one, the option's declared level shift from the
+    cell (``option_shifts``) as band probabilities (``shift_probabilities``); from the empty band,
+    under every option and from every cell, half each on the same and one higher. ``floor`` on
+    every entry."""
+    if centres is None:
+        centres = sm.field_grid()[1]
     n = sm.N_BANDS
-    shifts = option_shifts()
-    table = np.full((n, n, sm.N_OPTIONS), float(floor))
-    for k in range(sm.N_OPTIONS):
-        table[0, 0, k] += count / 2
-        table[1, 0, k] += count / 2
-        for band in range(1, n):
-            table[:, band, k] += count * shift_probabilities(shifts[k], band)
+    shifts = option_shifts(centres)
+    cells = shifts.shape[0]
+    table = np.full((n, n, cells, sm.N_OPTIONS), float(floor))
+    table[0, 0] += count / 2
+    table[1, 0] += count / 2
+    for c in range(cells):
+        for k in range(sm.N_OPTIONS):
+            for band in range(1, n):
+                table[:, band, c, k] += count * shift_probabilities(shifts[c, k], band)
     return table
 
 
@@ -248,12 +327,13 @@ def terminal_logits(penalty):
 
 
 def expected_change(table):
-    """The expected change of band over one option, ``(band, option)``, of a table
-    ``[next, band, option]`` (counts or probabilities)."""
+    """The expected change of band over one option, ``(band, ...)``, of a table ``[next, band,
+    ...]`` (counts or probabilities; ``[next, band, option]`` or ``[next, band, cell, option]``)."""
     t = np.asarray(table, np.float64)
     t = t / t.sum(axis=0, keepdims=True)
     bands = np.arange(t.shape[0], dtype=float)
-    return np.einsum("n,nbk->bk", bands, t) - bands[:, None]
+    shape = (-1,) + (1,) * (t.ndim - 2)
+    return np.einsum("n,nb...->b...", bands, t) - bands.reshape(shape)
 
 
 def cell_obs_table(centres):
@@ -314,12 +394,13 @@ def scheduler(
     cell centres ``centres``. Its parameter variable ``field`` has the shape and prior of the
     rover's, so that ``Identify("rover.field", "mission.field")`` identifies them; its parameter
     variable ``energy_table`` holds the energy transition's counts, ``energy_counts`` (``[next,
-    band, option]``) or the prior ``energy_prior``. ``terminal`` is the terminal target's penalty
-    on the empty band (``terminal_logits``), ``terminal_penalty(policy_len)`` by default. With
+    band, cell, option]``) or the prior ``energy_prior`` over ``centres``. ``terminal`` is the
+    terminal target's penalty on the empty band (``terminal_logits``),
+    ``terminal_penalty(policy_len)`` by default. With
     ``durations`` the control node declares a round of ``SURVEY_TICKS`` for every level; with
     ``readings`` the ``map`` state factor's novelty at each plan step is multiplied by the number
     of readings of the option selected at that step (``SURVEY_READINGS`` for a survey,
-    ``CHARGE_READINGS`` for charge), a slow step pooling the readings the fast tier takes in it.
+    ``CHARGE_READINGS`` for a charge), a slow step pooling the readings the fast tier takes in it.
     ``rovers=2`` plans for two rovers, every factor, node and modality once per rover under its
     index (``indexed``), the second starting at ``survey_world.SECOND_START``; the durations are
     declared on the first option node alone; an ``epistemic`` key on one rover's factor names it
@@ -332,7 +413,7 @@ def scheduler(
         penalty = terminal_penalty(policy_len, field_strength, rovers=rovers)
     else:
         penalty = terminal
-    counts = energy_prior() if energy_counts is None else energy_counts
+    counts = energy_prior(centres) if energy_counts is None else energy_counts
     ks = range(1, rovers + 1)
 
     def name(base, k):
@@ -352,7 +433,7 @@ def scheduler(
     system = System(
         A_deps=tuple((visit(k),) for k in ks) + tuple((energy(k),) for k in ks),
         B_deps=tuple((visit(k), energy(k), option(k)) for k in ks)
-        + tuple((energy(k), option(k)) for k in ks)
+        + tuple((energy(k), visit(k), option(k)) for k in ks)
         + tuple((visit(k),) for k in ks)
         + tuple(() for _ in ks),
         controls=tuple(option(k) for k in ks),
@@ -361,7 +442,7 @@ def scheduler(
         control_names=tuple(name("u_option", k) for k in ks),
         modality_names=tuple(name(b, k) for b in ("cell_obs", "gauge") for k in ks),
         policy_len=policy_len,
-        planner="enumeration",
+        planner="factorised" if rovers > 1 else "enumeration",
         mixture_k=sm.MIXTURE_K,
         mixture_schedule="mode_aligned",
         planning_belief="prior",
@@ -389,7 +470,7 @@ def scheduler(
         parameters={
             "field": ConditionalDirichlet.from_table(uniform, 1, strength=field_strength),
             "energy_table": ConditionalDirichlet(
-                concentration=jnp.asarray(counts, jnp.float32), parent_ndims=2
+                concentration=jnp.asarray(counts, jnp.float32), parent_ndims=3
             ),
         },
         likelihood={

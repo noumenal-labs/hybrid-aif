@@ -1,14 +1,17 @@
 """The multi-rover survey, step one (``examples/survey_*.py``): two rovers that are two readers of
 one field.
 
-The one-rover declarations are those the regression pin of ``tests/test_survey_run.py`` was
-recorded from (that pin passes unchanged); here: the names of the one-rover scheduler and world;
-the two-rover scheduler, whose policies are joint (the Cartesian product of the two option nodes'
-levels at every step); a world of two vehicles, which is two worlds of one stepped side by side;
-the field learned within the scheduler's plan, under which a rover's planned readings of cells the
-other rover's plan reads earlier are worth less; and short closed-loop runs of the two-rover
-settings, with and without the scheduler, recording the coverage of the shared field.
+The one-rover declarations are those the regression pin of ``tests/test_survey_run.py`` was recorded
+from (that pin passes unchanged); here: the names of the one-rover scheduler and world; the
+two-rover scheduler, planned by the factorised planner (one posterior per rover over its own option
+sequences, mean-field sweeps between them) and recording per rover; a world of two vehicles, which
+is two worlds of one stepped side by side; the field learned within the scheduler's plan, under
+which a rover's planned readings of cells the other rover's plan reads earlier are worth less; and
+short closed-loop runs of the two-rover settings, with and without the scheduler, recording the
+coverage of the shared field.
 """
+
+import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -44,7 +47,7 @@ def test_the_one_rover_scheduler_and_world_keep_their_names(mods):
     assert set(world.names.emissions) == {"fix", "img", "gauge", "band"}
 
 
-def test_the_two_rover_scheduler_plans_joint_options_over_one_field(mods):
+def test_the_two_rover_scheduler_plans_each_rover_s_options_over_one_field(mods):
     ss, sm = mods["survey_scheduler"], mods["survey_model"]
     grid, centres = sm.field_grid(GRID)
     system, params = ss.scheduler(grid, centres, rovers=2, durations=True, readings=True)
@@ -63,26 +66,29 @@ def test_the_two_rover_scheduler_plans_joint_options_over_one_field(mods):
         np.linalg.norm(centres - np.asarray(mods["survey_world"].SECOND_START), axis=1)
     )
     assert int(np.argmax(params.initial_state_prior["visit_2"].logits)) == start
-    for horizon in (2, ss.JOINT_HORIZON):
-        joint = system.policies(params) if horizon == system.policy_len else None
-        if joint is None:
-            s, p = ss.scheduler(grid, centres, rovers=2, policy_len=horizon)
-            joint = s.policies(p)
-        joint = np.asarray(joint)
-        assert joint.shape == (sm.N_OPTIONS ** (2 * horizon), horizon, 2)
-        #  every pair of levels at every step: the Cartesian product of the two nodes' levels
-        assert len({tuple(p.ravel()) for p in joint}) == joint.shape[0]
+    #  planned by the factorised planner, one posterior per rover over its own sequences; the
+    #  one-rover scheduler, one node, by the enumeration planner
+    assert system.planner == "factorised"
+    assert ss.scheduler(grid, centres)[0].planner == "enumeration"
+    #  the joint policy set, were it enumerated: the Cartesian product of the two nodes' levels
+    s, p = ss.scheduler(grid, centres, rovers=2, policy_len=2)
+    joint = np.asarray(s.policies(p))
+    assert joint.shape == (sm.N_OPTIONS**4, 2, 2)
+    assert len({tuple(q.ravel()) for q in joint}) == joint.shape[0]
     #  the two rovers' terminal penalty covers the novelty both could earn
     assert ss.terminal_penalty(3, rovers=2) == pytest.approx(2 * ss.terminal_penalty(3))
 
 
 def _map_novelty(ss, sm, plan_learning):
     """The ``transition:map_1`` leaf (midpoint) of the two-rover scheduler at the mission's start,
-    horizon 3, keyed by the two rovers' option sequences."""
+    horizon 3, keyed by the two rovers' option sequences: the model's term on each joint sequence,
+    scored by the enumeration planner (the scheduler plans with the factorised one, which keeps no
+    term per joint sequence)."""
     grid, centres = sm.field_grid()
     system, params = ss.scheduler(
         grid, centres, rovers=2, readings=True, policy_len=3, plan_learning=plan_learning
     )
+    system = dataclasses.replace(system, planner="enumeration")
     _, metrics = system.compiled().infer_policies(params, dict(params.initial_state_prior))
     leaf = metrics["infogain"]["transition:map_1"]
     mid = (np.asarray(leaf.lower) + np.asarray(leaf.upper)) / 2
@@ -144,6 +150,32 @@ def test_a_world_of_two_vehicles_is_two_worlds_of_one(mods):
     assert not np.array_equal(carry2["x_1"], carry2["x_2"])
 
 
+def _assert_per_rover_record(slow, sm, horizon):
+    """A decision's record of the two-rover scheduler (``joint_decision_record``) holds, per
+    rover, the sequence its posterior puts highest with its term tree, ``G`` and probability, the
+    best ``G`` and the probability of each first option over its own sequences, the sequence count
+    of each rover's posterior, and the last sweep's movement."""
+    n = sm.N_OPTIONS
+    assert slow["policies"] == [n**horizon, n**horizon]
+    assert np.isfinite(slow["movement"]) and slow["movement"] >= 0.0
+    assert len(slow["chosen"]) == 2 and len(slow["efe_by_option"]) == 2
+    for k in range(2):
+        chosen = slow["chosen"][k]
+        assert len(chosen["options"]) == horizon
+        assert all(0 <= o < n for o in chosen["options"])
+        assert chosen["G"][0] <= chosen["G"][1]
+        assert 0.0 < chosen["q_pi"] <= 1.0
+        leaves = [name for leaves in chosen["terms"].values() for name in leaves]
+        assert f"transition:mission.map_{k + 1}" in leaves, leaves
+        q = slow["q_by_option"][k]
+        assert len(q) == n and sum(q) == pytest.approx(1.0, abs=1e-5)
+        efe = np.asarray(slow["efe_by_option"][k])
+        assert efe.shape == (n,) and np.all(np.isfinite(efe))
+        #  the chosen sequence's own G is no better than the best of its first option
+        first = chosen["options"][0]
+        assert efe[first] <= np.mean(chosen["G"]) + 1e-3
+
+
 @pytest.mark.parametrize("sid", ["two-rover-two-level", "two-rover-one-level"])
 def test_two_rovers_run_and_record_the_coverage_of_their_shared_field(mods, sid):
     sr, ss, wd = mods["survey_run"], mods["survey_scheduler"], mods["survey_world"]
@@ -167,7 +199,7 @@ def test_two_rovers_run_and_record_the_coverage_of_their_shared_field(mods, sid)
     if setting["tiers"] == 2:
         decisions = [r for r in rows if r["slow"]["decision"]]
         assert [r["t"] for r in decisions] == [0, 2]
-        assert decisions[0]["slow"]["policies"] == 25**2
+        _assert_per_rover_record(decisions[0]["slow"], sm=mods["survey_model"], horizon=2)
         #  both rovers' options held between decisions
         assert rows[0]["options"] == rows[1]["options"]
         assert [r["option"] for r in first] == [r["options"][0] for r in rows]

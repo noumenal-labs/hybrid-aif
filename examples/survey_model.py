@@ -21,11 +21,14 @@ centred on a full battery.
     system, params, grid, centres = rover(decoder)
 
 With ``tiered`` the model has a fourth node, the option control ``u_opt`` (survey sector 1 to 4, or
-charge) that the scheduler supplies by a ``Link`` from its option action node: the rover plans no
-decision for it, and its factors read what is supplied as they read any control node. A target over
-the vehicle's state is conditional on the option: under a survey option a broad Gaussian at the
-sector's centre, under charge a narrow one at the charging place (``charge_site``, the grid cell of
-highest solar yield) with the speed at rest.
+charge at one of the ``N_CHARGE`` charging places) that the scheduler supplies by a ``Link`` from
+its option action node: the rover plans no decision for it, and its factors read what is supplied as
+they read any control node. A target over the vehicle's state is conditional on the option: under a
+survey option a broad Gaussian at the sector's centre, under a charge option a narrow one at that
+option's charging place with the speed at rest. The charging places (``charge_sites``) are one per
+sunny region (``sunny_regions``: a 4-connected patch of at least ``MIN_REGION_CELLS`` grid cells
+whose mean solar yield is at least ``SUNNY_YIELD``), each the region's cell of highest yield, in
+order of that yield; the first (``charge_site``) is the cell of highest yield on the field.
 
 The objective has no uncertainty term on the position: the fix's information gain is the rover's
 localisation drive, and the field's novelty its mapping drive.
@@ -57,8 +60,9 @@ from hybrid_aif.system import System, SystemParams
 N_TERRAIN = 3
 N_BANDS = wd.N_BANDS  # the energy bands the slow tier reads, band 0 the empty band
 N_SURVEY = wd.ZONES  # survey options: one per sector
-N_OPTIONS = N_SURVEY + 1  # and charge
-CHARGE = N_SURVEY  # the charge option's level
+CHARGE = N_SURVEY  # the first charge option's level (the charge levels: ``CHARGE_LEVELS``)
+SUNNY_YIELD = 0.5  # a grid cell is sufficiently sunny to charge on at this mean yield or more
+MIN_REGION_CELLS = 4  # a sunny region has at least this many cells
 STATE_DIM = 6  # position, heading pair, speed, energy level
 #  position sd of the survey target: half the width of a sector (1.5 on the field's quadrants)
 SECTOR_SD = (wd.ZONE_EDGES[0][1] - wd.ZONE_EDGES[0][0]) / 2
@@ -182,11 +186,60 @@ def cell_yields(shape=None):
     return total / count
 
 
-def charge_site(shape=None):
-    """The charging place: the centre of the grid cell whose mean solar yield (``cell_yields``)
-    is highest, ``(2,)``."""
+def sunny_regions(shape=None):
+    """The sunny regions of the field: the connected components (4-neighbour adjacency on the
+    grid) of the cells whose mean solar yield (``cell_yields``) is at least ``SUNNY_YIELD``, those
+    of at least ``MIN_REGION_CELLS`` cells, each an array of its cells' indices (row-major as
+    ``field_grid``), in order of the yield of the region's sunniest cell, descending."""
+    shape = shape or GRID_SHAPE
+    yields = cell_yields(shape)
+    sunny = (yields >= SUNNY_YIELD).reshape(shape, shape)
+    label = np.full((shape, shape), -1)
+    regions = []
+    for start in zip(*np.nonzero(sunny), strict=True):
+        if label[start] >= 0:
+            continue
+        label[start] = len(regions)
+        stack, cells = [start], []
+        while stack:
+            i, j = stack.pop()
+            cells.append(i * shape + j)
+            for a, b in ((i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)):
+                if 0 <= a < shape and 0 <= b < shape and sunny[a, b] and label[a, b] < 0:
+                    label[a, b] = len(regions)
+                    stack.append((a, b))
+        regions.append(np.asarray(sorted(cells)))
+    regions = [r for r in regions if len(r) >= MIN_REGION_CELLS]
+    return sorted(regions, key=lambda r: -float(yields[r].max()))
+
+
+def charge_site_cells(shape=None):
+    """The cell of each charging place, ``(N_CHARGE,)``: each sunny region's cell of highest
+    yield (``sunny_regions``), in the regions' order."""
+    yields = cell_yields(shape)
+    return np.asarray([int(r[np.argmax(yields[r])]) for r in sunny_regions(shape)])
+
+
+def charge_sites(shape=None):
+    """The charging places, ``(N_CHARGE, 2)``: the centres of ``charge_site_cells``."""
     _, centres = field_grid(shape)
-    return centres[int(np.argmax(cell_yields(shape)))]
+    return centres[charge_site_cells(shape)]
+
+
+def charge_site(shape=None):
+    """The first charging place: the centre of the grid cell whose mean solar yield
+    (``cell_yields``) is highest, ``(2,)`` (the first of ``charge_sites``)."""
+    return charge_sites(shape)[0]
+
+
+N_CHARGE = len(charge_site_cells())  # charge options: one per charging place (sunny region)
+N_OPTIONS = N_SURVEY + N_CHARGE  # the survey options, then the charge options
+CHARGE_LEVELS = range(CHARGE, N_OPTIONS)  # the charge options' levels
+
+
+def is_charge(option):
+    """Whether an option level is a charge option (``option >= CHARGE``); works on arrays."""
+    return option >= CHARGE
 
 
 def sector_centres():
@@ -202,18 +255,22 @@ def option_position_target():
     """The target over the vehicle's state conditional on the option, ``(options, 6)`` locations
     and ``(options, 6, 6)`` factors: under a survey option a Gaussian at the sector's centre
     (position sd ``SECTOR_SD``, heading pair and speed sd 2), the energy level left free (sd
-    ``FREE_SD``: the energy preference is over the gauge). Under charge, a Gaussian at the
-    charging place (``charge_site``, position sd ``SITE_SD``) with the speed at rest (sd
-    ``REST_SD``) and the level free."""
+    ``FREE_SD``: the energy preference is over the gauge). Under a charge option, a Gaussian at
+    its charging place (``charge_sites``, position sd ``SITE_SD``) with the speed at rest (sd
+    ``REST_SD``) and the level free. A soft form, no position target under charge (the rover to
+    charge where it stands, its energy preference to find the light), was measured and lost: the
+    rover parked where the option found it, mostly in shade, and both rovers of the two-tier pair
+    stalled for hundreds of ticks (``design/terrain-field.md``, "The charger, rethought")."""
     n = N_OPTIONS
     loc = np.zeros((n, STATE_DIM), np.float32)
     loc[:N_SURVEY, :2] = sector_centres()
+    sites = charge_sites()
     chol = np.zeros((n, STATE_DIM, STATE_DIM), np.float32)
     for k in range(n):
         if k < N_SURVEY:
             sd = [SECTOR_SD, SECTOR_SD, 2.0, 2.0, 2.0, FREE_SD]
         else:
-            loc[k, :2] = charge_site()
+            loc[k, :2] = sites[k - N_SURVEY]
             sd = [SITE_SD, SITE_SD, 2.0, 2.0, REST_SD, FREE_SD]
         chol[k] = np.diag(sd)
     return ConditionalGaussian(loc=jnp.asarray(loc), chol=jnp.asarray(chol), parent_ndims=1)

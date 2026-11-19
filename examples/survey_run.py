@@ -43,15 +43,17 @@ other and the world has no rover-to-rover physics: no collision, no occlusion, n
 rover by the other; they are joined only by the field they both count into (and, under the
 scheduler, the energy table). Three arms: ``two-rover-one-level``, the two rovers merged with
 their field one variable and no scheduler, stepped by one vmapped call (a group of ``steps``);
-``two-rover-two-level``, the two rovers under one scheduler with an option node per rover, so its
-policies are joint (``25 ** survey_scheduler.JOINT_HORIZON`` sequences), the field learned within
-its plan so that one rover's planned readings of the cells the other's plan reads first are worth
-less, the rovers again one group; and the independent-rover baseline,
-the union of two one-rover runs from the two starts (``one-level`` and ``one-level-second-start``,
-``union_rows``: a cell is mapped where either rover's own map is confident of it). A multi-rover
-run's part file holds one row per tick of the shared field and each rover's own rows
-(``_multi_result``); ``--multi-report`` prints the comparison of the part files in ``--out``
-(``multi_report``). A collision servo and nested rounds are later builds.
+``two-rover-two-level``, the two rovers under one scheduler with an option node per rover, planned
+by the factorised planner (one posterior per rover over its own ``N_OPTIONS ** JOINT_HORIZON``
+sequences, updated against the other's option marginals by mean-field sweeps, rather than the
+product's ``N_OPTIONS ** (2 * JOINT_HORIZON)`` joint sequences), the field learned within its plan
+so that one rover's planned readings of the cells the other's plan reads first are worth less, the
+rovers again one group; and the independent-rover baseline, the union of two one-rover runs from the
+two starts (``one-level`` and ``one-level-second-start``, ``union_rows``: a cell is mapped where
+either rover's own map is confident of it). A multi-rover run's part file holds one row per tick of
+the shared field and each rover's own rows (``_multi_result``); ``--multi-report`` prints the
+comparison of the part files in ``--out`` (``multi_report``). A collision servo and nested rounds
+are later builds.
 
     python examples/survey_run.py --out DIR [--settings id,id] [--ticks 200] [--seed 0]
     python examples/survey_run.py --out DIR --replicas 10   # seeds 0..9 by one batched run
@@ -718,9 +720,10 @@ def decision_record(carry, option, reading, seconds, pre="agent.mission.", n_opt
     ``plan(trace=True)`` step left: the option sequences it scored (``trace.policies``) with
     their term trees, ``G`` and ``q_pi``, the best ``G`` and the probability of each first option,
     the posterior over the energy band and the visited cell (``carry.previous``), and the energy
-    table the decision planned with (``energy_record``). ``reading`` is the cell modality's value
-    that round, ``None`` where it was absent; ``n_options`` the option control node's levels;
-    ``seconds`` the run's mean tick time, compile excluded (``run_seconds``)."""
+    table the decision planned with, at the believed cell (``energy_record``). ``reading`` is the
+    cell modality's value that round, ``None`` where it was absent; ``n_options`` the option
+    control node's levels; ``seconds`` the run's mean tick time, compile excluded
+    (``run_seconds``)."""
     q_pi, tree, sequences = carry.trace.q_pi, carry.trace.tree, np.asarray(carry.trace.policies)
     g = total(tree)
     records = [
@@ -752,23 +755,30 @@ def decision_record(carry, option, reading, seconds, pre="agent.mission.", n_opt
             energy=[float(p) for p in np.asarray(beliefs[pre + "energy"].probs)],
             visit=[float(p) for p in np.asarray(beliefs[pre + "visit"].probs)],
         ),
-        energy_table=energy_record(carry.trace.parameters[pre + "energy_table"]),
+        energy_table=energy_record(
+            carry.trace.parameters[pre + "energy_table"], beliefs[pre + "visit"].probs
+        ),
         seconds=seconds,
     )
 
 
-def energy_record(table):
-    """The scheduler's energy table as the page shows it, from the parameter variable (a
-    ``ConditionalDirichlet`` ``[next, band, option]``): the expected change of band per band and
-    option (``change``, ``[band][option]``), the next band's probabilities (``probs``,
-    ``[band][option][next]``) and the counts each case has gathered beyond its prior (``counts``,
-    ``[band][option]``)."""
+def energy_record(table, cell=None):
+    """The scheduler's energy table as the page shows it, per band and option, from the parameter
+    variable (a ``ConditionalDirichlet`` ``[next, band, cell, option]``): the next band's
+    probabilities at the rover's believed cell (``probs``, ``[band][option][next]``, the table's
+    probabilities averaged over ``cell``, a probability vector over the cells; with none, uniform
+    over the cells, the table's cell-marginal), the expected change of band they give
+    (``change``, ``[band][option]``), and the counts each band and option has gathered beyond its
+    prior over all the cells (``counts``, ``[band][option]``)."""
     conc = np.asarray(table.concentration, np.float64)
-    prior = ss.energy_prior()
+    cells = conc.shape[2]
+    weights = np.full(cells, 1.0 / cells) if cell is None else np.asarray(cell, np.float64)
+    probs = np.einsum("nbco,c->nbo", conc / conc.sum(axis=0, keepdims=True), weights)
+    prior = ss.energy_prior(sm.field_grid(int(round(math.sqrt(cells))))[1])
     return dict(
-        change=np.round(ss.expected_change(conc), 4).tolist(),
-        probs=np.round(np.transpose(conc / conc.sum(axis=0, keepdims=True), (1, 2, 0)), 4).tolist(),
-        counts=np.round(conc.sum(axis=0) - prior.sum(axis=0), 4).tolist(),
+        change=np.round(ss.expected_change(probs), 4).tolist(),
+        probs=np.round(np.transpose(probs, (1, 2, 0)), 4).tolist(),
+        counts=np.round((conc.sum(axis=0) - prior.sum(axis=0)).sum(axis=1), 4).tolist(),
     )
 
 
@@ -866,9 +876,9 @@ def _tiered_result(
 def settings_multi():
     """The settings of the multi-rover comparison, step one: two rovers that are two readers of
     one field. ``two-rover-two-level``: the scheduler over both rovers, its option nodes one per
-    rover so its policies are joint, looking ``survey_scheduler.JOINT_HORIZON`` options ahead with
-    the field learned within the plan (``plan_learning``), its terminal penalty the two rovers'.
-    ``two-rover-one-level``: the two rovers alone, merged with their field one variable, no
+    rover planned by the factorised planner, looking ``survey_scheduler.JOINT_HORIZON`` options
+    ahead with the field learned within the plan (``plan_learning``), its terminal penalty the two
+    rovers'. ``two-rover-one-level``: the two rovers alone, merged with their field one variable, no
     scheduler. ``one-level-second-start``: the rover alone from the second start
     (``survey_world.SECOND_START``); with ``one-level`` it makes the independent-rover baseline,
     the union of two one-rover runs (``union_rows``)."""
@@ -1070,39 +1080,50 @@ class _Counts:
 
 def joint_decision_record(carry, options, readings, seconds, pre="agent.mission.", rovers=2):
     """The record of one decision of the multi-rover scheduler, read from its ``plan(trace=True)``
-    carry: compact, since its policies are joint (``25 ** horizon`` of them) and a record per
-    policy would be most of the part file. The options chosen (one per rover) and the readings of
-    the cell modalities (``None`` where absent); the joint sequence chosen with its term tree and
-    ``G``; the best ``G`` (the midpoint of its interval) per joint first option (``efe_by_option``,
-    ``[option of rover 1][option of rover 2]``); each rover's probability of each first option;
-    the posterior over each rover's energy band and visited cell; the energy table as the decision
-    planned with it."""
-    q_pi, tree, sequences = carry.trace.q_pi, carry.trace.tree, np.asarray(carry.trace.policies)
-    g = total(tree)
-    midpoint = (np.asarray(g.lower) + np.asarray(g.upper)) / 2
-    probs = np.asarray(q_pi.probs, np.float64)
-    first = sequences[:, 0, :]  # (policies, rovers)
+    carry. The scheduler plans with the factorised planner, so the trace holds ``q_pi`` over the
+    joint first step (``N_OPTIONS ** rovers`` joint options, the product of the rovers' first-step
+    marginals) and ``plans``, a ``FactorisedPolicies``: one posterior per rover over that rover's
+    own ``N_OPTIONS ** horizon`` sequences, each with its term tree. Compact: no record per
+    sequence. The options chosen (one per rover) and the readings of the cell modalities (``None``
+    where absent); per rover, the sequence its posterior puts highest with its term tree, ``G`` and
+    probability (``chosen``), the best ``G`` (the midpoint of its interval) per first option of
+    that rover's own sequences (``efe_by_option``, ``[rover][option]``) and the probability of each
+    first option (``q_by_option``, the posterior's first-step marginal); the last sweep's
+    ``movement``; the number of sequences each rover's posterior is over (``policies``); the
+    posterior over each rover's energy band and visited cell; the energy table as the decision
+    planned with it, at the rovers' believed cells (``energy_record``)."""
+    plans = carry.trace.plans
+    outer = pre.split(".", 1)[0] + "."
     n = sm.N_OPTIONS
-    flat = first[:, 0] * n + first[:, 1]
-    efe = np.full(n * n, np.inf)
-    np.minimum.at(efe, flat, midpoint)
-    best = int(np.argmax(probs))
+    chosen, efe = [], []
+    for k in range(rovers):
+        grid = np.asarray(plans.grids[k])  # (sequences, horizon)
+        probs = np.asarray(plans.posteriors[k].probs, np.float64)
+        tree = plans.trees[k]
+        g = total(tree)
+        midpoint = (np.asarray(g.lower) + np.asarray(g.upper)) / 2
+        best = int(np.argmax(probs))
+        chosen.append(
+            dict(
+                options=[int(a) for a in grid[best]],
+                terms=term_record(tree, best, outer),
+                G=interval_pair(g, best),
+                q_pi=float(probs[best]),
+            )
+        )
+        by_option = np.full(n, np.inf)
+        np.minimum.at(by_option, grid[:, 0], midpoint)
+        efe.append(np.round(by_option, 4).tolist())
     beliefs = carry.previous
     return dict(
         decision=True,
         options=[int(o) for o in options],
         cells=readings,
-        chosen=dict(
-            options=np.asarray(sequences[best]).T.astype(int).tolist(),
-            terms=term_record(tree, best, pre.split(".", 1)[0] + "."),
-            G=interval_pair(g, best),
-            q_pi=float(probs[best]),
-        ),
-        efe_by_option=np.round(efe.reshape(n, n), 4).tolist(),
-        q_by_option=[
-            [float(probs[first[:, k] == o].sum()) for o in range(n)] for k in range(rovers)
-        ],
-        policies=int(sequences.shape[0]),
+        chosen=chosen,
+        efe_by_option=efe,
+        q_by_option=[[float(p) for p in np.asarray(plans.marginals[k][0])] for k in range(rovers)],
+        movement=float(plans.movement),
+        policies=[int(np.asarray(gr).shape[0]) for gr in plans.grids],
         belief=[
             dict(
                 energy=[float(p) for p in np.asarray(beliefs[pre + f"energy_{k}"].probs)],
@@ -1110,7 +1131,14 @@ def joint_decision_record(carry, options, readings, seconds, pre="agent.mission.
             )
             for k in range(1, rovers + 1)
         ],
-        energy_table=energy_record(carry.trace.parameters[pre + "energy_table"]),
+        #  at the cells the rovers are believed in, each rover's visit belief weighed equally
+        energy_table=energy_record(
+            carry.trace.parameters[pre + "energy_table"],
+            np.mean(
+                [np.asarray(beliefs[pre + f"visit_{k}"].probs) for k in range(1, rovers + 1)],
+                axis=0,
+            ),
+        ),
         seconds=seconds,
     )
 
@@ -1683,7 +1711,12 @@ def report_text(settings, runs, marks=MARKS, mdl=None):
                 for t in runs[s["id"]]["ticks"]
                 if t.get("slow", {}).get("decision")
             ]
-            charges = [t for t, o in decisions if o == "charge"]
+            charges = [
+                t
+                for t in runs[s["id"]]["ticks"]
+                if t.get("slow", {}).get("decision") and sm.is_charge(t["slow"]["option"])
+            ]
+            charges = [t["t"] for t in charges]
             first_charge = charges[0] if charges else None
             options = [d["option"] for d in slow]
             surveyed = options.index(0) if 0 in options else None
@@ -1872,20 +1905,30 @@ def assemble(out_dir, camera_report, decoder):
         zone_split=list(wd.ZONE_SPLIT),
         sector_centres=[[float(c) for c in p] for p in sm.sector_centres()],
         charge_site=[float(c) for c in sm.charge_site()],
+        charge_sites=[[float(c) for c in p] for p in sm.charge_sites()],
+        sunny_yield=float(sm.SUNNY_YIELD),
         survey_readings=ss.SURVEY_READINGS,
         charge_readings=ss.CHARGE_READINGS,
         horizon=tiered.get("horizon", ss.HORIZON),
         terminal_penalty=tiered.get("terminal_penalty"),
         energy_model=(
             "the scheduler's energy transition is the parameter variable energy_table, one "
-            "Dirichlet per band and option over the next band, learned at each decision from its "
-            "band readings (the band posterior against the decision before's, under the option "
-            "taken then); its prior: three pseudo-counts per case, the band probabilities of "
-            "the level shift the rover's declared energy rule gives over one option (a survey: "
-            "cruise speed on flat ground at the median solar yield; charge: parked on the "
-            "charging place's yield), the level uniform within its band; from the empty band, "
-            "under every option, half each on the same and one higher; 0.001 on every entry; "
-            "no information-gain term on it"
+            "Dirichlet per band, visited cell and option over the next band, learned at each "
+            "decision from its band readings (the band posterior against the decision before's, "
+            "in the cells of the visit posterior then, under the option taken then); its prior: "
+            "three pseudo-counts per case, the band probabilities of the level shift the rover's "
+            "declared energy rule gives over one option from the cell (a survey: the travel to "
+            "the sector at cruise speed and the rest at the survey speed, on flat ground at the "
+            "median solar yield; a charge option: the trip to its charging place (one per sunny "
+            "region, the region's sunniest cell) at the measured charge speed at the median "
+            "yield, then parked on that place's yield), the level uniform "
+            "within its band; from the empty band, under every option, half each on the same and "
+            "one higher; 0.001 on every entry; no information-gain term on it. The page shows it "
+            "per band and option at the believed cell. The one-rover scheduler plans with the "
+            "enumeration planner, every option sequence of its horizon scored; the two-rover "
+            "scheduler with the factorised planner, one posterior per rover over its own option "
+            "sequences, each updated against the other rover's option marginals by three "
+            "mean-field sweeps"
         ),
         terminal=(
             "the scheduler's energy term is a terminal target, scored once at the plan's end: "
@@ -1903,12 +1946,13 @@ def assemble(out_dir, camera_report, decoder):
         cell_error_sd=float(ss.CELL_ERROR_SD),
         measured=dict(
             cruise_speed=float(ss.CRUISE),
+            survey_speed=float(ss.SURVEY_SPEED),
             charge_speed=float(ss.CHARGE_SPEED),
             survey_readings=ss.SURVEY_READINGS,
             charge_readings=ss.CHARGE_READINGS,
             note=(
-                "the constants of the scheduler's visit table and pooled readings measured on "
-                "earlier runs of the two-tier agent; its energy table holds none"
+                "the constants of the scheduler's visit table and pooled readings, and the "
+                "survey speed of its energy prior, measured on earlier runs of the two-tier agent"
             ),
         ),
         one_level=(
