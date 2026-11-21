@@ -769,9 +769,9 @@ class System(eqx.Module, metaclass=_SystemMeta):
     #: One entry per modality: the state factors it observes, by node index; the length fixes the
     #: modality count. Action node ``k`` is named as ``len(B_deps) + k``.
     A_deps: tuple[tuple[int, ...], ...] = eqx.field(static=True, default=())
-    #: The planner's registry name: ``"enumeration"``, ``"cem"``, ``"gradient"``, ``"mixed"``,
-    #: ``"habit"`` or ``"sophisticated"``. Resolved at call time; a face's ``planner=`` argument
-    #: overrides it.
+    #: The planner's registry name: ``"enumeration"``, ``"factorised"``, ``"cem"``,
+    #: ``"gradient"``, ``"mixed"``, ``"habit"`` or ``"sophisticated"``. Resolved at call time; a
+    #: face's ``planner=`` argument overrides it.
     planner: str = eqx.field(static=True, default="enumeration")
     #: The policy precision in q_pi ~ softmax(-gamma G + log E), read when
     #: ``SystemParams.precision`` is ``None``.

@@ -2,9 +2,10 @@ Planning
 ========
 
 A System holds the name of a planner, never a planner. Planners are resolved through a registry,
-and the built-in ones are enumeration over a policy grid, the cross-entropy method, gradient
-descent, a mixed discrete and continuous search, a habit policy, and the sophisticated planner that
-branches on observations. Each has a ``..._plan`` function, a ``..._planner`` object that fits the
+and the built-in ones are enumeration over a policy grid, the factorised planner (one policy
+posterior per discrete control node, updated by mean-field sweeps), the cross-entropy method,
+gradient descent, a mixed discrete and continuous search, a habit policy, and the sophisticated
+planner that branches on observations. Each has a ``..._plan`` function, a ``..._planner`` object that fits the
 registry and a ``make_...`` constructor that binds options.
 
 The registry
@@ -40,6 +41,18 @@ Enumeration and policy scoring
    ~hybrid_aif.planning.action_marginals
    ~hybrid_aif.planning.sample_action
    ~hybrid_aif.planning.control_steps
+
+Factorised
+----------
+
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   ~hybrid_aif.planning.factorised_planner
+   ~hybrid_aif.planning.make_factorised_planner
+   ~hybrid_aif.planning.factorised_plan
+   ~hybrid_aif.planning.FactorisedPolicies
 
 Cross-entropy and gradient
 --------------------------
