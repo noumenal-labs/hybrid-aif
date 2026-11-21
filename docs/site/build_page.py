@@ -36,6 +36,14 @@ converter for exactly the subset page-prose.md uses:
 - the markers ``<!-- tldr -->`` (opens the header's TLDR, plain prose) and ``<!-- footer -->``
   (ends the sections; the paragraphs after it form the footer under every pane);
 - a comment opened by a line ``<!--`` and closed by a line ``-->`` is ignored;
+- version spans: a line ``<!-- version: v1 -->`` opens a span of blocks shown only under that
+  version of the page's replay (any ``v<k>``) and a line ``<!-- /version -->`` closes it; the
+  span is written as ``<div class="ver" data-version="v1">`` and the page's script hides every
+  span that is not the version shown (without the script, every span shows). A span stays inside
+  one section: it cannot hold a ``#`` or ``##`` heading, the ``tldr`` or ``footer`` marker or the
+  demo's block, and must be closed before the next section. Blocks outside any span are shared.
+  A span may also open inside a block's caption (the marker between groups of ``> `` lines) and
+  close inside it: those caption paragraphs show under that version alone;
 - inline: ``**strong**``, ``*em*``, ```code```, ``[text](url)``, and a block placeholder inside
   a paragraph, which is pasted inline. A non-ASCII character is written as its named HTML entity
   (``'`` stays a plain apostrophe, while the typographic one becomes ``&rsquo;``).
@@ -75,6 +83,8 @@ SIDEBAR_LINKS = "links"  # a block the header names, placed in the sidebar inste
 DEMO_BLOCK = "hero-viewer"  # the section placing this block is the demo, with the demo bar
 DOCS_ID = "documentation"  # the synthetic last pane, unless the markdown has a section with this id
 # set before the layout is painted, so that panes are hidden only when the script can show them
+VERSION_OPEN = re.compile(r"^<!-- version: (v[0-9]+) -->$")
+VERSION_CLOSE = "<!-- /version -->"
 JS_FLAG = '<script>document.documentElement.classList.add("js");</script>'
 
 
@@ -180,6 +190,13 @@ def chunks(lines: list[str]) -> list[list[str]]:
             continue
         if line.strip() == "<!--":
             in_comment = True
+            continue
+        if VERSION_OPEN.match(line.strip()) or line.strip() == VERSION_CLOSE:
+            # a version marker is a group of its own, whatever surrounds it
+            if cur:
+                out.append(cur)
+                cur = []
+            out.append([line.strip()])
             continue
         if line.strip():
             cur.append(line.rstrip())
@@ -341,6 +358,7 @@ def build(prose: str, blocks_text: str) -> str:
     in_tldr = False
     section_open = False
     footer: list[str] = []
+    version: str | None = None  # the version span open, if any
     groups = chunks(body)
     i = 0
     while i < len(groups):
@@ -356,7 +374,26 @@ def build(prose: str, blocks_text: str) -> str:
                 raise PageError(f"attribute line {first!r} must sit directly above a paragraph")
             first = chunk[0]
 
-        if first == "<!-- tldr -->":
+        vm = VERSION_OPEN.match(first)
+        if version is not None and (
+            first.startswith(("# ", "## "))
+            or first in ("<!-- tldr -->", "<!-- footer -->")
+            or first == f"<!-- block: {DEMO_BLOCK} -->"
+        ):
+            raise PageError(f"close the <!-- version: {version} --> span before {first!r}")
+        if vm:
+            if version is not None:
+                raise PageError(f"a version span opens inside the open {version} span: {first!r}")
+            if region == "footer":
+                raise PageError("no version spans after <!-- footer -->")
+            version = vm.group(1)
+            out.append(f'{indent}<div class="ver" data-version="{version}">')
+        elif first == VERSION_CLOSE:
+            if version is None:
+                raise PageError(f"{VERSION_CLOSE} without an open version span")
+            version = None
+            out.append(f"{indent}</div>")
+        elif first == "<!-- tldr -->":
             if region != "header" or in_tldr:
                 raise PageError("<!-- tldr --> belongs in the header, once")
             out.append('  <div class="tldr">')
@@ -446,11 +483,37 @@ def build(prose: str, blocks_text: str) -> str:
             name = BLOCK_OPEN.match(first).group(1)
             html = get_block(blocks, name)
             # the caption: the '> ' lines of this chunk and every following chunk of '> ' lines,
-            # a blank line between them starting a new paragraph of the caption
-            paragraphs = [chunk[1:]] if chunk[1:] else []
-            while i < len(groups) and groups[i][0].startswith(">"):
-                paragraphs.append(groups[i])
+            # a blank line between them starting a new paragraph of the caption. A version span
+            # may open inside the caption (a marker followed by '> ' lines) and must close inside
+            # it: those paragraphs show under that version alone
+            parts: list[tuple[str, list[str] | str]] = [("p", chunk[1:])] if chunk[1:] else []
+            cap_version: str | None = None
+            while i < len(groups):
+                lead = groups[i][0]
+                vopen = VERSION_OPEN.match(lead)
+                if lead.startswith(">"):
+                    parts.append(("p", groups[i]))
+                elif (
+                    vopen
+                    and cap_version is None
+                    and version is None
+                    and i + 1 < len(groups)
+                    and groups[i + 1][0].startswith(">")
+                ):
+                    cap_version = vopen.group(1)
+                    parts.append(("open", cap_version))
+                elif lead == VERSION_CLOSE and cap_version is not None:
+                    cap_version = None
+                    parts.append(("close", ""))
+                else:
+                    break
                 i += 1
+            if cap_version is not None:
+                raise PageError(
+                    f"close the <!-- version: {cap_version} --> span inside the caption of "
+                    f"{first!r}"
+                )
+            paragraphs = [p for kind, p in parts if kind == "p"]
             caption = [line for para in paragraphs for line in para]
             if (CAPTION_SLOT in html) != bool(caption):
                 need = "needs" if caption == [] else "has no slot for"
@@ -462,11 +525,22 @@ def build(prose: str, blocks_text: str) -> str:
                     raise PageError(f"block {name!r} belongs in one section")
                 demo = current
             if caption:
+                # one paragraph goes in bare; more (or any span) go in as <p> elements
                 texts = [
-                    inline(" ".join(line[1:].strip() for line in para), blocks)
-                    for para in paragraphs
+                    inline(" ".join(line[1:].strip() for line in part), blocks)
+                    if kind == "p"
+                    else f'<div class="ver" data-version="{part}">'
+                    if kind == "open"
+                    else "</div>"
+                    for kind, part in parts
                 ]
-                text = texts[0] if len(texts) == 1 else "".join(f"<p>{x}</p>" for x in texts)
+                if len(parts) == 1:
+                    text = texts[0]
+                else:
+                    text = "".join(
+                        f"<p>{x}</p>" if kind == "p" else x
+                        for (kind, _), x in zip(parts, texts, strict=True)
+                    )
                 html = html.replace(CAPTION_SLOT, text)
             out.append(html)
         else:
@@ -478,6 +552,8 @@ def build(prose: str, blocks_text: str) -> str:
                 cls = "lead"
             attr = f' class="{cls}"' if cls else ""
             out.append(f"{indent}<p{attr}>{text}</p>")
+    if version is not None:
+        raise PageError(f"the <!-- version: {version} --> span is not closed")
     if region != "footer":
         raise PageError("page-prose.md must end with <!-- footer --> and the footer text")
     if DOCS_ID not in ids:

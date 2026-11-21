@@ -1,7 +1,8 @@
 :root{
   --bg:#fbfbfa;--fg:#1d1f21;--muted:#62666b;--line:#d9dbde;--panel:#f2f3f4;
   --accent:#1f5fbf;--c1:#1f5fbf;--c2:#c2571a;--c3:#2a8a5a;--c4:#8a5cc2;--c5:#9a7b12;--warn:#b3261e;--sun:#d99a06;
-  --o0:#6f9bd6;--o1:#e29a62;--o2:#6dbb8f;--o3:#a67fd1;--o4:#e0bb3a;
+  --o0:#6f9bd6;--o1:#e29a62;--o2:#6dbb8f;--o3:#a67fd1;--o4:#e0bb3a;--o5:#b88a1e;--o6:#ecd27a;
+  --r1:#d4007f;--r2:#4a2a9c;
   --tf:#dfe6d8;--tr:#e4d3b9;--ti:#d3e3ef;--mf:#2a8a5a;--mr:#b8651a;--mi:#1f5fbf;--contour:rgba(70,55,30,.38);--cellline:rgba(0,0,0,.07);--plan:#c4175a;--ell:#7a2bd1;--washfix:#7a2bd1;
   --qg:#2a8a5a;--qb:#c2571a;--qs:#9a9fa5;--inactive:.3;
   --side-bg:#f3f4f2;--toc-current:#e1e9f6;--toc-parent:#eef2f9;
@@ -12,13 +13,15 @@
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
   --bg:#16181a;--fg:#e6e7e8;--muted:#9aa0a6;--line:#34383c;--panel:#1f2225;
   --accent:#6aa3f0;--c1:#6aa3f0;--c2:#f0a060;--c3:#5cc596;--c4:#b08af0;--c5:#d4b24a;--warn:#f08a82;--sun:#ffd84a;
-  --o0:#4f80c0;--o1:#c07a45;--o2:#4a9a72;--o3:#9a76cc;--o4:#d4a92a;
+  --o0:#4f80c0;--o1:#c07a45;--o2:#4a9a72;--o3:#9a76cc;--o4:#d4a92a;--o5:#a07818;--o6:#e6cc6e;
+  --r1:#ff5cb8;--r2:#38cdf2;
   --tf:#2b3a30;--tr:#4a3e2c;--ti:#2c4254;--mf:#5cc596;--mr:#f0a060;--mi:#6aa3f0;--contour:rgba(255,255,255,.28);--cellline:rgba(255,255,255,.07);--plan:#ff6fa0;--ell:#b98af5;--washfix:#b98af5;
   --qg:#5cc596;--qb:#f0a060;--qs:#6c7178;--inactive:.42;
   --side-bg:#1b1d20;--toc-current:#22324a;--toc-parent:#1f2633;}}
 :root[data-theme="dark"]{--bg:#16181a;--fg:#e6e7e8;--muted:#9aa0a6;--line:#34383c;--panel:#1f2225;
   --accent:#6aa3f0;--c1:#6aa3f0;--c2:#f0a060;--c3:#5cc596;--c4:#b08af0;--c5:#d4b24a;--warn:#f08a82;--sun:#ffd84a;
-  --o0:#4f80c0;--o1:#c07a45;--o2:#4a9a72;--o3:#9a76cc;--o4:#d4a92a;
+  --o0:#4f80c0;--o1:#c07a45;--o2:#4a9a72;--o3:#9a76cc;--o4:#d4a92a;--o5:#a07818;--o6:#e6cc6e;
+  --r1:#ff5cb8;--r2:#38cdf2;
   --tf:#2b3a30;--tr:#4a3e2c;--ti:#2c4254;--mf:#5cc596;--mr:#f0a060;--mi:#6aa3f0;--contour:rgba(255,255,255,.28);--cellline:rgba(255,255,255,.07);--plan:#ff6fa0;--ell:#b98af5;--washfix:#b98af5;
   --qg:#5cc596;--qb:#f0a060;--qs:#6c7178;--inactive:.42;
   --side-bg:#1b1d20;--toc-current:#22324a;--toc-parent:#1f2633;}
@@ -65,7 +68,8 @@ main{max-width:var(--wide)}
 /* the demo bar: title and playback controls, stuck to the top over the demo's panes */
 .demobar{position:sticky;top:var(--topbar-h,0px);z-index:15;display:flex;flex-wrap:wrap;align-items:center;gap:.3rem 1rem;margin:-.6rem 0 1.4rem;padding:.6rem 0;background:var(--bg);border-bottom:1px solid var(--line);font-size:.92rem}
 .demobar[hidden]{display:none}
-.demobar-title{flex:1 1 100%;font-size:1.4rem;font-weight:700;line-height:1.25;color:var(--fg);text-decoration:none}
+.demobar-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem 1.2rem;flex:1 1 100%;min-width:0}
+.demobar-title{flex:0 1 auto;font-size:1.4rem;font-weight:700;line-height:1.25;color:var(--fg);text-decoration:none}
 /* the demo bar carries the demo's title, so its own section heading is kept for assistive technology only */
 #demo>h2{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 .demobar-title:hover{color:var(--accent)}
@@ -73,6 +77,9 @@ main{max-width:var(--wide)}
 .demobar .slider{flex:1 1 7rem}
 .demobar .setting{flex:0 1 auto;display:inline-flex;align-items:center;gap:.4rem;min-width:0}
 .demobar .setting select{width:auto}
+/* the demo's version switch: a plain line below the demo bar, on the demo's own pane only */
+.verpick{display:inline-flex;align-items:center;gap:.4rem;font-size:.92rem;font-weight:400;color:var(--muted,var(--fg))}
+.verpick select{width:auto}
 .pagefoot{max-width:var(--measure);color:var(--muted);font-size:.85rem;padding:1rem 0 3rem;border-top:1px solid var(--line)}
 @media (prefers-reduced-motion:no-preference){
   .js .pane.is-current{animation:pane-in .18s ease-out}
@@ -169,7 +176,8 @@ td.kind{font-family:var(--mono);font-size:.85rem;word-break:break-word}
 #graph text{paint-order:stroke;stroke:var(--panel);stroke-width:3px;stroke-linejoin:round}
 
 /* camera panel */
-.camerafig{margin-top:1rem}
+.camerafig{margin-top:1rem;width:fit-content;max-width:100%}
+.camerafig figcaption{contain:inline-size}
 .camgrid{display:flex;flex-wrap:wrap;gap:1rem 1.4rem;align-items:flex-start}
 .cam{display:flex;flex-direction:column;gap:.3rem;width:192px;max-width:100%}
 .camc{position:relative;width:192px;height:192px}
@@ -230,3 +238,41 @@ td.kind{word-break:normal;white-space:nowrap}
 .decenergy tbody th{text-align:left;font-weight:400}
 .decenergy tr.here th,.decenergy tr.here td{font-weight:700}
 .decenergy .muted{color:var(--muted);font-weight:400}
+/* two rovers' joint decision: a block per rover, its band belief as a heat strip */
+.decrover{margin:.2rem 0 .9rem}
+.dechead{font-size:.85rem;margin:.2rem 0 .1rem}
+.bandbel{display:flex;align-items:flex-start;gap:.6rem;margin:.1rem 0 0;font-size:.78rem}
+.bandbel .bl{color:var(--muted);min-width:8.5em;padding-top:.2rem}
+.bandbel .heat{display:grid;grid-template-columns:repeat(8,minmax(2.6rem,1fr));gap:.2rem;flex:1;min-width:0;overflow-x:auto}
+.bandbel .hc{display:flex;flex-direction:column;align-items:center;gap:.1rem;min-width:0}
+.bandbel .hcell{display:block;width:100%;height:1.3rem;border:1px solid var(--line);border-radius:2px;text-align:center}
+.bandbel .hp{font:.7rem/1.3rem var(--mono)}
+.bandbel .rn{font-size:.7rem;color:var(--muted);white-space:nowrap}
+.decmove{font-size:.82rem;margin:.2rem 0 .4rem}
+.decmove .mono{font-family:var(--mono)}
+.decmove .muted{color:var(--muted)}
+/* the arms compared, and their five-seed table */
+.seedtable{font-variant-numeric:tabular-nums;width:auto}
+.seedtable caption{caption-side:top;text-align:left;font-size:.85rem;color:var(--muted);padding-bottom:.3rem}
+.seedtable td.num,.seedtable th.num{white-space:nowrap}
+.seedtable .muted{color:var(--muted)}
+.armsw{display:inline-block;width:.8rem;height:.8rem;border-radius:2px;vertical-align:middle;margin-right:.4rem}
+/* two rovers at once: a HUD group per rover, legend groups, two camera feeds */
+.hud .hrover{border-left:3px solid var(--line);padding-left:.5rem;margin:.15rem 0;display:grid;gap:.1rem}
+.hud .hrname{font-weight:700;font-size:.82rem}
+.hud .rmarks{margin:0 0 .1rem;font-size:.78rem}
+.legend .lgroup{display:flex;flex-wrap:wrap;align-items:center;gap:.15rem .9rem;flex-basis:100%}
+.legend .lghead{color:var(--muted);font-size:.78rem;text-transform:none;font-weight:600}
+.camgrid.camtwo{gap:1rem 1.4rem}
+.camrover{border-top:3px solid var(--line);padding-top:.3rem}
+.camhead{font-weight:700;font-size:.9rem;margin-bottom:.3rem}
+.camcells{display:flex;flex-wrap:wrap;gap:.6rem .7rem;align-items:flex-start}
+.camtwo .cam{width:128px}
+.camtwo .camc,.camtwo .cam canvas{width:128px;height:128px}
+.camtwo .readout{width:128px;height:128px;padding:.3rem}
+.camtwo .readout .hcell{height:46px}
+.decenergy .rovcol{text-align:left;padding-left:.6rem}
+.decenergy .rovtag{font-weight:700;margin-right:.4rem}
+/* per-version prose (page-prose.md's version spans) */
+.ver[hidden]{display:none}
+.ver>p,.ver>ul,.ver>h3,.ver>h4{max-width:var(--measure)}

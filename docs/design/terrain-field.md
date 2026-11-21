@@ -228,6 +228,18 @@ measured under. The arm without a scheduler was a group already.
 Sharing the field beats pooling two independent maps at every mark; the scheduler leads every
 arm to tick 400 and ends level with the union, behind the shared map without it.
 
+*Amended 2026-11-21 (Alex): the union now pools the two maps' counts per cell.* The union row
+above counted a cell as mapped where either rover's own map was confident of it, which credits
+the two rovers' maps with their contradictions as well as their agreements. `union_rows` now sums
+the two fields' counts per cell under one prior (`field_counts`, read off the published uint8
+means and counts), the map one shared field would hold from the same readings, and counts a cell
+as mapped where that pooled map's top probability exceeds the threshold, as seen where the pooled
+counts reach one. What the comparison then isolates is the gain from sharing the map *during* the
+survey, not that plus the gain from pooling afterwards. Same five seeds, the pooled union:
+0.373±0.033 | 0.596±0.029 | 0.733±0.027 | 0.797±0.049 (against 0.377 | 0.603 | 0.738 | 0.805
+under the either-map reading; the pooling resolves a few cells the two maps read differently).
+The page's replay seed is unchanged.
+
 **Tuned on the way.** The first build lost late on every seed (0.798±0.058), both rovers held to
 the sector above the charger, because the survey option predicted its readings as a Gaussian of
 sd 0.66 about the sector's centre, so once the centres were read no option saw a sector's unread

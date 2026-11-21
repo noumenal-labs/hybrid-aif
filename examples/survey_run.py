@@ -49,9 +49,10 @@ sequences, updated against the other's option marginals by mean-field sweeps, ra
 product's ``N_OPTIONS ** (2 * JOINT_HORIZON)`` joint sequences), the field learned within its plan
 so that one rover's planned readings of the cells the other's plan reads first are worth less, the
 rovers again one group; and the independent-rover baseline, the union of two one-rover runs from the
-two starts (``one-level`` and ``one-level-second-start``, ``union_rows``: a cell is mapped where
-either rover's own map is confident of it). A multi-rover run's part file holds one row per tick of
-the shared field and each rover's own rows (``_multi_result``); ``--multi-report`` prints the
+two starts (``one-level`` and ``one-level-second-start``, ``union_rows``: the two maps' counts
+pooled per cell, a cell mapped where the pooled map is confident of it). A multi-rover run's part
+file holds one row per tick of the shared field and each rover's own rows (``_multi_result``);
+``--multi-report`` prints the
 comparison of the part files in ``--out`` (``multi_report``). A collision servo and nested rounds
 are later builds.
 
@@ -63,6 +64,21 @@ are later builds.
     python examples/survey_run.py --out DIR --multi-report  # their coverage, and the union
     python examples/survey_run.py --out DIR --assemble     # merge the part files into bundle
     python examples/survey_trim.py DIR/bundle.json OUT_DIR   # the page's bundle.js
+
+The page's two versions (``VERSIONS``): ``v1`` the one rover (``two-level``, ``one-level``),
+``v2`` the two rovers (``two-rover-two-level``, ``two-rover-one-level`` and the union of
+``one-level`` and ``one-level-second-start``). Each takes five seeds of every arm by
+``--replicas 5`` into one directory; its replay is the replicas of one seed from those batches,
+by ``replay_seed``: among the seeds where every arm's coverage at tick 800 is within one sample sd
+of that arm's mean, the seed at which the scheduled arm's coverage at 800 is highest
+(``--replay-from unbatched`` reads unbatched runs of that seed, ``--seed K``, from ``--out``
+instead):
+
+    python examples/survey_run.py --out FIVE --ticks 800 --settings two-level --replicas 5
+    python examples/survey_run.py --out FIVE --ticks 800 --settings one-level --replicas 5
+    python examples/survey_run.py --out V1 --assemble --version v1 --seeds-dir FIVE
+    python examples/survey_trim.py V1/bundle_v1.json docs/site --name HYBRID_AIF_BUNDLE_V1 \
+        --file bundle_v1.js
 """
 
 import argparse
@@ -1220,22 +1236,36 @@ def covered_cells(row):
     return mean.max(axis=1) > COVERED_MAX, np.asarray(row["counts"]) >= SEEN_COUNTS
 
 
-def union_rows(rows_a, rows_b):
-    """The independent-rover baseline over the ticks of two one-rover runs: per tick the share of
-    cells covered by either rover's own field (``covered_cells``), and seen by either; two rovers
-    that map apart and pool their maps afterwards, a cell counted as mapped where either map is
-    confident of it. Read off the published uint8 means, so a cell within half a step of
-    ``COVERED_MAX`` may be miscounted (``union_check`` measures it against the runs' own
-    coverage)."""
+def field_counts(row, strength=FIELD_STRENGTH):
+    """A one-rover tick row's field as the counts it has absorbed per cell and class, ``(cells,
+    3)``: its published uint8 mean times its total concentration (the prior's ``strength`` per
+    cell plus the counts the row records), less the prior's share of each class; clipped at zero,
+    since the uint8 rounding of a small probability can fall short of that share."""
+    mean = np.asarray(row["map"], np.float64) / 255.0
+    total = strength + np.asarray(row["counts"], np.float64)
+    return np.maximum(mean * total[:, None] - strength / mean.shape[1], 0.0)
+
+
+def union_rows(rows_a, rows_b, strength=FIELD_STRENGTH):
+    """The independent-rover baseline over the ticks of two one-rover runs: two rovers that map
+    apart and pool their maps afterwards. Per tick the two fields' counts are summed per cell
+    (``field_counts``: the pooled posterior is the uniform prior of ``strength`` per cell plus
+    both rovers' counts, the map one shared field would hold from the same readings), and the
+    share of cells is taken whose pooled top probability exceeds ``COVERED_MAX`` (``coverage``)
+    and whose pooled counts reach ``SEEN_COUNTS`` (``seen``). Read off the published uint8 means,
+    so a cell within half a step of ``COVERED_MAX`` may be miscounted (``union_check`` measures
+    that reading against the runs' own coverage)."""
     out = []
     for a, b in zip(rows_a, rows_b, strict=True):
-        cov_a, seen_a = covered_cells(a)
-        cov_b, seen_b = covered_cells(b)
+        counts_a, counts_b = field_counts(a, strength), field_counts(b, strength)
+        conc = strength / counts_a.shape[1] + counts_a + counts_b
+        mean = conc / conc.sum(axis=1, keepdims=True)
+        counts = np.asarray(a["counts"], np.float64) + np.asarray(b["counts"], np.float64)
         out.append(
             dict(
                 t=a["t"],
-                coverage=float(np.mean(cov_a | cov_b)),
-                seen=float(np.mean(seen_a | seen_b)),
+                coverage=float(np.mean(mean.max(axis=1) > COVERED_MAX)),
+                seen=float(np.mean(counts >= SEEN_COUNTS)),
             )
         )
     return out
@@ -1247,6 +1277,40 @@ def union_check(rows):
     return max(abs(float(np.mean(covered_cells(r)[0])) - r["coverage"]) for r in rows)
 
 
+def union_id(pair):
+    """The name of the union of the one-rover runs ``pair`` in the comparisons."""
+    return f"union({pair[0]}, {pair[1]})"
+
+
+def seed_curves(out_dir, pair=("one-level", "one-level-second-start")):
+    """The coverage curves of the batched runs' part files in ``out_dir``
+    (``part_<id>_s<k>.json``, ``--replicas``): ``{id: {seed: [coverage per tick]}}``, and, under
+    ``union_id(pair)``, the union of the one-rover runs ``pair`` (``union_rows``) over the seeds
+    both hold. The part files are read one at a time, only the rows the union needs kept."""
+    curves, kept = {}, {}
+    for path in sorted(Path(out_dir).glob("part_*.json")):
+        replica = re.fullmatch(r"(.+)_s(\d+)", path.stem.removeprefix("part_"))
+        if not replica:
+            continue
+        sid, seed = replica.group(1), int(replica.group(2))
+        part = json.loads(path.read_text())
+        rows = part["runs"][sid]["ticks"]
+        curves.setdefault(sid, {})[seed] = [r["coverage"] for r in rows]
+        if sid in pair:
+            kept.setdefault(sid, {})[seed] = [
+                dict(t=r["t"], map=r["map"], counts=r["counts"]) for r in rows
+            ]
+        del part, rows
+    if all(p in kept for p in pair):
+        common = sorted(set(kept[pair[0]]) & set(kept[pair[1]]))
+        if common:
+            curves[union_id(pair)] = {
+                k: [r["coverage"] for r in union_rows(kept[pair[0]][k], kept[pair[1]][k])]
+                for k in common
+            }
+    return curves
+
+
 def multi_report(out_dir, marks=(200, 400, 600, 800), pair=("one-level", "one-level-second-start")):
     """The multi-rover comparison from the part files in ``out_dir``: coverage of the field at the
     ticks ``marks`` for each run there (a multi-rover run's of its shared field), and the union of
@@ -1255,40 +1319,25 @@ def multi_report(out_dir, marks=(200, 400, 600, 800), pair=("one-level", "one-le
     (``part_<id>_s<k>.json``, ``--replicas``), a second table gives each setting's coverage as
     mean ± sd over its seeds, and the union of ``pair`` over the seeds both hold."""
     runs = {}
-    seeds = {}
     for path in sorted(Path(out_dir).glob("part_*.json")):
-        part = json.loads(path.read_text())
         tag = path.stem.removeprefix("part_")
-        replica = re.fullmatch(r"(.+)_s(\d+)", tag)
+        if re.fullmatch(r"(.+)_s(\d+)", tag):
+            continue
+        part = json.loads(path.read_text())
         for sid, one in part["runs"].items():
-            if replica:
-                seeds.setdefault(replica.group(1), {})[int(replica.group(2))] = one
-            else:
-                runs[tag] = (sid, one)
+            runs[tag] = (sid, one)
     curves = {tag: [r["coverage"] for r in one["ticks"]] for tag, (_, one) in runs.items()}
     if all(p in runs for p in pair):
         a, b = (runs[p][1]["ticks"] for p in pair)
-        curves[f"union({pair[0]}, {pair[1]})"] = [r["coverage"] for r in union_rows(a, b)]
+        curves[union_id(pair)] = [r["coverage"] for r in union_rows(a, b)]
         check = max(union_check(a), union_check(b))
     else:
         check = None
     #  the seeds of ``--replicas`` part files (``part_<id>_s<k>.json``): coverage per seed, and
     #  the union of the pair over the seeds both hold
     spread = {
-        sid: {k: [r["coverage"] for r in one["ticks"]] for k, one in by_seed.items()}
-        for sid, by_seed in seeds.items()
-        if len(by_seed) > 1
+        sid: by_seed for sid, by_seed in seed_curves(out_dir, pair).items() if len(by_seed) > 1
     }
-    if all(p in seeds for p in pair):
-        common = sorted(set(seeds[pair[0]]) & set(seeds[pair[1]]))
-        if len(common) > 1:
-            spread[f"union({pair[0]}, {pair[1]})"] = {
-                k: [
-                    r["coverage"]
-                    for r in union_rows(seeds[pair[0]][k]["ticks"], seeds[pair[1]][k]["ticks"])
-                ]
-                for k in common
-            }
     head = "".join(f" tick {k} |" for k in marks)
     lines = [
         "# Multi-rover survey, step one",
@@ -1897,8 +1946,27 @@ def assemble(out_dir, camera_report, decoder):
     meta = meta_record(n, camera_report, grid, camera_mode(settings[0]))
     seeds = {s.get("seed", 0) for s in settings}
     meta["seed"] = seeds.pop() if len(seeds) == 1 else None  # the run key the settings share
+    meta["tiers"] = tiers_record(settings)
+    for run_ in runs.values():
+        add_charge_to(run_)
+    bundle = dict(meta=meta, graph=graph_record(*model), settings=settings, runs=runs)
+    try:
+        bundle["mdl"] = mdl_record(*model)
+        bundle["description"] = describe(*model)[0]
+    except Exception as exc:  # the description refuses some models; say so and carry on
+        print(f"mdl skipped: {type(exc).__name__}: {exc}")
+    text = json.dumps(bundle)
+    (out_dir / "bundle.json").write_text(text)
+    marks = tuple(range(100, n + 1, 100)) or (n,)
+    (out_dir / "REPORT.md").write_text(report_text(settings, runs, marks, bundle.get("mdl")))
+    print(f"bundle: {len(runs)} runs, {len(text) / 1e6:.1f} MB")
+
+
+def tiers_record(settings):
+    """``meta.tiers`` of a bundle of ``settings``: the scheduler's clock, options, sectors and
+    charging places, its constants and the sentences the page shows."""
     tiered = next((s for s in settings if s.get("tiers") == 2), settings[0])
-    meta["tiers"] = dict(
+    return dict(
         slow_ticks=settings[0]["slow_ticks"],
         options=ss.OPTION_NAMES,
         zones=ss.SECTOR_NAMES,
@@ -1961,7 +2029,273 @@ def assemble(out_dir, camera_report, decoder):
             "wall preference), no scheduler, no option and no sector or charging target, free "
             "to go where it likes; its ticks have no option and no slow record"
         ),
+        charge_form="per-option",
+        charge_to=(
+            "each tick of a two-tier run (each rover's row in a multi-rover run) carries "
+            "charge_to, the charging place of the option in force when it is a charge option, "
+            "charge_sites[option - len(zones)], else null"
+        ),
     )
+
+
+def charge_destination(option, sites):
+    """The charging place an option sends the rover to: ``sites[option - CHARGE]`` for a charge
+    option, else ``None``."""
+    if option is None or not sm.is_charge(option):
+        return None
+    return [float(c) for c in sites[option - sm.CHARGE]]
+
+
+def add_charge_to(run_):
+    """Write ``charge_to`` (``charge_destination``) into each tick of a run that has options:
+    a one-rover run's ticks, a multi-rover run's rows of each rover. The charging places are the
+    ones the rover's charge target drives to (``survey_model.charge_sites`` of the declared
+    grid, whatever the field's grid)."""
+    sites = np.asarray(sm.charge_sites())
+    rows = [run_["ticks"]] + list(run_.get("rovers", {}).values())
+    for one in rows:
+        for tick in one:
+            if "option" in tick:
+                tick["charge_to"] = charge_destination(tick["option"], sites)
+
+
+UNION_PAIR = ("one-level", "one-level-second-start")
+UNION_ARM = "two-rover-union"  # the bundle's id of the independent-rover baseline
+COMPARISON_MARKS = (200, 400, 600, 800)
+REPLAY_MARK = 800
+#  the page's two versions: the settings each replays, the arms of its five-seed table (the union
+#  of the one-rover runs ``UNION_PAIR`` under ``UNION_ARM``), the arm whose best seed is replayed
+VERSIONS = {
+    "v1": dict(
+        label="One rover: the scheduler over the rover, and the rover alone",
+        runs=("two-level", "one-level"),
+        arms=("two-level", "one-level"),
+        rule_arm="two-level",
+    ),
+    "v2": dict(
+        label=(
+            "Two rovers reading one field: a scheduler over both, the pair alone, and two "
+            "independent rovers whose maps are pooled afterwards"
+        ),
+        runs=("two-rover-two-level", "two-rover-one-level"),
+        arms=("two-rover-two-level", "two-rover-one-level", UNION_ARM),
+        rule_arm="two-rover-two-level",
+    ),
+}
+
+
+def arm_labels():
+    """The id and label of every arm the versions name, the union included."""
+    labels = {s["id"]: s["label"] for s in settings_grid_l2() + settings_multi()}
+    labels[UNION_ARM] = "Two rovers alone, each its own field, the maps pooled afterwards"
+    return labels
+
+
+def comparison_record(curves, arms, marks=COMPARISON_MARKS):
+    """The five-seed table of a version: per arm (``curves`` as ``seed_curves`` gives them, the
+    union under ``union_id(UNION_PAIR)``), the coverage at ``marks`` per seed, and its mean and
+    sample sd (ddof 1) over the seeds, as ``multi_report`` computes them."""
+    labels = arm_labels()
+    out = []
+    for arm in arms:
+        by_seed = curves[union_id(UNION_PAIR) if arm == UNION_ARM else arm]
+        seeds = sorted(by_seed)
+        values = np.asarray([[by_seed[k][m - 1] for m in marks] for k in seeds], np.float64)
+        out.append(
+            dict(
+                id=arm,
+                label=labels[arm],
+                seeds=seeds,
+                coverage={
+                    str(k): [float(v) for v in row] for k, row in zip(seeds, values, strict=True)
+                },
+                mean=[float(v) for v in values.mean(axis=0)],
+                sd=[float(v) for v in values.std(axis=0, ddof=1)] if len(seeds) > 1 else None,
+            )
+        )
+    return dict(
+        marks=list(marks),
+        arms=out,
+        note=(
+            "coverage (cells whose field's top probability exceeds 0.6) of each arm's batched "
+            "replicas (--replicas, seeds 0 onward), mean and sample sd (ddof 1) over the seeds; "
+            "the union arm is the union of the one-rover runs one-level and "
+            "one-level-second-start of the same seed (union_rows); a batched replica is not the "
+            "unbatched run of its seed (design/batched-run.md)"
+        ),
+    )
+
+
+def arm_curves(curves, arm):
+    """An arm's coverage curves per seed in ``seed_curves``'s record (the union arm under
+    ``union_id(UNION_PAIR)``)."""
+    return curves[union_id(UNION_PAIR) if arm == UNION_ARM else arm]
+
+
+def replay_rule(rule_arm, mark=REPLAY_MARK):
+    """The replay rule (``replay_seed``) as a sentence, as ``meta.replay.rule`` records it."""
+    return (
+        f"among the seeds where every arm's coverage at tick {mark} is within one sample sd of "
+        f"that arm's mean, the seed at which the scheduled arm's ({rule_arm}) coverage at tick "
+        f"{mark} is highest"
+    )
+
+
+def replay_seed(curves, arms, rule_arm, mark=REPLAY_MARK):
+    """The replay's seed: among the seeds every arm of ``arms`` holds where each arm's coverage
+    at tick ``mark`` is within one sample sd (ddof 1) of that arm's mean over its seeds, the seed
+    at which ``rule_arm``'s coverage at ``mark`` is highest (the lowest such seed on a tie). A
+    seed typical of every arm, the scheduled arm at its best among those."""
+    at = {arm: {k: c[mark - 1] for k, c in arm_curves(curves, arm).items()} for arm in arms}
+    seeds = sorted(set.intersection(*(set(v) for v in at.values())))
+    typical = []
+    for k in seeds:
+        ok = True
+        for values in at.values():
+            v = np.asarray([values[j] for j in sorted(values)], np.float64)
+            sd = v.std(ddof=1) if len(v) > 1 else 0.0
+            ok &= abs(values[k] - v.mean()) <= sd + 1e-12
+        if ok:
+            typical.append(k)
+    if not typical:
+        raise SystemExit(f"no seed is within one sd of every arm's mean at tick {mark}")
+    return max(typical, key=lambda k: (at[rule_arm][k], -k))
+
+
+def replay_parts(out_dir, ids, seed=None):
+    """The part files in ``out_dir`` of the settings ``ids``: the batched runs' replicas of
+    ``seed`` (``part_<id>_s<seed>.json``), or, with ``seed`` None, the unbatched runs
+    (``part_<id>.json``): ``(runs, settings)`` keyed by id."""
+    runs, settings = {}, {}
+    tag = "" if seed is None else f"_s{seed}"
+    for sid in ids:
+        path = Path(out_dir) / f"part_{sid}{tag}.json"
+        if not path.exists():
+            raise SystemExit(f"no part file {path}")
+        part = json.loads(path.read_text())
+        runs[sid], settings[sid] = part["runs"][sid], part["settings"][sid]
+    return runs, settings
+
+
+def union_run(runs, settings, pair=UNION_PAIR):
+    """The independent-rover baseline as a run of the bundle: ticks of ``{t, coverage, seen}``
+    only (``union_rows`` of the one-rover runs ``pair``), flagged ``coverage_only``, and its
+    setting."""
+    a, b = (runs[p] for p in pair)
+    seeds = {settings[p].get("seed", 0) for p in pair}
+    if len(seeds) != 1:
+        raise SystemExit(f"the union's runs have different seeds: {sorted(seeds)}")
+    check = max(union_check(a["ticks"]), union_check(b["ticks"]))
+    strength = settings[pair[0]].get("field_strength", FIELD_STRENGTH)
+    run_ = dict(
+        ticks=union_rows(a["ticks"], b["ticks"], strength),
+        coverage_only=True,
+        union_of=list(pair),
+        starts=[list(map(float, wd.STARTS[k])) for k in range(2)],
+        union_check=check,
+    )
+    setting = dict(
+        id=UNION_ARM,
+        label=arm_labels()[UNION_ARM],
+        coverage_only=True,
+        union_of=list(pair),
+        rovers=2,
+        seed=seeds.pop(),
+        note=(
+            "two one-rover runs of the rover alone, from the first and the second start, each "
+            "with its own field, the two fields' counts pooled per cell afterwards; a cell counts "
+            "as mapped where the pooled map is confident of it (and as seen where the pooled "
+            "counts reach one): coverage and seen only"
+        ),
+    )
+    return run_, setting
+
+
+def assemble_version(
+    out_dir,
+    camera_report,
+    decoder,
+    version,
+    seeds_dir=None,
+    marks=COMPARISON_MARKS,
+    mark=REPLAY_MARK,
+    replay_from="replica",
+):
+    """The page's bundle of one version (``VERSIONS``) from the batched runs' part files in
+    ``seeds_dir`` (``part_<id>_s<k>.json``, default ``out_dir``): the five-seed table
+    (``comparison_record``); the replay, at the seed the rule picks (``replay_seed`` over the
+    version's arms, its scheduled arm ``rule_arm``): with ``replay_from`` "replica" that seed's
+    replicas from the same part files (for ``v2`` the union's two one-rover runs too), with
+    "unbatched" the unbatched runs ``part_<id>.json`` in ``out_dir``, which must be of that seed;
+    the model records of the version's two-tier agent. ``marks`` are the table's ticks and
+    ``mark`` the rule's. Writes ``bundle_<version>.json`` and ``REPORT_<version>.md`` in
+    ``out_dir``."""
+    spec = VERSIONS[version]
+    seeds_dir = seeds_dir or out_dir
+    curves = seed_curves(seeds_dir, UNION_PAIR)
+    seed = replay_seed(curves, spec["arms"], spec["rule_arm"], mark)
+    multi = version == "v2"
+    ids = spec["runs"] + (UNION_PAIR if multi else ())
+    if replay_from == "replica":
+        runs, by_id = replay_parts(seeds_dir, ids, seed)
+    elif replay_from == "unbatched":
+        runs, by_id = replay_parts(out_dir, ids)
+    else:
+        raise ValueError(f"replay_from: 'replica' or 'unbatched', not {replay_from!r}")
+    recorded = {by_id[sid].get("seed", 0) for sid in ids}
+    if recorded != {seed}:
+        raise SystemExit(
+            f"the replay parts are of seeds {sorted(recorded)}, the rule picks seed {seed}"
+        )
+    settings = [by_id[sid] for sid in spec["runs"]]
+    replayed = runs
+    runs = {sid: replayed[sid] for sid in spec["runs"]}
+    if multi:
+        runs[UNION_ARM], union_setting = union_run(replayed, by_id)
+        settings.append(union_setting)
+        del replayed
+    ticks = {len(r["ticks"]) for r in runs.values()}
+    if len(ticks) != 1:
+        raise SystemExit(f"the runs have different lengths: {sorted(ticks)}")
+    n = ticks.pop()
+    grid, _ = sm.field_grid(settings[0].get("grid", sm.GRID_SHAPE))
+    confusion = camera_report.get("recogniser_confusion")
+    tiered = settings[0]
+    if multi:  # one mind plans with one planner: the scheduler's, the factorised one
+        model = joint_planner(
+            *multi_agent_system(decoder, tiered, confusion)[0], planner="factorised"
+        )
+    else:
+        model = joint_planner(*agent_system(decoder, tiered, confusion)[0])
+    meta = meta_record(n, camera_report, grid, camera_mode(tiered))
+    meta["seed"] = seed
+    meta["tiers"] = tiers_record(settings)
+    if multi:
+        meta["start"] = list(wd.START)
+        meta["starts"] = [list(map(float, wd.STARTS[k])) for k in range(2)]
+        meta["tiers"]["one_level"] = (
+            "the two-rover one-level setting is the two rovers alone: each the fast tier with its "
+            "own objective, both counting into one field, no scheduler, no option and no sector "
+            "or charging target; its ticks have no options and no slow record"
+        )
+        meta["tiers"]["union"] = arm_labels()[UNION_ARM] + (
+            ": the one-level runs from the first and the second start, a cell mapped where either "
+            "rover's own map is confident of it; coverage and seen only (coverage_only)"
+        )
+    for sid in spec["runs"]:
+        add_charge_to(runs[sid])
+    meta["version"] = version
+    meta["version_label"] = spec["label"]
+    batch_seeds = sorted(arm_curves(curves, spec["rule_arm"]))
+    meta["replay"] = dict(
+        seed=seed,
+        rule=replay_rule(spec["rule_arm"], mark),
+        rule_arm=spec["rule_arm"],
+        mark=mark,
+        **{"from": replay_from},
+        batch=dict(seeds=batch_seeds, replicas=len(batch_seeds), seed_arg=batch_seeds[0]),
+    )
+    meta["comparison"] = comparison_record(curves, spec["arms"], marks)
     bundle = dict(meta=meta, graph=graph_record(*model), settings=settings, runs=runs)
     try:
         bundle["mdl"] = mdl_record(*model)
@@ -1969,10 +2303,39 @@ def assemble(out_dir, camera_report, decoder):
     except Exception as exc:  # the description refuses some models; say so and carry on
         print(f"mdl skipped: {type(exc).__name__}: {exc}")
     text = json.dumps(bundle)
-    (out_dir / "bundle.json").write_text(text)
-    marks = tuple(range(100, n + 1, 100)) or (n,)
-    (out_dir / "REPORT.md").write_text(report_text(settings, runs, marks, bundle.get("mdl")))
-    print(f"bundle: {len(runs)} runs, {len(text) / 1e6:.1f} MB")
+    (Path(out_dir) / f"bundle_{version}.json").write_text(text)
+    (Path(out_dir) / f"REPORT_{version}.md").write_text(comparison_text(bundle))
+    print(f"bundle {version}: {len(runs)} runs, seed {seed}, {len(text) / 1e6:.1f} MB")
+    return bundle
+
+
+def comparison_text(bundle):
+    """A version's report: its replay seed and rule, its runs' coverage at the marks, and the
+    five-seed table."""
+    meta = bundle["meta"]
+    comp = meta["comparison"]
+    marks = comp["marks"]
+    head = "".join(f" tick {k} |" for k in marks)
+    lines = [
+        f"# The page, {meta['version']}: {meta['version_label']}",
+        "",
+        f"Replay: seed {meta['replay']['seed']} ({meta['replay']['from']}), the rule: "
+        f"{meta['replay']['rule']}.",
+        "",
+        f"| replay run |{head}",
+        "|---|" + "---|" * len(marks),
+    ]
+    for sid, run_ in bundle["runs"].items():
+        rows = run_["ticks"]
+        lines.append(f"| {sid} |" + "".join(f" {rows[k - 1]['coverage']:.3f} |" for k in marks))
+    lines += ["", comp["note"], "", f"| arm | seeds |{head} at {marks[-1]} per seed |"]
+    lines.append("|---|---|" + "---|" * len(marks) + "---|")
+    for arm in comp["arms"]:
+        sd = arm["sd"] or [0.0] * len(marks)
+        cells = "".join(f" {m:.3f} ± {d:.3f} |" for m, d in zip(arm["mean"], sd, strict=True))
+        per = ", ".join(f"{k}: {v[-1]:.3f}" for k, v in arm["coverage"].items())
+        lines.append(f"| {arm['id']} | {len(arm['seeds'])} |{cells} {per} |")
+    return "\n".join(lines) + "\n"
 
 
 def main():
@@ -2001,6 +2364,24 @@ def main():
         default=True,
         help="observe the position fix (--no-fix: the fix ablation, vision-only localisation)",
     )
+    ap.add_argument(
+        "--version",
+        choices=tuple(VERSIONS),
+        default=None,
+        help="with --assemble: the page's bundle of one version (assemble_version)",
+    )
+    ap.add_argument(
+        "--seeds-dir",
+        default=None,
+        help="with --version: the batched runs' part files (default: --out)",
+    )
+    ap.add_argument(
+        "--replay-from",
+        choices=("replica", "unbatched"),
+        default="replica",
+        help="with --version: the replay is the rule's seed's replicas from --seeds-dir, or the "
+        "unbatched runs of that seed in --out",
+    )
     ap.add_argument("--tag", default="")
     ap.add_argument(
         "--replicas",
@@ -2018,7 +2399,17 @@ def main():
     decoder, encoder, camera_report = cam.load_or_train(out_dir)
     confusion = camera_report.get("recogniser_confusion")
     if args.assemble:
-        assemble(out_dir, camera_report, decoder)
+        if args.version:
+            assemble_version(
+                out_dir,
+                camera_report,
+                decoder,
+                args.version,
+                args.seeds_dir,
+                replay_from=args.replay_from,
+            )
+        else:
+            assemble(out_dir, camera_report, decoder)
         return
     settings = settings_grid_l2()
     if args.settings:  # any setting by id, the multi-rover ones (``settings_multi``) included

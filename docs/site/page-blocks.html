@@ -8,7 +8,8 @@ are sidebar-logo (the logo at the top of the sidebar; title-image is the Intro's
 and links (the sidebar small print), documentation (the Documentation pane, while the markdown has
 no section with the id documentation) and demo-bar (the playback controls that stick to the top of
 the column over the demo's panes; {{title}} is the demo section's heading, {{href}} its link and
-{{panes}} the ids of the demo and its child sections).
+{{panes}} the ids of the demo and its child sections). The bar's title row also carries the demo's
+version switch (#verpick, "version:"), to the right of the title.
 -->
 
 <!-- block: head -->
@@ -57,7 +58,10 @@ the column over the demo's panes; {{title}} is the demo section's heading, {{hre
 
 <!-- block: demo-bar -->
 <div class="demobar" id="demobar" data-panes="{{panes}}" hidden>
-  <a class="demobar-title" href="{{href}}">{{title}}</a>
+  <div class="demobar-head">
+    <a class="demobar-title" href="{{href}}">{{title}}</a>
+    <label class="verpick" id="verpick">version: <select id="bundlever" aria-label="Demo version"><option value="v2">v2 (latest)</option><option value="v1">v1 (one rover)</option></select></label>
+  </div>
   <div class="demobar-controls" role="group" aria-label="Playback">
     <button id="play" type="button" aria-label="Play">Play</button>
     <label class="slider">Tick <input id="tick" type="range" min="0" max="0" value="0"> <output id="tickout">0</output></label>
@@ -143,6 +147,19 @@ the column over the demo's panes; {{title}} is the demo section's heading, {{hre
   <div id="tip" class="tip" role="status" hidden></div>
 <!-- /block -->
 
+<!-- block: comparison-figure -->
+  <figure class="compfig" id="compfig">
+    <div id="comparison" class="chartbox"></div>
+    <div class="legend" id="complegend"></div>
+    <figcaption id="compcap"></figcaption>
+  </figure>
+<!-- /block -->
+
+<!-- block: seed-table -->
+  <div class="tablewrap"><table id="seedtable" class="seedtable"></table></div>
+  <p class="mdlfoot" id="seedfoot"></p>
+<!-- /block -->
+
 <!-- block: mdl-table -->
   <div class="tablewrap"><table id="mdltable"><thead><tr><th>Component</th><th>Kind</th><th class="num">entries</th><th class="num">nats</th><th>Size (log scale)</th><th>Status</th></tr></thead><tbody></tbody></table></div>
   <p class="mdlfoot" id="mdlfoot"></p>
@@ -221,9 +238,9 @@ for t in range(60):
 
 <!-- block: tail -->
 <noscript><div class="wrap static"><p>This page replays precomputed data and needs JavaScript. Without it, here are the rendered views of one setting.</p>
-<img src="static/hero.png" alt="The survey rover&#39;s field with its learned map, and the two-tier model graph with the shared terrain table">
-<img src="static/timeline.png" alt="The timeline of option bands, energy and coverage over the run, with the one-level run dashed">
-<img src="static/objective.png" alt="Expected free energy of the scheduler&#39;s option sequences">
+<img src="static/hero.png" alt="Two rovers at tick 150 of the run with a scheduler over both: the field with the shared learned map, each rover&#39;s true path, plans and position belief, the three charging places, each rover&#39;s option, energy and terrain; and the model graph, the mission tier between the two rover tiers, with the shared field and energy table">
+<img src="static/timeline.png" alt="The timeline of the two-rover run with a scheduler: each rover&#39;s option strip and energy level against the eight bands, and the coverage of the shared field, with the two rovers without a scheduler dashed and the two independent rovers&#39; pooled maps dotted">
+<img src="static/objective.png" alt="The scheduler&#39;s decision at tick 144 for both rovers: per rover, the expected free energy of its highest-posterior option sequence split into novelty and the energy term, the best expected free energy per first option with its probability, and the energy band belief">
 </div></noscript>
 <script src="nav.js" defer></script>
 <script src="app.js" defer></script>

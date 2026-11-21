@@ -28,6 +28,12 @@ Conventions:
   other special characters directly; the build writes them as HTML entities. A plain `'` stays
   plain. `\[` and `\]` are literal brackets, for brackets around a link.
 - Line breaks inside a paragraph do not matter; a blank line ends it.
+- Per-version text: a line `<!-- version: v1 -->` opens a span shown only while the page shows
+  version v1 of the replay (v2 likewise), and a line `<!-- /version -->` closes it. Everything
+  outside a span is shared by both versions. A span stays inside one section: put no `#` or `##`
+  heading, no `tldr`/`footer` marker and not the demo's viewer block inside it, and close it
+  before the next section. A `###` inside a span keeps its contents entry in both versions.
+  Without JavaScript every span shows.
 -->
 
 # <!-- block: title-image -->
@@ -110,29 +116,72 @@ varying height), classifying terrain into three kinds (firm, rough, and ice). Th
 charges in sunlight, which depends on which slopes are shaded. For navigation it relies on a forward 
 camera and a GPS-like satellite signal whose quality varies over the field. The demo shows two 
 variants: one with just the rover and one a hierarchical model whose second layer is a discrete 
-mission planner that provides options to map a given coarse-grained sector, or to charge the battery.
+mission planner that provides options to map a given coarse-grained sector, or to charge the battery
+by heading to one of three locations with optimal sunlight.
 
-The page replays one run of the demo, both tiers over both settings:
-`python examples/survey_run.py --ticks 800 --seed 4 --out OUT_DIR`, then the same command with
-`--assemble`, then `python examples/survey_trim.py OUT_DIR/bundle.json docs/site`;
-`docs/site/README.md` says how the page's data is rebuilt from it.
+<!-- version: v1 -->
+
+The page replays one run of each setting (scheduler + rover, and rover alone),
+seed 4 of 5:
+`python examples/survey_run.py --ticks 800 --replicas 5 --settings two-level --out FIVE` and the
+same with `--settings one-level`, then
+`python examples/survey_run.py --assemble --version v1 --seeds-dir FIVE --out OUT`, then
+`python examples/survey_trim.py OUT/bundle_v1.json docs/site --name HYBRID_AIF_BUNDLE_V1 --file bundle_v1.js`;
+`docs/site/README.md` explains how the page's data is rebuilt from it.
+
+<!-- /version -->
+
+<!-- version: v2 -->
+
+The page replays one run of each setting (two rovers coordinated via a scheduler, or via a shared map),
+seed 3 of 5:
+`python examples/survey_run.py --ticks 800 --replicas 5 --settings two-rover-two-level --out FIVE`
+and the same with `--settings two-rover-one-level`, `--settings one-level` and
+`--settings one-level-second-start` (the two one-rover runs pooled in the comparison), then
+`python examples/survey_run.py --assemble --version v2 --seeds-dir FIVE --out OUT`, then
+`python examples/survey_trim.py OUT/bundle_v2.json docs/site --name HYBRID_AIF_BUNDLE_V2 --file bundle_v2.js`;
+`docs/site/README.md` explains how the page's data is rebuilt from it.
+
+<!-- /version -->
 
 <!-- block: hero-viewer -->
+
+<!-- version: v1 -->
+
 > **Left:** Contour map, with rover position/heading beliefs, satellite fixes, and patches colored 
-> by the rover's accumulated certainty about terrain class. The chosen plan's path is drawn in red, 
-> alternate plans thinner in the text color. 
-> Plans are rolled forward by the same nonlinear functions the generative process uses
-> (see [World](#world) below).
+> by accumulated certainty about terrain class. The chosen plan's path is drawn in red, alternate 
+> plans thinner in the text color. Plans are rolled forward by the same nonlinear functions the 
+> generative process uses (see [World](#world) below).
 
 > **Right:** the model, with the table
-> `rover.field` read by `rover.terrain` in the fast tier and by `mission.map` in the slow one. The
-> table is one node because the two tiers share it outright (one learned belief by design), not
-> because one reads a copy of the other. The belief over position is a Gaussian, drawn as its 2σ ellipse 
-> with a minimum size so it stays visible; the camera and the fix together keep it small.
+> `rover.field` read by `rover.terrain` in the fast tier and by `mission.map` in the slow one. This
+> Dirichlet table is one learned belief shared by the two tiers. The belief over position is a Gaussian, 
+> drawn as its 2σ ellipse with a minimum size so it stays visible; the camera and the fix together keep 
+> it small. `energy_table` is the mission's energy-band transition model, learned online.
+
+<!-- /version -->
+
+<!-- version: v2 -->
+
+> **Left:** Contour map, with each rover's position/heading beliefs, satellite fixes and true path, 
+> and patches colored by the shared map's accumulated certainty about terrain class. A rover's chosen 
+> plan is drawn bold in its color, alternate plans thinner. Plans are rolled forward by the same nonlinear 
+> functions the generative process uses (see [World](#world) below). Suns mark charging sites.
+
+> **Right:** the model: the mission tier in the middle, with the rover models on each side. The Dirichlet
+> table `mission.field` is a single map read by both rovers' `terrain` factors and by `map_1` and `map_2` 
+> in the mission tier. The mission level has one option node per rover, `u_option_1` and `u_option_2`. The 
+> belief over position is a Gaussian, drawn as its 2σ ellipse with a minimum size so it stays visible;
+> the camera and the fix together keep it small. `energy_table` is the mission's energy-band transition 
+> model, learned online from both rovers.
+
+<!-- /version -->
 
 ### Model \[[code](https://github.com/noumenal-labs/hybrid-aif/blob/main/examples/survey_run.py)\]
 
 #### Rover tier \[[code](https://github.com/noumenal-labs/hybrid-aif/blob/main/examples/survey_model.py)\]
+
+<!-- version: v1 -->
 
 - **Sensation.** The vehicle's position is inferred via Bayesian fusion of the satellite `fix` with the 
 camera image (`img`), whose neural likelihood is inverted during inference. The camera also informs a heading 
@@ -153,15 +202,48 @@ a broad preference to be in a given quadrant of the map for surveying, or a prec
 good charging location and wait.
 
   Exploration is driven primarily by novelty on the Dirichlet counts, and also by infogain about
-  position from GPS, which drives the rover to find spots good for localizing. The camera's own
-  infogain is left out: in trials the pose information in its pixels outweighed the rest of the
-  objective and drove the rover to the walls, the only landmarks the renderer offers. A version
-  scoped to the terrain class is the planned follow-up.
+  position from GPS, which drives the rover to find spots good for localizing. The camera infogain 
+  is left out: in trials the pose information in its pixels outweighed the rest of the objective 
+  and drove the rover to the walls, which are the simulation's most visually distinguishable landmarks.
 
 - **Planning.** Planning is via gradient descent on the rover level's expected free energy, from
 four starts and over a horizon of 12 discrete time-steps.
 
+<!-- /version -->
+
+<!-- version: v2 -->
+
+- **Sensation.** A vehicle's position is inferred via Bayesian fusion of the satellite `fix` with its 
+camera image (`img`), whose neural likelihood is inverted during inference. The camera also informs a heading 
+estimate, and the rover's beliefs about terrain classes. The rover senses its battery level via a 
+continuous gauge.
+
+- **Action.** The rover chooses continuous two-dimensional (target speed, turn rate) commands `v`.
+
+- **Inference and learning.** Continuous state appears in the generative model as a six-dimensional 
+`x` (2D position, 2D heading vector, speed, energy). The terrain map is a table of Dirichlet counts 
+`mission.field` shared across both rovers, whose cells are updated in proportion to each rover's 
+discretized position belief, according to the inferred `terrain` classes.
+
+- **Objectives.** Each rover has a continuous preference for its energy `gauge` to be more full. It
+also has a preference to stay within the square region of the map, implemented via a Gaussian
+mixture over the GPS modality. When driven by the mission planner (see below), the rover has either 
+a broad preference to be in a given quadrant of the map for surveying, or a precise one to drive to a 
+good charging location and wait.
+
+  Exploration is driven primarily by novelty on the Dirichlet counts, and also by infogain about
+  position from GPS, which drives the rover to find spots good for localizing. The camera infogain 
+  is left out: in trials the pose information in its pixels outweighed the rest of the objective 
+  and drove the rover to the walls, which are the simulation's most visually distinguishable landmarks.
+
+- **Planning.** Planning is via gradient descent on the rover level's expected free energy, from
+four starts and over a horizon of 12 discrete time-steps, separately for each rover.
+
+<!-- /version -->
+
 #### Mission tier \[[code](https://github.com/noumenal-labs/hybrid-aif/blob/main/examples/survey_scheduler.py)\]
+
+<!-- version: v1 -->
 
 - **Sensation.** The mission tier observes a discretized (8-level) `gauge` reading of the rover's 
 `energy`, as well as the rover's believed position, mapped to a 16 x 16 cell grid over the landscape.
@@ -185,9 +267,55 @@ an empty battery. There's no infogain about location or battery level at this ti
 - **Planning.** Planning at the mission tier is "vanilla" expected-free-energy based policy 
 search with the terms just described, with a horizon of 4 options (= 96 lower-tier steps).
 
+<!-- /version -->
+
+<!-- version: v2 -->
+
+- **Sensation.** For each rover, the mission tier observes a discretized (8-level) `gauge` reading of 
+its `energy`, as well as its believed position, mapped to a 16 x 16 cell grid over the landscape.
+
+- **Action.** Options `u_option` (per rover) are to survey one of the quadrants of the map, or to 
+head for a good charging location. The mission planner's actions accomplish this by setting the rovers' 
+state preferences (effectively, location and speed) for the next 24 ticks at its timescale.
+
+- **Inference and learning.** The rovers' discrete locations `visit_1` and `visit_2` are inferred 
+from `cell_obs` modalities that map a rover's believed location to a grid. The Dirichlet table filled 
+out by the rovers' survey is a parameter shared by the higher-level model, which then informs option 
+selection. The mission tier also learns a transition model of each rover's energy conditional on which 
+option is pursued, from both rovers' readings, starting from weak priors grounded in the rover's 
+machinery.
+
+- **Objectives.** Option choice is driven by expected novelty (parameter infogain) about the 
+map cells, aggregated over the number of distinct cells a rover will visit under the option 
+(measured empirically), and by a terminal-state prior that discourages ending an option with 
+an empty battery. Planning is "sophisticated" in that the map is learned within one rollout:
+imagined cell readings raise working Dirichlet counts, so later readings of that cell earn
+less novelty. There's no infogain about location or battery level at this tier.
+
+- **Planning.** The mission tier plans with a factorised expected-free-energy search: one 
+policy posterior per rover over that rover's option sequences, each updated against the other 
+rover's per-step option marginals by three mean-field iterations, with a horizon of 3 options 
+(= 72 lower-tier steps). Each round thus scores 2 × 343 sequences three times, rather than 
+the 117,649 joint sequences of the product space. The rovers are coupled only through the 
+shared map, which the plan learns as it goes, so cells one rover's plan would read lose novelty 
+for the other, and indirectly through the shared energy table.
+
+
+<!-- /version -->
+
 ### World \[[code](https://github.com/noumenal-labs/hybrid-aif/blob/main/examples/survey_world.py)\]
 
+<!-- version: v1 -->
+
 The generative process of the rover's environment steps the rover's state forward from its current state and command, via the following functions:
+
+<!-- /version -->
+
+<!-- version: v2 -->
+
+The world has no rover-to-rover physics. The generative process steps each rover's state forward from its current state and command via the following functions:
+
+<!-- /version -->
 
 The command is a drive $d \in [0, 1]$ (ratio of target to top speed) and a
 turn $u \in [-1, 1]$. A stall gate $g = \sigma\big((\ell - \ell_{\mathrm{stall}}) / w\big)$ damps the drive
@@ -218,12 +346,40 @@ preference keeps it inside the walls. The rover does model stalls due to battery
 
 ## Performance comparison {#timescales .sub}
 
+<!-- version: v1 -->
+
 Both runs compared here use the same rover, model and world. In the rover-only condition there is no 
 preferred sector. Coverage is defined as the fraction of cells whose maximum posterior class probability
 is above 0.6. After a small early lead for the mission-assisted run, both runs end at similar coverage 
 in the run shown (seed 4). The mission tier decides to charge about 1/3 of the time, and spends most 
 time surveying sector 3. Over five seeds the mission planner ends at 0.657 against 0.670 alone, having led 
 at tick 400 on every seed and on the mean at every checkpoint before 800.
+
+<!-- /version -->
+
+<!-- version: v2 -->
+
+This demo has three arms. **Two rovers, one map, a mission tier over both:** two rovers count
+into one map, and one mission tier chooses an option for each rover every 24 ticks. **Two rovers,
+one map, no mission tier:** the same two rovers, each driven by its own objective, count into one 
+shared map, with no scheduler. **Two rovers alone, the maps pooled afterwards:** two one-rover runs, 
+one from each start, each with its own map; a cell counts as mapped where either rover's own map is 
+confident of it.
+
+The two rovers read one map: the parameter variable `mission.field` is read by both rovers'
+terrain factors and by the scheduler's two map factors. They start at different positions mirrored 
+through the field's centre. The rovers do not observe each other, and the world has no collision 
+between them. The scheduler has two option nodes, `u_option_1` and `u_option_2`, one per rover, 
+each with seven options: a survey of each of the four sectors, and a charge at each of three sites, 
+one per sunny region. It plans with the factorised planner: one posterior per rover over that rover's 
+343 sequences of three options, each updated against the other rover's option marginals by three 
+mean-field sweeps. One energy table, next band × band × cell × option, is shared by the two rovers.
+
+<!-- block: seed-table -->
+
+<!-- block: comparison-figure -->
+
+<!-- /version -->
 
 <!-- block: timeline-figure -->
 > Top to bottom: the option in force (a tick above the band marks each decision, every 24
@@ -234,11 +390,25 @@ at tick 400 on every seed and on the mean at every checkpoint before 800.
 
 ## The camera \[[code](https://github.com/noumenal-labs/hybrid-aif/blob/main/examples/survey_camera.py)\] {#camera .sub}
 
+<!-- version: v1 -->
+
 The rover's forward camera is a 32 by 32 grayscale image along the current actual heading direction.
 The panels show it at 6x scale. The rover's model includes a neural likelihood for the camera image,
 a 4-layer MLP that predicts the picture from the rover's (position, heading) pose and the inferred 
 ground type. Inference inverts the likelihood given the empirical prior over state, linearizing around 
 the belief's mean.
+
+<!-- /version -->
+
+<!-- version: v2 -->
+
+Each rover's forward camera is a 32 by 32 grayscale image along that rover's current actual heading.
+The panels show it at 4x scale. The rover's model includes a neural likelihood for the camera image,
+a 4-layer MLP that predicts the picture from the rover's (position, heading) pose and the inferred 
+ground type. Inference inverts the likelihood given the empirical prior over state, linearizing around 
+the belief's mean.
+
+<!-- /version -->
 
 <!-- block: camera-figure -->
 > **Observed image:** what the camera sees now. **Decoder prediction:** the image the model expects at 
@@ -249,12 +419,7 @@ the belief's mean.
 
 ## Term-by-term objectives {#objective .sub}
 
-The objective depends on the risk + infogain terms described earlier. For intervals, the bar spans the 
-derived lower and upper bounds and the mark is the midpoint, which is what the planner ranks on. Exact 
-terms are points. Switch tiers to compare the rover's gradient
-planner with the mission's exact enumeration of option sequences.
-
-The objective is the sum of the risk and information gain terms described above, and every score is 
+The objective is the sum of the risk and information gain terms described earlier, and every score is 
 reported as an interval: the bar spans the lower and upper bound and the mark is the midpoint, which 
 the planner ranks on. Exact terms are points. A term over a mixture carries a bracket from closed-form 
 entropy bounds; in this demo that is the wall preference on the fix. The rover's terms are marked 
