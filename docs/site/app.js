@@ -1084,7 +1084,7 @@
     });
     if (sl.movement != null) host.insertAdjacentHTML("beforeend", "<p class='decmove'><span class='mono'>" + sl.movement.toExponential(2) + "</span> <span class='muted'>movement: the largest change of a marginal in the last mean-field sweep</span></p>");
     lg.innerHTML = "<span><i style='background:" + termColor("infogain") + "'></i>novelty of the map</span><span><i style='background:" + termColor("risk") + "'></i>" + energyTerm() + "</span><span>&#9670; G</span><span><i style='background:" + css("--muted") + ";opacity:.4'></i>best G per first option (its terms are not kept)</span><span>outlined: the chosen sequence and the option chosen</span>";
-    cap.textContent = "Decision at tick " + d.t + ". Sign convention: every term enters G with its sign applied, so novelty appears negative (lower G is better) and the " + energyTerm() + " positive. A rover's sequence is scored against the other rover's option marginals, so its record carries both rovers' leaves (the map and energy leaves _1 and _2). The record keeps no list of sequences: the terms of the highest-posterior sequence only, and per first option the best G. The chart's axis is fixed over the run so decisions can be compared.";
+    cap.textContent = "Sign convention: every term enters G with its sign applied, so novelty appears negative (lower G is better) and the " + energyTerm() + " positive. A rover's sequence is scored against the other rover's option marginals, so its record carries both rovers' leaves (the map and energy leaves _1 and _2). The record keeps no list of sequences: the terms of the highest-posterior sequence only, and per first option the best G. The chart's axis is fixed over the run so decisions can be compared.";
     drawEnergyTable(d);
   }
   // the scheduler's learned energy table at a decision: the expected change of band over one
@@ -1104,7 +1104,9 @@
       if (!bl || !bl.energy) return;
       var b = argmax(bl.energy); (heres[b] = heres[b] || []).push(rks[k]);
     });
-    var h = "<table><caption>The scheduler's energy model at this decision, learned from its band readings: the expected change of band over one option (in bands), from each band, and in brackets the band changes the case has counted so far." + (joint ? " One table, shared by the rovers, at their believed cells. The last column names the rovers believed to be in each band." : " The band it believes it is in is marked.") + " Options: S1&ndash;S" + nZones() + " survey sectors 1&ndash;" + nZones() + (no > nZones() ? ", C1&ndash;C" + (no - nZones()) + " charge at sites 1&ndash;" + (no - nZones()) : "") + ".</caption><thead><tr><th>from</th>";
+    // the caption is a paragraph above the table, not a <caption>: a caption is as wide as its
+    // table, and the table's width would follow its digits from one decision to the next
+    var h = "<p class='etcap'>The scheduler's energy model at this decision, learned from its band readings: the expected change of band over one option (in bands), from each band, and in brackets the band changes the case has counted so far." + (joint ? " One table, shared by the rovers, at their believed cells. The last column names the rovers believed to be in each band." : " The band it believes it is in is marked.") + " Options: S1&ndash;S" + nZones() + " survey sectors 1&ndash;" + nZones() + (no > nZones() ? ", C1&ndash;C" + (no - nZones()) + " charge at sites 1&ndash;" + (no - nZones()) : "") + ".</p><table" + (joint ? " class='joint'" : "") + "><thead><tr><th>from</th>";
     for (var k = 0; k < no; k++) h += "<th>" + esc(optShort(k)) + "</th>";
     if (joint) h += "<th class='rovcol'>rovers in the band</th>";
     h += "</tr></thead><tbody>";

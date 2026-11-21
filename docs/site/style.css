@@ -232,8 +232,12 @@ tr.grp.total td{font-weight:700;border-top:2px solid var(--fg);background:transp
 td.kind{word-break:normal;white-space:nowrap}
 /* the scheduler's learned energy table, under its decision chart */
 .decenergy{margin-top:.6rem;overflow-x:auto}
-.decenergy table{font-size:.8rem;width:auto;font-variant-numeric:tabular-nums}
-.decenergy caption{caption-side:top;text-align:left;font-size:.82rem;color:var(--muted);padding-bottom:.3rem}
+.decenergy .etcap{font-size:.82rem;color:var(--muted);margin:0 0 .3rem}
+/* fixed columns: the table's width does not follow its digits from one decision to the next */
+.decenergy table{font-size:.8rem;width:100%;min-width:40rem;table-layout:fixed;font-variant-numeric:tabular-nums}
+.decenergy table.joint{min-width:50rem}
+.decenergy thead th:first-child{width:4.4rem}
+.decenergy th.rovcol{width:8.5rem}
 .decenergy th,.decenergy td{padding:.1rem .55rem .1rem 0;text-align:right;white-space:nowrap}
 .decenergy tbody th{text-align:left;font-weight:400}
 .decenergy tr.here th,.decenergy tr.here td{font-weight:700}
