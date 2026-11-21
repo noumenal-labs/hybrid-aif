@@ -111,6 +111,8 @@ are on the roadmap).
 
 ### Overview
 
+<!-- version: v1 -->
+
 In this demo, a solar-powered rover builds a map of a 2.5D environment (a field with continuously 
 varying height), classifying terrain into three kinds (firm, rough, and ice). The rover's battery
 charges in sunlight, which depends on which slopes are shaded. For navigation it relies on a forward 
@@ -118,6 +120,19 @@ camera and a GPS-like satellite signal whose quality varies over the field. The 
 variants: one with just the rover and one a hierarchical model whose second layer is a discrete 
 mission planner that provides options to map a given coarse-grained sector, or to charge the battery
 by heading to one of three locations with optimal sunlight.
+
+<!-- /version -->
+
+<!-- version: v2 -->
+
+In this demo, two solar-powered rovers build a shared map of a 2.5D environment (a field with continuously 
+varying height), classifying terrain into three kinds (firm, rough, and ice). The rovers' batteries
+charge in sunlight, which depends on which slopes are shaded. For navigation they rely on a forward 
+camera and a GPS-like satellite signal whose quality varies over the field. The demo shows two variants:
+one with rovers alone and one a hierarchical model whose second layer is a discrete mission planner
+that provides per-rover options to map a given coarse-grained sector, or to charge the battery. 
+
+<!-- /version -->
 
 <!-- version: v1 -->
 

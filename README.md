@@ -11,21 +11,20 @@ flexibility in specifying models and objective functions.
 ## Solar rover demo
 
 <p align="center">
-  <img src="docs/site/static/rover-map.gif" width="52%" alt="The two-level run of the solar rover demo, one frame every 2 ticks of the 800-tick run">
-  <img src="docs/site/static/rover-graph.png" width="45%" alt="The generative model of the two-level agent: the mission tier over the rover tier">
+  <img src="docs/site/static/rover-map.gif" width="40%" alt="The two-rover run of the solar rover demo under a scheduler, one frame every 2 ticks of the 800-tick run">
+  <img src="docs/site/static/rover-graph.png" width="58%" alt="The generative model of the two-rover agent: the mission tier between the two rovers, with the shared map and energy table">
 </p>
 
-*Contour map, with rover position/heading beliefs, satellite fixes, and patches colored by the
-rover's accumulated certainty about terrain class. The chosen plan's path is drawn in red, alternate
-plans thinner.*
+*Contour map, with each rover's position/heading beliefs, satellite fixes and true path in its
+color, and patches colored by the shared map's accumulated certainty about terrain class. A rover's
+chosen plan is drawn bold in its color, alternate plans thinner.*
 
-In this demo, a solar-powered rover builds a map of a 2.5D environment (a field with continuously
-varying height), classifying terrain into three kinds (firm, rough, and ice). The rover's battery
-charges in sunlight, which depends on which slopes are shaded. For navigation it relies on a forward
-camera and a GPS-like satellite signal whose quality varies over the field. The demo shows two
-variants: one with just the rover and one a hierarchical model (pictured here) whose second layer is a 
-discrete mission planner that provides options to map a given coarse-grained sector, or to charge the 
-battery. 
+In this demo, two solar-powered rovers build a map of a 2.5D environment (a field with continuously
+varying height), classifying terrain into three kinds (firm, rough, and ice). Each rover's battery
+charges in sunlight, which depends on which slopes are shaded. For navigation rovers rely on a forward
+camera and a GPS-like satellite signal whose quality varies over the field. The demo shows two variants:
+one with rovers alone and one a hierarchical model whose second layer is a discrete mission planner
+that provides per-rover options to map a given coarse-grained sector, or to charge the battery. 
 
 See the [project page](https://noumenal-labs.github.io/hybrid-aif/) for the full demo, with details
 on objective terms, description length, and more. The [demo notebook](examples/demo.ipynb) 
