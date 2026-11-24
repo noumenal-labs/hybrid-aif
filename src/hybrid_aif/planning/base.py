@@ -9,7 +9,7 @@ Design: docs/design/system.md "Planning"
 """
 
 from collections.abc import Callable
-from typing import Any, Literal, NamedTuple, Protocol, TypeAlias
+from typing import Any, Literal, NamedTuple, Protocol
 
 from jax import Array
 
@@ -17,7 +17,7 @@ from hybrid_aif.controls import FLOAT, LEVEL, ControlLayout, ControlTable
 from hybrid_aif.distributions import Categorical
 from hybrid_aif.objectives.base import TermTree
 
-Beliefs: TypeAlias = Any
+type Beliefs = Any
 """Opaque belief pytree threaded through a planner's scan.
 
 Planners never introspect beliefs; the System's closures define their meaning.
