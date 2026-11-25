@@ -368,8 +368,7 @@ preferred sector. Coverage is defined as the fraction of cells whose maximum pos
 is above 0.6. In the run shown (seed 4) the mission-assisted run leads for the first half, trails the 
 rover alone for a stretch after tick 450, and ends ahead, at 0.742 against 0.688. The mission tier decides 
 to charge about 1/3 of the time, and spends most time surveying sector 3. Over five seeds the mission 
-planner ends at 0.713 against 0.684 alone (sample sd 0.030 and 0.049), ahead on four seeds of five. It 
-leads on the mean at every checkpoint (ticks 200, 400, 600 and 800), and at tick 400 on three seeds of five.
+planner ends at 0.713 against 0.684 alone (sample sd 0.030 and 0.049), ahead on 4/5 seeds.
 
 <!-- /version -->
 
