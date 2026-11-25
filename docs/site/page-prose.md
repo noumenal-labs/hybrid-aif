@@ -365,10 +365,11 @@ preference keeps it inside the walls. The rover does model stalls due to battery
 
 Both runs compared here use the same rover, model and world. In the rover-only condition there is no 
 preferred sector. Coverage is defined as the fraction of cells whose maximum posterior class probability
-is above 0.6. After a small early lead for the mission-assisted run, both runs end at similar coverage 
-in the run shown (seed 4). The mission tier decides to charge about 1/3 of the time, and spends most 
-time surveying sector 3. Over five seeds the mission planner ends at 0.657 against 0.670 alone, having led 
-at tick 400 on every seed and on the mean at every checkpoint before 800.
+is above 0.6. In the run shown (seed 4) the mission-assisted run leads for the first half, trails the 
+rover alone for a stretch after tick 450, and ends ahead, at 0.742 against 0.688. The mission tier decides 
+to charge about 1/3 of the time, and spends most time surveying sector 3. Over five seeds the mission 
+planner ends at 0.713 against 0.684 alone (sample sd 0.030 and 0.049), ahead on four seeds of five. It 
+leads on the mean at every checkpoint (ticks 200, 400, 600 and 800), and at tick 400 on three seeds of five.
 
 <!-- /version -->
 
