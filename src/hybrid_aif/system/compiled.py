@@ -46,8 +46,10 @@ Design: docs/design/recompilation.md R6, R7.
 from __future__ import annotations
 
 import collections
+import contextlib
 import functools
 import inspect
+import weakref
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -225,8 +227,32 @@ def _complete_priors(system, params, priors, face: str):
 # The body of each runs once per trace, which is what ``_TRACES`` counts.
 
 _TRACES: collections.Counter = collections.Counter()
+_SNAPSHOT_LIMIT = 256
+
+
+class _SnapshotStore(collections.OrderedDict):
+    """Bounded LRU store of the last traced signature per ``(face, System)``."""
+
+    def __init__(self, limit: int = _SNAPSHOT_LIMIT) -> None:
+        super().__init__()
+        self.limit = limit
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        return default
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self.limit:
+            self.popitem(last=False)
+
+
 #: The last traced call signature per ``(face, System)``, shared by every watcher.
-_SNAPSHOTS: dict = {}
+_SNAPSHOTS: _SnapshotStore = _SnapshotStore()
 
 
 def _counted(face: str) -> Callable:
@@ -382,6 +408,11 @@ class CompiledSystem:
             ident: Any = system
         except TypeError:  # pragma: no cover  a System holding an unhashable field
             ident = id(system)
+            with contextlib.suppress(TypeError):
+                weakref.finalize(
+                    system,
+                    lambda i=ident: [_SNAPSHOTS.pop((face, i), None) for face in FACES],
+                )
         self._watched = {
             face: debug.watch(
                 _JITS[face],
