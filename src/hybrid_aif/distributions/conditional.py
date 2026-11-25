@@ -141,6 +141,11 @@ class _TabularConditional(Conditional):
         return self._table.shape[self._child_axis]
 
     def _check(self) -> None:
+        if isinstance(self.parent_ndims, bool) or not isinstance(self.parent_ndims, int):
+            raise TypeError(
+                "parent_ndims must be an int count of parent axes (e.g. parent_ndims=2), "
+                f"not a shape or {type(self.parent_ndims).__name__}: got {self.parent_ndims!r}"
+            )
         if self.parent_ndims < 1:
             raise ValueError(f"need parent_ndims >= 1, got {self.parent_ndims}")
         if self._table.ndim < self.parent_ndims + 1:

@@ -383,11 +383,8 @@ class VehicleStep(eqx.Module):
 
 
 #  the motion's class is named for the model's description (``describe`` writes code by name);
-#  a second import of this module in one interpreter finds the name taken and keeps the first
-try:
-    register_transition("survey.vehicle", VehicleStep)
-except ValueError:
-    pass
+#  replace=True keeps reloads / %autoreload bound to the freshly defined VehicleStep class
+register_transition("survey.vehicle", VehicleStep, replace=True)
 
 
 def top_speed():
