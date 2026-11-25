@@ -98,8 +98,9 @@ tuple containers do not load (dict leaves flatten in sorted-name order).
 >    convention governs tabular families only
 >    (`distributions/conditional.py:21`).
 >
-> Two more worth knowing: `num_controls[f]` is `1`, not `0`, for an
-> uncontrolled factor; and observations are typed per modality — an `int32`
+> Two more worth knowing: the trailing control axis has size `1`, not `0`, for an
+> uncontrolled discrete factor (`System` no longer carries a public `num_controls`
+> field — sizes are inferred from the transition tables); and observations are typed per modality — an `int32`
 > level index for a tabular modality, a float array for an LG one.
 >
 > A **memoryless** (reactive) factor is `B_deps[f] = ()` with a table of shape

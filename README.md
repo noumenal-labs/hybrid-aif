@@ -1,11 +1,11 @@
-# Hybrid-AIF: <br> Continuous-discrete-amortized active inference +
+# Hybrid-AIF: <br> Continuous-discrete-amortized active inference
 
 A software package (in active development, and in many respects experimental; see
 `docs/capabilities.md`) aimed at production-grade, potentially large-scale implementations of
 active inference (AIF): parallel policy search in JAX, vectorised over policies and vmappable
 over agents; continuous and discrete observations and state factors, including mixtures and
 switching structure; closed-form conjugate updates, fixed-point variational inference for 
-discrete factors, and linearised and amortized (neural) inference in the same model"; and 
+discrete factors, and linearised and amortized (neural) inference in the same model; and 
 flexibility in specifying models and objective functions.
 
 ## Solar rover demo
@@ -64,7 +64,7 @@ terminal-state constraint (this is still aspirational in full generality, but co
 
 The library's design philosophy also adopts the lens that any physical system (including classical "agents" as well as their components and environments) can be 
 formalized in terms of appropriately nested or coupled subsystems — this led to the main workhorse/abstraction in the library, the `System`. Each such system can
-be translated into a canonical document with an associated description length (model + optional data cost in nats), which might also serve as the basis of AI agent-assisted model search. See next README section for more detail.
+be translated into a canonical document with an associated description length (model + optional data cost in nats), which might also serve as the basis of AI agent-assisted model search. See `docs/description-format.md` for more detail.
 
 ## Use of software agents
 
