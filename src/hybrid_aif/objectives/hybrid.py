@@ -58,6 +58,7 @@ from hybrid_aif.distributions import (
     MLPConditional,
 )
 from hybrid_aif.distributions.gaussian import sigma_points
+from hybrid_aif.distributions.truncated import TruncatedGaussian
 from hybrid_aif.factors import (
     LGObservation,
     LinearGaussianObservation,
@@ -1246,6 +1247,18 @@ class _LGInputs:
         self.shared = shared
 
 
+def _control_root(v) -> Array:
+    """Square-root factor ``L`` with ``L Lᵀ = Cov(v)``, finite on zero-variance boxes."""
+    if isinstance(v, Gaussian):
+        return v.chol
+    if isinstance(v, TruncatedGaussian):
+        var = v.variance()
+        pos = var > 0.0
+        sd = jnp.where(pos, jnp.sqrt(jnp.where(pos, var, 1.0)), 0.0)
+        return sd[..., :, None] * jnp.eye(v.dim, dtype=sd.dtype)
+    return jnp.linalg.cholesky(v.cov)
+
+
 def _lg_inputs(B_f: LinearGaussianTransition, read, entries: dict[int, object]) -> _LGInputs:
     """Index ``B_f``'s discrete control axes at their levels and gather its ``G u`` input.
 
@@ -1277,7 +1290,7 @@ def _lg_inputs(B_f: LinearGaussianTransition, read, entries: dict[int, object]) 
             for v in values:
                 if is_distribution(v):
                     means.append(jnp.asarray(v.mean(), jnp.float32))
-                    root = v.chol if isinstance(v, Gaussian) else jnp.linalg.cholesky(v.cov)
+                    root = _control_root(v)
                     roots.append(jnp.asarray(root, jnp.float32))
                 else:
                     v = jnp.asarray(v, jnp.float32)
@@ -1446,7 +1459,7 @@ def _nl_inputs(
             levels.append(level)
             controls.append(level)
         elif is_distribution(entry):
-            root = entry.chol if isinstance(entry, Gaussian) else jnp.linalg.cholesky(entry.cov)
+            root = _control_root(entry)
             mean = jnp.asarray(entry.mean(), jnp.float32)
             beliefs.append((at, mean, jnp.asarray(root, jnp.float32)))
             controls.append(None)

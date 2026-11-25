@@ -58,6 +58,7 @@ import numpy as np
 from jax import Array
 
 from hybrid_aif.distributions import Categorical, Gaussian, TruncatedGaussian
+from hybrid_aif.distributions.gaussian import cholesky_of_inverse
 from hybrid_aif.interval import Interval
 from hybrid_aif.objectives.base import TermTree, total
 from hybrid_aif.planning.base import (
@@ -430,8 +431,7 @@ def _laplace(score, plan: Array, gamma: float) -> Gaussian:
     if not isinstance(smallest, jax.core.Tracer) and not bool(smallest > 0.0):
         raise ValueError(f"{_NOT_PD} (smallest eigenvalue {float(smallest):.3g})")
     precision = eqx.error_if(precision, ~(smallest > 0.0), _NOT_PD)
-    cov = jnp.linalg.inv(precision)
-    return Gaussian.from_cov(flat, 0.5 * (cov + cov.T))
+    return Gaussian(loc=flat, chol=cholesky_of_inverse(precision))
 
 
 def make_gradient_planner(**kwargs) -> Planner:
