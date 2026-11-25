@@ -370,6 +370,11 @@ rover alone for a stretch after tick 450, and ends ahead, at 0.742 against 0.688
 to charge about 1/3 of the time, and spends most time surveying sector 3. Over five seeds the mission 
 planner ends at 0.713 against 0.684 alone (sample sd 0.030 and 0.049), ahead on 4/5 seeds.
 
+Coverage measures the map's confidence, not its correctness. Checked against the true terrain in the 
+run shown, with a cell's true class taken to be the one covering most of its area, 182 of the 190 cells 
+the mission-assisted run has mapped at tick 800 are right (96%), and 171 of the rover-only run's 176 (97%). 
+All but one of the wrong cells straddle a boundary between terrain patches.
+
 <!-- /version -->
 
 <!-- version: v2 -->
@@ -393,6 +398,11 @@ mean-field sweeps. One energy table, next band × band × cell × option, is sha
 <!-- block: seed-table -->
 
 <!-- block: comparison-figure -->
+
+Coverage measures the map's confidence, not its correctness. Checked against the true terrain in the 
+run shown (seed 3), with a cell's true class taken to be the one covering most of its area, 216 of the 
+222 cells mapped at tick 800 under the mission tier are right (97%), and 219 of 223 without it (98%). 
+Every wrong cell straddles a boundary between terrain patches.
 
 <!-- /version -->
 
