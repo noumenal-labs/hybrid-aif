@@ -42,6 +42,21 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/hybrid_aif"]
 
+# The source archive holds the package, its tests and examples, the guides, the design notes and
+# the experiments' write-ups. The project page (docs/site), the experiments' raw run outputs and
+# the API pages stay in the repository.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/examples",
+    "/docs/*.md",
+    "/docs/design",
+    "/docs/experiments/**/*.md",
+    "/CHANGELOG.md",
+    "/CITATION.cff",
+]
+
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
