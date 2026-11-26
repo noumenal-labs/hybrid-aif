@@ -21,6 +21,7 @@ bounds nothing.
 Design: docs/design/amortization.md A4, A12; docs/design/objective-terms.md
 """
 
+import math
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
@@ -40,7 +41,7 @@ register_term("predicted_reward", -1.0)
 register_term("g_tail", -1.0)
 register_term("model_uncertainty", 1.0)
 
-_LOG_2PI = float(jnp.log(2.0 * jnp.pi))
+_LOG_2PI = math.log(2.0 * math.pi)
 
 #: The block key of a single-leaf row: it names the conditional the row read.
 CRITIC_BLOCK = "critic"

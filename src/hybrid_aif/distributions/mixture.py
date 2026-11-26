@@ -73,7 +73,9 @@ class MixtureGaussian(Distribution):
         z = jax.random.categorical(
             key_z, self.log_weights, shape=sample_shape + self.batch_shape
         ).astype(jnp.int32)
-        eps = jax.random.normal(key_x, sample_shape + self.batch_shape + (self.dim,))
+        eps = jax.random.normal(
+            key_x, sample_shape + self.batch_shape + (self.dim,), dtype=self.means.dtype
+        )
         # Gather the chosen component per draw straight from the K axis (the
         # unit sample axes broadcast inside the gather; nothing is materialised).
         lead = (None,) * len(sample_shape)

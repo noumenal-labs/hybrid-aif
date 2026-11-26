@@ -381,7 +381,7 @@ class ConditionalDirichlet(_TabularConditional):
         """Draw a CPD table from the posterior: one independent Dirichlet draw per
         parent configuration, returned in the child-first ``concentration`` layout."""
         conc = jnp.moveaxis(self.concentration, self._child_axis, -1)
-        draw = jax.random.dirichlet(key, conc)
+        draw = jax.random.dirichlet(key, conc, dtype=conc.dtype)
         return jnp.moveaxis(draw, -1, self._child_axis)
 
     def condition_on(self, parent_indices: tuple[Array | int, ...]) -> Dirichlet:

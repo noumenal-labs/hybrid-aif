@@ -23,6 +23,8 @@ moments. Sampling is reparameterised through the inverse CDF, inverted in log sp
 Design: docs/design/control-states.md C4 (Bounded Gaussian).
 """
 
+import math
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -32,8 +34,8 @@ from jax.scipy.special import log_ndtr, ndtri
 from hybrid_aif.distributions.base import Distribution
 from hybrid_aif.interval import Interval
 
-_LOG_2PI = float(jnp.log(2.0 * jnp.pi))
-_LOG_2 = float(jnp.log(2.0))
+_LOG_2PI = math.log(2.0 * math.pi)
+_LOG_2 = math.log(2.0)
 #: Newton steps of the log-space inverse CDF (quadratic convergence from the asymptotic start).
 _NEWTON_STEPS = 8
 #: Beyond this many standard deviations a box's moments come from the tail forms (see

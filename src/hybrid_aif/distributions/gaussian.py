@@ -5,6 +5,8 @@ Stored parameterization: ``mean`` and lower-triangular Cholesky factor ``chol``
 ``(dim,)``. Natural view: ``eta1 = Σ⁻¹ μ``, ``eta2 = -0.5 Σ⁻¹``.
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax import Array
@@ -13,7 +15,7 @@ from jax.scipy.linalg import cho_solve, solve_triangular
 from hybrid_aif.distributions.base import ExponentialFamily
 from hybrid_aif.interval import Interval
 
-_LOG_2PI = jnp.log(2.0 * jnp.pi)
+_LOG_2PI = math.log(2.0 * math.pi)
 
 
 class Gaussian(ExponentialFamily):
@@ -73,7 +75,9 @@ class Gaussian(ExponentialFamily):
         return -0.5 * (self.dim * _LOG_2PI + maha) - self._half_log_det()
 
     def sample(self, key: Array, sample_shape: tuple[int, ...] = ()) -> Array:
-        eps = jax.random.normal(key, sample_shape + self.batch_shape + (self.dim,))
+        eps = jax.random.normal(
+            key, sample_shape + self.batch_shape + (self.dim,), dtype=self.loc.dtype
+        )
         return self.loc + (self.chol @ eps[..., None])[..., 0]
 
     def mean(self) -> Array:

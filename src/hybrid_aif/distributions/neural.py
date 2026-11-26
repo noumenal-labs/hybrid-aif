@@ -30,6 +30,7 @@ no bias; the head layer is never normed and keeps its bias.
 Design: docs/design/amortization.md A1, A2, A9, A10
 """
 
+import math
 from typing import NamedTuple
 
 import equinox as eqx
@@ -61,7 +62,7 @@ def adam(eps: float = DEFAULT_EPS) -> optax.GradientTransformation:
     return optax.adam(1.0, eps=float(eps))
 
 
-_LOG_2PI = float(jnp.log(2.0 * jnp.pi))
+_LOG_2PI = math.log(2.0 * math.pi)
 
 _ACTIVATIONS = {
     "tanh": jnp.tanh,
