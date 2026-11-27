@@ -468,7 +468,7 @@ def test_a_composite_with_a_routed_view_pins_its_trajectory():
     four rounds of ``same_step_zoo/sequential`` in ``tests/data/run_parity.npz``, which pinned
     ``[3, 4, 1, 1]`` and ``[0, 3, 3, 3, 3]``); under ``run``'s own keys they are pinned below, and
     are the same, since the planner is deterministic and the world's tables exact."""
-    from tests.test_run_parity import FIXTURE, _run_old_keys, idle, states
+    from tests.test_run_parity import FIXTURE, _run_old_keys, as_recorded, idle, states
 
     comp, cp, _ = _zoo()
     system, params = with_mirror(comp, cp)
@@ -481,7 +481,9 @@ def test_a_composite_with_a_routed_view_pins_its_trajectory():
     assert levels == [3, 4, 1, 1]
     location = states(traj, "world.world.location").tolist()
     assert location == FIXTURE["same_step_zoo/sequential/world.location"][:5].tolist()
-    traj = run(system, params, 4, KEY, steps, tick_order="sequential", record_carries=True)
+    traj = run(
+        system, as_recorded(params), 4, KEY, steps, tick_order="sequential", record_carries=True
+    )
     assert [int(a) for a in traj[f"{M}agent"].emitted["a_location"]] == PINNED_LEVELS
     assert states(traj, "world.world.location").tolist() == PINNED_LOCATION
 
@@ -569,7 +571,7 @@ def test_a_merged_robot_with_durations_coupled_to_a_world_decides_once_per_optio
     ``m.a`` for its option, ``m.b`` and the world step every round. Under the key layout of the
     merge as the one mind of the wired form, ``a`` held for its option inside it, the moves, the
     corridor and the number of decisions are what that form recorded."""
-    from tests.test_run_parity import states
+    from tests.test_run_parity import as_recorded, states
 
     system, params = _held_robots()
     steps = {
@@ -579,7 +581,9 @@ def test_a_merged_robot_with_durations_coupled_to_a_world_decides_once_per_optio
     }
     first, second = _wired_layout()
     with first, second:
-        rec = run(system, params, 20, KEY, steps, tick_order=order, record_carries=True)
+        rec = run(
+            system, as_recorded(params), 20, KEY, steps, tick_order=order, record_carries=True
+        )
     moves = np.asarray(rec["m.a"].emitted["move"])
     rounds, t, decisions = {0: 4, 1: 2, 2: 4}, 0, 0
     while t < len(moves):

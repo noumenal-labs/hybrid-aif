@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from hybrid_aif.distributions import Categorical, MixtureGaussian, MLPConditional
+from hybrid_aif.dtypes import tree_float_dtype
 from hybrid_aif.factors import LGObservation, TabularObservation
 from hybrid_aif.inference import amortized as _amortized
 from hybrid_aif.inference import emission as _emission
@@ -230,7 +231,7 @@ def _joint_weights(system, q, out, axes: tuple[int, ...], f: int) -> Array:
     configuration, otherwise the configurations weigh by the mode beliefs.
     """
     if not isinstance(q, MixtureGaussian):
-        return jnp.ones((1, 1))
+        return jnp.ones((1, 1), q.loc.dtype)
     w = jax.nn.softmax(q.log_weights, axis=-1)
     if not axes:
         return w[:, None]
@@ -481,7 +482,12 @@ def _infer_states_expected(
     def _detail() -> InferenceDetail | None:
         if not detail:
             return None
-        total = jnp.zeros(()) if free_energy[0] is None else free_energy[0]
+        if free_energy[0] is None:  # the sum starts in the dtype of the terms it adds
+            terms = [t for t in (*evidence_terms, *message_terms) if t is not None]
+            dtype = jnp.result_type(*terms) if terms else tree_float_dtype(params.likelihood)
+            total = jnp.zeros((), dtype)
+        else:
+            total = free_energy[0]
         for ev in evidence_terms:
             if ev is not None:
                 total = total - ev
@@ -489,7 +495,7 @@ def _infer_states_expected(
             total = total + term
         for entry in system.recognition or ():  # an absent entry's normaliser is zero
             if entry.variable in system._facs:
-                message_log_z.setdefault(f"recognition:{entry.variable}", jnp.zeros(()))
+                message_log_z.setdefault(f"recognition:{entry.variable}", jnp.zeros_like(total))
         return InferenceDetail(
             pre_reduce=tuple(pre_reduce),
             mode_log_evidence=tuple(mode_log_ev),
@@ -636,7 +642,7 @@ def _infer_states_expected(
         for m in emission_m:
             shape = tuple(priors[f].probs.shape[-1] for f in A_deps[m])
             if masks is not None and masks[m] is False:
-                sub_lls.append(jnp.zeros((1, *shape)))
+                sub_lls.append(jnp.zeros((1, *shape), tree_float_dtype(params.likelihood[m])))
             else:
                 sub_lls.append(
                     _emission.emission_log_likelihood(params.likelihood[m], observations[m], shape)
@@ -645,7 +651,7 @@ def _infer_states_expected(
         for m in neural_tab_m:
             shape = tuple(priors[f].probs.shape[-1] for f in A_deps[m])
             if masks is not None and masks[m] is False:
-                sub_lls.append(jnp.zeros((1, *shape)))
+                sub_lls.append(jnp.zeros((1, *shape), tree_float_dtype(params.likelihood[m])))
             else:
                 sub_lls.append(
                     _neural_table(
@@ -825,7 +831,8 @@ def _infer_states_expected(
         # modality's update so it multiplies the posterior the tick's evidence has left
         f, present = ms.factor, ms.present
         d = ms.loc.shape[-1]
-        H, c, R_chol = jnp.eye(d), jnp.zeros(d), jnp.diag(ms.scale)
+        R_chol = jnp.diag(ms.scale)
+        H, c = jnp.eye(d, dtype=R_chol.dtype), jnp.zeros(d, R_chol.dtype)
         before = None if present is True else list(out)
         if families[f] == _hybrid.MIXTURE:
             posterior, log_z, _ = _condition_mixture(
@@ -849,7 +856,7 @@ def _infer_states_expected(
         for m in sorted(covered):
             a = params.likelihood[m]
             present = True if masks is None else masks[m]
-            term = jnp.zeros(())
+            term = jnp.zeros((), tree_float_dtype((a, out)))  # an absent modality's term
             if present is not False:
                 term = expected_nll(system, a, m, observations[m], out, priors, families, s)
                 term = term if present is True else jnp.where(present, term, 0.0)

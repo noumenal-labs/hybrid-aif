@@ -66,7 +66,7 @@ def _numpy_prequential(system, params, observations, actions, learn: bool, prese
     """The canonical loop on one categorical factor, in NumPy: infer exactly, learn the sense
     table from the second tick on where it was observed, step the prior through the
     transition on the recorded action; the free energies and the counts at the end."""
-    conc = np.asarray(params.likelihood["sense"].concentration, np.float64)
+    conc = np.array(params.likelihood["sense"].concentration, np.float64)  # a writable copy
     ident = _lowered(params.likelihood["ident"])
     B = np.exp(np.asarray(params.transition["s"].log_table, np.float64))
     prior = np.exp(np.asarray(params.initial_state_prior["s"].log_probs, np.float64))
@@ -426,7 +426,9 @@ def test_describe_parameters_reads_the_envelope_off_the_document():
     by_name = {r.address: r for r in records}
     assert by_name["B_location"].shape == (5, 5, 5)
     assert by_name["B_location"].domain == "log_simplex"
-    assert by_name["B_location"].source == "clamp" and by_name["B_location"].dtype == "float32"
+    default = "float64" if jax.config.jax_enable_x64 else "float32"  # tmaze_system's dtype
+    assert params.transition["location"].log_table.dtype == default
+    assert by_name["B_location"].source == "clamp" and by_name["B_location"].dtype == default
     assert all(r.source == "clamp" for r in records)
     assert len(records) == len(
         [v for v in document["variables"] if v in document.get("clamps", {})]

@@ -915,11 +915,12 @@ class Deterministic(eqx.Module):
         norm: bool = True,
         frozen: bool = False,
         init: str = "default",
+        dtype: object = None,
     ) -> "Deterministic":
         """An RSSM's carry node: a :class:`~hybrid_aif.distributions.neural.GRUCell`
         over ``(deter, *inputs)``, with ``input_dims`` the widths of the non-carry
         inputs — for an RSSM ``(num_vars·num_classes, action_dim)``, the previous
-        flattened one-hot ``stoch`` and the action. ``init`` is the cell's."""
+        flattened one-hot ``stoch`` and the action. ``init`` and ``dtype`` are the cell's."""
         return cls(
             map=GRUCell.from_shapes(
                 deter_dim,
@@ -929,6 +930,7 @@ class Deterministic(eqx.Module):
                 activation=activation,
                 norm=norm,
                 init=init,
+                dtype=dtype,
             ),
             rule="carry",
             frozen=frozen,

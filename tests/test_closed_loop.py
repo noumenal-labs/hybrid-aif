@@ -1082,8 +1082,30 @@ def test_a_plan_over_32_bit_beliefs_and_64_bit_noise_is_scored_in_64_bit():
 
 
 def test_a_32_bit_model_is_planned_in_32_bit_under_64_bit_mode():
+    """Every float leaf float32, the control box included: the score and the plan are float32
+    under 64-bit mode."""
     with jax.enable_x64(True):
         system, params = small_lg()
         narrow = _in_dtype(params, jnp.float32)
-        tree = system.infer_policies(narrow, {"x": narrow.initial_state_prior["x"]})[1]
+        assert narrow.control["u_x"].low.dtype == jnp.float32
+        _, tree, plans = system.infer_policies(
+            narrow, {"x": narrow.initial_state_prior["x"]}, return_policies=True
+        )
         assert total(tree).midpoint.dtype == jnp.float32
+        assert plans.dtype == jnp.float32
+
+
+def test_a_64_bit_model_is_planned_and_scored_in_64_bit():
+    """Under 64-bit mode an all-float64 model, its control box included, is planned with a
+    float64 plan, and its score tells a plan from the same plan shifted by 1e-10."""
+    with jax.enable_x64(True):
+        system, params = small_lg()
+        wide = _in_dtype(params, jnp.float64)
+        prior = {"x": wide.initial_state_prior["x"]}
+        _, _, plans = system.infer_policies(wide, prior, return_policies=True)
+        assert plans.dtype == jnp.float64
+        plan = jnp.asarray(PLAN, jnp.float64)
+        g = total(system.score_policies(wide, prior, plan)).midpoint
+        shifted = total(system.score_policies(wide, prior, plan + 1e-10)).midpoint
+        assert g.dtype == jnp.float64
+        assert float(g) != float(shifted)

@@ -61,7 +61,7 @@ KEEP = 0.5  # the share of the forward speed kept per tick; the rest moves to th
 GAIN = (1.0 - KEEP) * TOP_SPEED  # forward speed added per tick per unit of the drive command
 COMMAND_LOW = (0.0, -1.0)  # the command (drive, turn): drive from stop to full, turn either way
 COMMAND_HIGH = (1.0, 1.0)
-TURN_MAX = np.deg2rad(20.0)  # the heading turns at most this far per tick (in place too)
+TURN_MAX = float(np.deg2rad(20.0))  # the heading turns at most this far per tick (in place too)
 #  process sd per state coordinate: position, heading pair, speed, energy level
 STATE_SD = np.asarray([0.005, 0.005, 0.01, 0.01, 0.004, 0.004])
 STATE_NAMES = ("x", "y", "cos heading", "sin heading", "forward speed", "energy level")
@@ -77,8 +77,8 @@ ICE_PATCHES = (((1.4, 2.1), 0.9),)  # in the low basin
 ROUGH_PATCHES = (((3.6, 0.2), 0.8), ((-0.2, 2.6), 0.6))
 ICE_PATCH = ICE_PATCHES[0]
 
-SUN_AZIMUTH = np.deg2rad(200.0)
-SUN_ELEVATION = np.deg2rad(35.0)
+SUN_AZIMUTH = float(np.deg2rad(200.0))
+SUN_ELEVATION = float(np.deg2rad(35.0))
 N_AZIMUTH = 16
 HORIZON_RANGE = 4.0
 HORIZON_STEP = 0.1
@@ -127,9 +127,9 @@ ZONES = (len(ZONE_EDGES[0]) - 1) * (len(ZONE_EDGES[1]) - 1)
 IMG_SIDE = 32
 IMG_PIXELS = IMG_SIDE * IMG_SIDE
 PIXEL_SD = 0.04
-FOCAL = (IMG_SIDE / 2) / np.tan(np.deg2rad(35.0))  # pixels: a 70 degree field of view
+FOCAL = float((IMG_SIDE / 2) / np.tan(np.deg2rad(35.0)))  # pixels: a 70 degree field of view
 CAMERA_HEIGHT = 0.12  # the lens above the ground under the rover
-CAMERA_TILT = np.deg2rad(8.0)  # the lens points this far below the rover's forward axis
+CAMERA_TILT = float(np.deg2rad(8.0))  # the lens points this far below the rover's forward axis
 NEAR, REACH, MARCH = 0.15, 5.0, 96  # the ray march: nearest and farthest distance, samples
 SUBCOLUMNS = 3  # rays per pixel across its width (the pixel's footprint, a midpoint rule)
 WALL_EDGE = 0.05  # the ground's albedo ramps to WALL_ALBEDO over this width across a wall
@@ -174,8 +174,8 @@ YS = np.linspace(FIELD[1][0], FIELD[1][1], GRID_N)
 _GX, _GY = np.meshgrid(XS, YS, indexing="ij")  # arrays are indexed [ix, iy]
 _H0 = _height_fn(_GX, _GY)
 HEIGHT = _H0 - _H0.min()
-_DX = XS[1] - XS[0]
-_DY = YS[1] - YS[0]
+_DX = float(XS[1] - XS[0])
+_DY = float(YS[1] - YS[0])
 
 
 def _bilinear_np(table, x, y):
@@ -248,8 +248,8 @@ def _lookup(table):
     t = jnp.asarray(table, jnp.float32)
 
     def f(xy):
-        fx = jnp.clip((xy[0] - XS[0]) / _DX, 0, GRID_N - 1)
-        fy = jnp.clip((xy[1] - YS[0]) / _DY, 0, GRID_N - 1)
+        fx = jnp.clip((xy[0] - float(XS[0])) / _DX, 0, GRID_N - 1)
+        fy = jnp.clip((xy[1] - float(YS[0])) / _DY, 0, GRID_N - 1)
         return map_coordinates(t, [fx, fy], order=1, mode="nearest")
 
     return f
@@ -365,7 +365,8 @@ class VehicleStep(eqx.Module):
     on every terrain."""
 
     def __call__(self, x, controls):
-        a = jnp.clip(controls[0], jnp.asarray(COMMAND_LOW), jnp.asarray(COMMAND_HIGH))
+        dtype = jnp.result_type(x, controls[0])  # the bounds in the dtype of the values
+        a = jnp.clip(controls[0], jnp.asarray(COMMAND_LOW, dtype), jnp.asarray(COMMAND_HIGH, dtype))
         g = drive_share(x[5])
         norm = jnp.sqrt(x[2] ** 2 + x[3] ** 2) + 1e-6
         c, s = x[2] / norm, x[3] / norm
@@ -450,7 +451,7 @@ def texture(points, terrain):
     pattern as the rover moves and turns."""
     w = jnp.asarray(WAVES)[terrain]  # (TEXTURE_WAVES, 3)
     phase = points[..., 0, None] * w[:, 0] + points[..., 1, None] * w[:, 1] + w[:, 2]
-    wave = jnp.sum(jnp.cos(phase), axis=-1) / np.sqrt(TEXTURE_WAVES / 2)
+    wave = jnp.sum(jnp.cos(phase), axis=-1) / float(np.sqrt(TEXTURE_WAVES / 2))
     amp = jnp.asarray(TEXTURE_AMP, jnp.float32)[terrain]
     return jnp.asarray(ALBEDO, jnp.float32)[terrain] * (1.0 + amp * jnp.tanh(wave))
 
@@ -647,10 +648,10 @@ def observe(key, state):
     band_p = jnp.asarray(gauge_table(), jnp.float32)[:, band_of(level)]  # readings given the band
     image = render(state["x"], state["terrain"], heading_of(state["x"]))
     return {
-        "gauge": level[None] + GAUGE_SD * jax.random.normal(k_gauge, (1,)),
+        "gauge": level[None] + GAUGE_SD * jax.random.normal(k_gauge, (1,), level.dtype),
         "band": jax.random.categorical(k_band, jnp.log(band_p)).astype(jnp.int32),
-        "fix": pos + sd_fix(pos) * jax.random.normal(k_fix, (2,)),
-        "img": image + PIXEL_SD * jax.random.normal(k_img, (IMG_PIXELS,)),
+        "fix": pos + sd_fix(pos) * jax.random.normal(k_fix, (2,), pos.dtype),
+        "img": image + PIXEL_SD * jax.random.normal(k_img, (IMG_PIXELS,), image.dtype),
     }
 
 
@@ -660,8 +661,9 @@ def move(key, state, command):
     plus noise of sd ``STATE_SD``, the heading renormalised to a unit vector, the level held in
     ``[0, ENERGY_MAX]``, and where the world differs from the model: the field has walls (the
     position is clipped to them and a rover that hits one stops)."""
-    a = jnp.clip(command, jnp.asarray(COMMAND_LOW), jnp.asarray(COMMAND_HIGH))
-    noise = jnp.asarray(STATE_SD, jnp.float32) * jax.random.normal(key, (6,))
+    dtype = state["x"].dtype  # the draws and the constants in the state's dtype
+    a = jnp.clip(command, jnp.asarray(COMMAND_LOW, dtype), jnp.asarray(COMMAND_HIGH, dtype))
+    noise = jnp.asarray(STATE_SD, dtype) * jax.random.normal(key, (6,), dtype)
     x = VehicleStep()(state["x"], (a,)) + noise
     norm = jnp.sqrt(x[2] ** 2 + x[3] ** 2)
     lo = jnp.asarray([FIELD[0][0], FIELD[1][0]], jnp.float32)

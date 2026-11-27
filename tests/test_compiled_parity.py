@@ -205,8 +205,13 @@ def test_tmaze_compiled_path_matches_reference():
 # --------------------------------------------- (b) synthetic multi-factor, everything on
 
 
+#: The synthetic model's draws are float32 in either mode, so its tables (and the values pinned
+#: from them) are one model under JAX's 64-bit mode too.
+F32 = jnp.float32
+
+
 def _rand_table(key, shape, child_axis):
-    x = jax.random.uniform(key, shape, minval=0.1, maxval=1.0)
+    x = jax.random.uniform(key, shape, F32, minval=0.1, maxval=1.0)
     return x / x.sum(axis=child_axis, keepdims=True)
 
 
@@ -223,7 +228,7 @@ def synthetic_system(decomposition, epistemic, policy_len=2):
     B_shapes = [(ns[0], ns[0], ns[1], nu[0]), (ns[1], ns[1], nu[1])]
     A = (
         ConditionalDirichlet(
-            concentration=jax.random.uniform(next(keys), A_shapes[0], minval=0.5, maxval=4.0),
+            concentration=jax.random.uniform(next(keys), A_shapes[0], F32, minval=0.5, maxval=4.0),
             parent_ndims=len(A_shapes[0]) - 1,
         ),
         ConditionalCategorical(
@@ -237,7 +242,7 @@ def synthetic_system(decomposition, epistemic, policy_len=2):
             parent_ndims=len(B_shapes[0]) - 1,
         ),
         ConditionalDirichlet(
-            concentration=jax.random.uniform(next(keys), B_shapes[1], minval=0.5, maxval=4.0),
+            concentration=jax.random.uniform(next(keys), B_shapes[1], F32, minval=0.5, maxval=4.0),
             parent_ndims=len(B_shapes[1]) - 1,
         ),
     )
@@ -258,17 +263,19 @@ def synthetic_system(decomposition, epistemic, policy_len=2):
             likelihood=A,
             transition=B,
             initial_state_prior=tuple(
-                Categorical(logits=jax.random.normal(next(keys), (n,))) for n in ns
+                Categorical(logits=jax.random.normal(next(keys), (n,), F32)) for n in ns
             ),
             obs_targets={
-                "m0": Categorical(logits=jax.random.normal(next(keys), (no[0],))),
-                "m1": Categorical(logits=jax.random.normal(next(keys), (no[1],))),
+                "m0": Categorical(logits=jax.random.normal(next(keys), (no[0],), F32)),
+                "m1": Categorical(logits=jax.random.normal(next(keys), (no[1],), F32)),
             },
-            state_targets={"f0": Categorical(logits=jax.random.normal(next(keys), (ns[0],)))},
-            terminal_targets={"f1": Categorical(logits=jax.random.normal(next(keys), (ns[1],)))},
+            state_targets={"f0": Categorical(logits=jax.random.normal(next(keys), (ns[0],), F32))},
+            terminal_targets={
+                "f1": Categorical(logits=jax.random.normal(next(keys), (ns[1],), F32))
+            },
         ),
     )
-    beliefs = tuple(Categorical(logits=jax.random.normal(next(keys), (n,))) for n in ns)
+    beliefs = tuple(Categorical(logits=jax.random.normal(next(keys), (n,), F32)) for n in ns)
     return system, params, beliefs
 
 

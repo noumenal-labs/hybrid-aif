@@ -31,6 +31,7 @@ import numpy as np
 from jax import Array
 from jax.scipy.special import xlogy
 
+from hybrid_aif.dtypes import as_float, as_floats
 from hybrid_aif.interval import Interval
 
 #: A node read as a level index.
@@ -44,7 +45,9 @@ class Box(eqx.Module):
 
     Every bound is finite and ``low < high`` in every dimension. Concrete bounds are checked here
     and again where :func:`control_space` reads the box; traced ones there, by
-    ``equinox.error_if``.
+    ``equinox.error_if``. Float bounds keep their dtype (both promoted to the wider); a Python
+    number or an integer bound takes the other bound's float dtype, and bounds with no float
+    array among them take the default float dtype. A plan over the box is in the bounds' dtype.
     """
 
     #: The lower bounds, a float ``(dim,)`` array (a scalar broadcasts to ``high``'s shape).
@@ -53,7 +56,7 @@ class Box(eqx.Module):
     high: Array
 
     def __init__(self, low: Array, high: Array):
-        low, high = jnp.asarray(low, jnp.float32), jnp.asarray(high, jnp.float32)
+        low, high = as_floats(low, high)
         shape = jnp.broadcast_shapes(low.shape, high.shape)
         if len(shape) != 1 or shape[0] == 0:
             raise ValueError(
@@ -108,7 +111,7 @@ class ControlLayout(NamedTuple):
     @property
     def bounds(self) -> tuple[Array, Array]:
         """``(low, high)`` as float arrays of shape ``(action_dim,)``."""
-        return jnp.asarray(self.low, jnp.float32), jnp.asarray(self.high, jnp.float32)
+        return self.low, self.high
 
     def structure(self) -> "ControlLayout":
         """The layout without its bounds: hashable, for static fields."""
@@ -182,9 +185,9 @@ def soft_clip(action: Array, bounds: tuple[Array, Array] | None) -> Array:
     """
     if bounds is None:
         return action
-    low, high = (jnp.asarray(b, jnp.float32) for b in bounds)
+    action, low, high = as_floats(action, *bounds)
     centre, half = (high + low) / 2.0, (high - low) / 2.0
-    offset = jnp.asarray(action, jnp.float32) - centre
+    offset = action - centre
     scale = half / jnp.maximum(half, jnp.abs(offset))
     return centre + offset * jax.lax.stop_gradient(scale)
 
@@ -282,12 +285,13 @@ def continuous_node_risk(entry: object, target: object) -> Interval:
     from hybrid_aif.distributions import Gaussian, TruncatedGaussian
 
     if not is_distribution(entry):
-        return Interval.exact(-target.log_prob(jnp.asarray(entry, jnp.float32)))
+        return Interval.exact(-target.log_prob(as_float(entry)))
     if isinstance(entry, TruncatedGaussian) and isinstance(target, Gaussian):
         return Interval.exact(-entry.entropy().lower - _expected_log_gaussian(entry, target))
     if isinstance(entry, Gaussian) and isinstance(target, TruncatedGaussian):
         #  a Gaussian belief puts mass outside the target's box, where the target has none
-        return Interval.exact(jnp.full(entry.batch_shape, jnp.inf, jnp.float32))
+        dtype = jnp.result_type(entry.mean(), target.loc)
+        return Interval.exact(jnp.full(entry.batch_shape, jnp.inf, dtype))
     return entry.kl_to(target)
 
 
@@ -297,7 +301,8 @@ def _expected_log_gaussian(q, target) -> Array:
 
     dev = q.mean() - target.loc
     z = solve_triangular(target.chol, dev[..., None], lower=True)[..., 0]
-    prec = cho_solve((target.chol, True), jnp.broadcast_to(jnp.eye(target.dim), target.chol.shape))
+    eye = jnp.eye(target.dim, dtype=target.chol.dtype)
+    prec = cho_solve((target.chol, True), jnp.broadcast_to(eye, target.chol.shape))
     trace = jnp.sum(jnp.diagonal(prec, axis1=-2, axis2=-1) * q.variance(), axis=-1)
     half_log_det = jnp.sum(jnp.log(jnp.diagonal(target.chol, axis1=-2, axis2=-1)), axis=-1)
     log_2pi = jnp.log(2.0 * jnp.pi)
@@ -816,7 +821,7 @@ def check_kernel(table: object, what: str, kind: str, size: int | None) -> Array
             f"{what} is a kernel on the action of a continuous control node, whose values have no "
             "levels to tabulate P(a | u) over; drop the entry"
         )
-    table = jnp.asarray(table, jnp.float32)
+    table = as_float(table)
     n = size if size is not None else (table.shape[0] if table.ndim == 2 else -1)
     if table.shape != (n, n):
         raise ValueError(
@@ -845,7 +850,8 @@ class SensedNodes(NamedTuple):
     after the state factors (engine position ``offset + i`` is ``columns[i]``); ``names`` and
     ``levels`` their action-node names and level counts; ``kernels`` the declared actuator
     kernels ``P(a | u)`` by control column (a node absent from it has the delta kernel);
-    ``layout`` the flat layout of an all-continuous space (``None`` otherwise)."""
+    ``layout`` the flat layout of an all-continuous space (``None`` otherwise); ``dtype`` the
+    float dtype of a clamped level's one-hot (the default float dtype when ``None``)."""
 
     offset: int
     columns: tuple[int, ...]
@@ -853,6 +859,7 @@ class SensedNodes(NamedTuple):
     levels: tuple[int, ...]
     kernels: Mapping[int, Array]
     layout: "ControlLayout | None" = None
+    dtype: object = None
 
 
 def action_node_beliefs(action: object, sensed: SensedNodes) -> tuple[Array, ...]:
@@ -873,7 +880,7 @@ def action_node_beliefs(action: object, sensed: SensedNodes) -> tuple[Array, ...
             continue
         u = jnp.asarray(entry, jnp.int32)
         if kernel is None:
-            out.append(jax.nn.one_hot(u, n, dtype=jnp.float32))
+            out.append(jax.nn.one_hot(u, n, dtype=sensed.dtype or float))
         else:
             out.append(jnp.moveaxis(jnp.take(kernel, u, axis=-1), 0, -1))
     return tuple(out)
@@ -1191,7 +1198,7 @@ def control_space(
             node_spans=tuple(spans),
             factor_nodes=tuple(tuple(c for c, _ in parents) for parents in table.control_parents),
             action_dim=at,
-            low=jnp.concatenate([jnp.asarray(b.low, jnp.float32) for b in boxes]),
-            high=jnp.concatenate([jnp.asarray(b.high, jnp.float32) for b in boxes]),
+            low=jnp.concatenate([b.low for b in boxes]),
+            high=jnp.concatenate([b.high for b in boxes]),
         )
     return ControlSpace(kinds=tuple(kinds), sizes=tuple(sizes), boxes=tuple(boxes), layout=layout)

@@ -41,6 +41,7 @@ from hybrid_aif.composition.merge import (
     subsystem,
 )
 from hybrid_aif.distributions import Categorical
+from hybrid_aif.dtypes import as_float
 from hybrid_aif.planning.enumerate import enumerate_policies
 from hybrid_aif.reads import Emission
 from hybrid_aif.system import UNSET, PartParams, Subsystem, System, SystemParams
@@ -416,7 +417,7 @@ def _habit(
     chosen = {n for n, a in zip(joint, system.action_names, strict=True) if a is not None}
     levels = system._control_levels(params)
     policies = enumerate_policies(levels, system.policy_len, (True,) * len(levels))
-    total = jnp.zeros((policies.shape[0],), jnp.float32)
+    total = None
     names = list(original._table.control_names)
     own_levels = original._control_levels(original_params)
     config = dict(leaves)
@@ -443,7 +444,7 @@ def _habit(
         for _ in range(mine["policy_len"]):
             for k in own:
                 expected *= own_levels[k]
-        lp = habit.log_probs if isinstance(habit, Categorical) else jnp.asarray(habit)
+        lp = as_float(habit.log_probs if isinstance(habit, Categorical) else habit)
         if lp.shape != (expected,):
             raise ValueError(
                 f"leaf {leaf!r} has policy_prior of shape {lp.shape}, but its own policy set has "
@@ -454,6 +455,8 @@ def _habit(
         for t in range(mine["policy_len"]):
             for k in own:
                 index = index * own_levels[k] + policies[:, t, joint.index(names[k])]
+        if total is None:
+            total = jnp.zeros((policies.shape[0],), lp.dtype)
         total = total + lp[index]
     return total
 

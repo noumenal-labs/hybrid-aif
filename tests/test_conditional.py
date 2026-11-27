@@ -23,7 +23,7 @@ from hybrid_aif import (
 )
 from hybrid_aif.distributions.conditional import _count_update
 from hybrid_aif.inference import fpi, propagate
-from tests.test_discrete_parity import _log_stable, _random_model, _run_both
+from tests.test_discrete_parity import _log_stable, _random_model, _run_both, oracle
 
 KEY = jax.random.PRNGKey(0)
 
@@ -280,16 +280,17 @@ def test_conditional_dirichlet_update_pymdp_parity():
     rng = np.random.default_rng(101)
     pA = [np.float32(rng.gamma(2.0, size=a.shape) + 0.1) for a in A]
     _, posteriors = _run_both(A_deps, A, num_obs, priors, obs)
-    qA_ref, _ = update_obs_likelihood_dirichlet(
-        [jnp.asarray(p) for p in pA],
-        [jnp.asarray(a) for a in A],
-        [jnp.asarray([o]) for o in obs],
-        [q.probs[None] for q in posteriors],
-        A_dependencies=A_deps,
-        categorical_obs=False,
-        num_obs=num_obs,
-        lr=1.0,
-    )
+    with oracle():
+        qA_ref, _ = update_obs_likelihood_dirichlet(
+            [jnp.asarray(p) for p in pA],
+            [jnp.asarray(a) for a in A],
+            [jnp.asarray([o]) for o in obs],
+            [q.probs[None] for q in posteriors],
+            A_dependencies=A_deps,
+            categorical_obs=False,
+            num_obs=num_obs,
+            lr=1.0,
+        )
     for m, deps in enumerate(A_deps):
         cd = ConditionalDirichlet(concentration=jnp.asarray(pA[m]), parent_ndims=len(deps))
         upd = cd.update(jnp.asarray(obs[m], jnp.int32), tuple(posteriors[f] for f in deps), lr=1.0)

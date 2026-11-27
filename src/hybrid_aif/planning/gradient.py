@@ -249,15 +249,17 @@ def descend_scored(
     optimizer: Optimizer,
 ) -> tuple[Array, Array, Array, Array, Array]:
     """:func:`descend` with the score of the returned plan appended: ``(plan, best_step, trace,
-    gradient_trace, final_score)``."""
+    gradient_trace, final_score)``. The best score is kept in the score's own dtype, which can
+    be wider than the plan's (a float32 box over a float64 model)."""
     value_and_grad = jax.value_and_grad(score)
+    score_dtype = jax.eval_shape(score, plan0).dtype
 
     def step(carry, t):
         plan, m, v, best_plan, best_g, best_t = carry
         g_value, grad = value_and_grad(plan)
-        better = g_value.astype(best_g.dtype) <= best_g
+        better = g_value <= best_g
         best_plan = jnp.where(better, plan, best_plan)
-        best_g = jnp.where(better, g_value.astype(best_g.dtype), best_g)
+        best_g = jnp.where(better, g_value, best_g)
         best_t = jnp.where(better, t.astype(jnp.int32), best_t)
         rms = jnp.sqrt(jnp.mean(grad**2))
         if optimizer == "adam":
@@ -274,11 +276,11 @@ def descend_scored(
         return (plan, m, v, best_plan, best_g, best_t), (g_value, rms)
 
     zeros = jnp.zeros_like(plan0)
-    start = (plan0, zeros, zeros, plan0, jnp.asarray(jnp.inf, plan0.dtype), jnp.int32(0))
+    start = (plan0, zeros, zeros, plan0, jnp.asarray(jnp.inf, score_dtype), jnp.int32(0))
     (last, _, _, best_plan, best_g, best_t), (trace, gradient_trace) = jax.lax.scan(
         step, start, jnp.arange(steps, dtype=low.dtype)
     )
-    last_g = score(last).astype(best_g.dtype)
+    last_g = score(last)
     final_best = ~jnp.isfinite(last_g) | (last_g <= best_g)
     plan = jnp.where(final_best, last, best_plan)
     best_step = jnp.where(final_best, jnp.int32(steps), best_t)

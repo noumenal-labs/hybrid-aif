@@ -30,6 +30,7 @@ import pytest
 
 from hybrid_aif.controls import Box
 from hybrid_aif.distributions import Categorical, Gaussian, MLPConditional
+from hybrid_aif.dtypes import cast
 from hybrid_aif.factors import LinearGaussianTransition
 from hybrid_aif.objectives import total
 from hybrid_aif.planning import get_planner, planner_needs_key
@@ -175,6 +176,11 @@ def test_a_terminal_only_designation_scores_on_both_paths():
         terminal_targets={"x": Gaussian(loc=jnp.asarray([TARGET]), chol=0.2 * jnp.eye(1))},
     )
     beliefs = _belief(0.0)
+    if jax.config.jax_enable_x64:
+        #  the claim below is read off one seed's 16 draws, a float32 stream: the model in
+        #  float32 draws it under 64-bit mode too (a float64 box draws another stream)
+        terminal, beliefs = cast(terminal, jnp.float32), cast(beliefs, jnp.float32)
+        assert terminal.control["u_x"].low.dtype == jnp.float32
     with_tree = _plan(system, terminal, beliefs, num_candidates=16, cem_iters=2, metrics=True)
     without = _plan(system, terminal, beliefs, num_candidates=16, cem_iters=2, metrics=False)
     assert sorted(with_tree.tree) == ["terminal_risk"]

@@ -997,10 +997,10 @@ def test_a_simultaneous_kernel_run_is_pinned_under_the_round_keys():
     )
     cp = dataclasses.replace(cp, actuator={"agent.a_location": KERNEL5})
     system, params = with_mirror(composite, cp)
-    from tests.test_run_parity import ancestral
+    from tests.test_run_parity import ancestral, as_recorded
 
     steps = {"model.agent": plan(), "model.world": ancestral(), "world": sample()}
-    traj = run(system, params, 12, KEY, steps, record_carries=True)
+    traj = run(system, as_recorded(params), 12, KEY, steps, record_carries=True)
     assert traj["model.agent"].emitted["a_location"].tolist() == [
         4,
         0,

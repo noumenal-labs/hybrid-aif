@@ -13,6 +13,7 @@ from jax import Array
 from hybrid_aif.cells import cell_mass
 from hybrid_aif.controls import ControlSpace
 from hybrid_aif.distributions import ConditionalDirichlet, Learnable, MLPConditional
+from hybrid_aif.dtypes import as_floats
 from hybrid_aif.factors import (
     GaussianTransition,
     LinearGaussianObservation,
@@ -157,14 +158,22 @@ def _learn(
         return isinstance(r, int | float) and float(r) == 0.0
 
     def observed(m: int, r):
-        """The rate under the tick's availability: a traced flag scales it to zero."""
+        """The rate under the tick's availability: a traced flag scales it to zero. A Python or
+        weakly typed rate stays weakly typed, taking the dtype of the statistic it scales."""
         flag = True if present is None else present[m]
-        return r if flag is True else r * jnp.asarray(flag, jnp.float32)
+        if flag is True:
+            return r
+        return r * jnp.asarray(flag, bool)
 
     def contribute(home: str, stats: Array, weight: Array | None = None) -> None:
-        """Add one reader's statistic (scaled by its availability, when traced) to its variable's
-        sum."""
-        scaled = stats if weight is None else jax.tree_util.tree_map(lambda s: s * weight, stats)
+        """Add one reader's statistic (scaled by its availability ``weight``, a traced flag,
+        when given) to its variable's sum."""
+
+        def scale(s):
+            s, w = as_floats(s, weight)
+            return s * w
+
+        scaled = stats if weight is None else jax.tree_util.tree_map(scale, stats)
         home_stats[home] = (
             scaled
             if home not in home_stats
@@ -238,7 +247,7 @@ def _learn(
                     *_lg_noise_stats(system, m, a, observations[m], beliefs, detail)
                 )
                 flag = True if present is None else present[m]
-                contribute(home, stats, None if flag is True else jnp.asarray(flag, jnp.float32))
+                contribute(home, stats, None if flag is True else flag)
                 continue
             r_noise = rate(key, lr, lr_rates, "noise")
             if not a.learnable_noise or skipped(r_noise):
@@ -263,7 +272,7 @@ def _learn(
         stats = a.stats(observations[m], parents)
         if home is not None:
             flag = True if present is None else present[m]
-            contribute(home, stats, None if flag is True else jnp.asarray(flag, jnp.float32))
+            contribute(home, stats, None if flag is True else flag)
             continue
         new_A[m] = _absorbing(key, a, stats, lr=observed(m, r), decay=rate(key, decay, decay_rates))
 
@@ -640,7 +649,7 @@ def init_learn_state(system, params: SystemParams) -> LearnState:
         opt_states[f"scoring:{name}"] = _amortized_terms.scoring_opt_state(
             name, entry, dict(system.scoring).get(name)
         )
-        moments.update(_amortized_terms.scoring_moments(name))
+        moments.update(_amortized_terms.scoring_moments(name, entry))
     if system._habit_module(params) is not None:
         opt_states[ACTOR_KEY] = params.policy_prior.init_opt_state()
     if system.reduction_period is not None and _structure.growable_factors(system, params):

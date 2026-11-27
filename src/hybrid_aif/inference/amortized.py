@@ -39,6 +39,7 @@ from hybrid_aif.distributions import (
     MLPPredictor,
 )
 from hybrid_aif.distributions.neural import LearnedVector, PredictorHead, straight_through_onehot
+from hybrid_aif.dtypes import as_float
 from hybrid_aif.factors import DerivedInitial, Deterministic, Recognition
 from hybrid_aif.inference.linear_gaussian import DiagonalNoise
 from hybrid_aif.inference.sample import collapse
@@ -131,7 +132,7 @@ def action_parent(
         )
     action = jnp.asarray(action)
     if controls is not None:
-        return (controls.block(f, action).astype(jnp.float32),)
+        return (as_float(controls.block(f, action)),)
     #  one level per control node: a controlled factor's node is its rank among them
     return (jax.nn.one_hot(action[sum(controlled[:f])], num_controls[f]),)
 

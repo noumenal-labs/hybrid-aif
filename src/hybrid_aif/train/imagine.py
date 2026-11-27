@@ -30,9 +30,11 @@ from hybrid_aif.distributions.neural import (
     PredictorHead,
     adam,
     apply_gradient,
+    disc_bins,
     factored_categorical_entropy,
     symlog_disc_nll,
 )
+from hybrid_aif.dtypes import as_float, as_floats, settled_scan
 from hybrid_aif.inference import amortized as _amortized
 from hybrid_aif.interval import Interval
 from hybrid_aif.objectives.amortized import RETNORM_KEY, SLOW_KEY, features, scoring_moments
@@ -195,8 +197,10 @@ def lambda_return(value: Array, reward: Array, disc: Array, return_lambda: float
     ``value`` is ``(H+1,)``, the critic at ``s_0 … s_H``; ``reward`` and ``disc`` are
     ``(H,)`` indexed by the step taken (``reward[k]`` is collected moving into
     ``s_{k+1}``, ``disc[k] = discount · cont(s_{k+1})``). Returns ``(H,)``, entry
-    ``k`` the return estimate at ``s_k``, bootstrapped by ``value[H]``.
+    ``k`` the return estimate at ``s_k``, bootstrapped by ``value[H]``, in the dtype the three
+    inputs promote to (:func:`~hybrid_aif.dtypes.as_floats`).
     """
+    value, reward, disc = as_floats(value, reward, disc)
     interm = reward + disc * value[1:] * (1.0 - return_lambda)
 
     def back(carry: Array, xs: tuple[Array, Array]) -> tuple[Array, Array]:
@@ -224,7 +228,8 @@ def perc_ema(
 
 
 def init_retnorm() -> Array:
-    """A fresh ``(low, high)`` percentile-EMA carry: zeros, as seeded under :data:`RETNORM_KEY`."""
+    """A fresh ``(low, high)`` percentile-EMA carry: zeros, as seeded under :data:`RETNORM_KEY`,
+    in the default float dtype."""
     return scoring_moments(ROW)[RETNORM_KEY]
 
 
@@ -324,9 +329,10 @@ def imagine(
     action_dim = actor.child_dim  # the actor declares the action's width
 
     n = int(jnp.shape(start_beliefs[carry])[0])
-    flags, expert_actions = _bc_inputs(start_actions, bc_weights, n, action_dim, bc_scale)
+    dtype = jnp.result_type(start_beliefs[carry])  # what a made-up input is combined with
+    flags, expert_actions = _bc_inputs(start_actions, bc_weights, n, action_dim, dtype)
     aux = None if not aux_beliefs else system._aux_in(aux_beliefs, "imagine")
-    first_cont = jnp.ones((n,), jnp.float32) if start_cont is None else jnp.asarray(start_cont)
+    first_cont = jnp.ones((n,), dtype) if start_cont is None else jnp.asarray(start_cont)
     if jnp.shape(first_cont) != (n,):
         raise ValueError(f"imagine: start_cont must be ({n},), got {jnp.shape(first_cont)}")
 
@@ -382,7 +388,8 @@ def imagine(
         target = jax.lax.stop_gradient(ret)
         slow_target = jax.lax.stop_gradient(jax.vmap(jax.vmap(lambda f: slow.predict((f,))))(feats))
         logits = jax.vmap(jax.vmap(lambda f: critic_m((f,))))(feats)
-        bins = critic_m.bins
+        #  the bin centres in the logits' dtype, which they are read against
+        bins = disc_bins(critic_m.num_bins, critic_m.bin_low, critic_m.bin_high, logits.dtype)
         nll = jax.vmap(jax.vmap(lambda lg, y: symlog_disc_nll(lg, y, bins)))
         #  The SAME weight, applied to the sum of the two NLLs rather than to each mean.
         critic_loss = jnp.mean((nll(logits, target) + slowreg * nll(logits, slow_target)) * weight)
@@ -510,7 +517,7 @@ def roll_batch(
             )
 
         ts = jnp.arange(horizon, dtype=jnp.int32)
-        _, out = jax.lax.scan(step, start, (jax.random.split(k, horizon), ts))
+        _, out = settled_scan(step, start, (jax.random.split(k, horizon), ts))
         value, per_term, v_next, continuation, h_prior, h_pi, feats = out
         v0 = critic_sg.predict((features(start),))
         return Rollout(
@@ -581,7 +588,7 @@ def rollout_returns(
         cont=(cont_head, cont_deps),
         code_and_carry=(code, carry),
         aux=None if not aux_beliefs else system._aux_in(aux_beliefs, "rollout_returns"),
-        expert_actions=jnp.zeros((n, actor.child_dim), jnp.float32),
+        expert_actions=jnp.zeros((n, actor.child_dim), jnp.result_type(start_beliefs[carry])),
         sample_scoring=sample_scoring,
     )
     ret = jax.vmap(lambda v, r, d: lambda_return(v, r, d, return_lambda))(
@@ -611,7 +618,7 @@ def _sampled_step(params, system, carry: int, code: int, beliefs, action, key):
         system._num_controls(params, "imagine"),
         system._control_layout(params),
         tuple(beliefs),
-        jnp.asarray(action, jnp.float32),
+        as_float(action),
         key,
     )
     return new, logits[code], jax.nn.softmax(logits[code], axis=-1)
@@ -667,12 +674,13 @@ def _cont_head(
 
 
 def _bc_inputs(
-    start_actions: Array | None, bc_weights: Array | None, n: int, action_dim: int, scale
+    start_actions: Array | None, bc_weights: Array | None, n: int, action_dim: int, dtype
 ) -> tuple[Array, Array]:
     """``(weights, actions)`` for the self-imitation term, with the no-BC case zeroed.
 
-    Raises when only one of the two is given. With neither, the weights are zeros
-    (``log π`` is still computed and reported).
+    Raises when only one of the two is given. With neither, the weights and the actions are
+    zeros in ``dtype`` (``log π`` is still computed and reported); given, each keeps its float
+    dtype (:func:`~hybrid_aif.dtypes.as_float`).
     """
     if (start_actions is None) != (bc_weights is None):
         raise ValueError(
@@ -681,9 +689,9 @@ def _bc_inputs(
             "term (design: amortization.md A10 disposition 8)"
         )
     if start_actions is None:
-        return jnp.zeros((n,), jnp.float32), jnp.zeros((n, action_dim), jnp.float32)
-    actions = jnp.asarray(start_actions, jnp.float32)
-    flags = jnp.asarray(bc_weights, jnp.float32)
+        return jnp.zeros((n,), dtype), jnp.zeros((n, action_dim), dtype)
+    actions = as_float(start_actions)
+    flags = as_float(bc_weights)
     if actions.shape != (n, action_dim) or flags.shape != (n,):
         raise ValueError(
             f"imagine: start_actions must be ({n}, {action_dim}) and bc_weights ({n},), "
@@ -759,8 +767,9 @@ def _slow_update(slow, fast, updates: Array, fraction: float, period: int):
     so the first call hard-copies the freshly stepped critic. Design:
     docs/design/amortization.md chunk 2d §(a″) item 13
     """
-    need_init = (updates == 0).astype(jnp.float32)
-    need_update = (jnp.mod(updates, int(period)) == 0).astype(jnp.float32)
+    #  weakly typed: the mix takes the dtype of the weights it mixes
+    need_init = jnp.where(updates == 0, 1.0, 0.0)
+    need_update = jnp.where(jnp.mod(updates, int(period)) == 0, 1.0, 0.0)
     mix = jnp.clip(1.0 * need_init + fraction * need_update, 0.0, 1.0)
     mixed = jax.tree_util.tree_map(lambda s, f: mix * f + (1.0 - mix) * s, slow, fast)
     return mixed, updates + 1

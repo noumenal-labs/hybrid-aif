@@ -95,8 +95,11 @@ def test_the_amortized_path_replays_through_the_per_tick_faces(agent):
     _close(out.beliefs, beliefs)
     _close(out.priors, priors)
     _close(out.chosen, chosen)
+    #  the chosen action is the actor's output, so in the actor's dtype (float32, as the
+    #  reference draws it), whatever the dtype of the recorded actions
+    assert params.policy_prior.dtype == jnp.float32
     for k, a in actions.items():
-        assert out.chosen[k].shape == a.shape and out.chosen[k].dtype == a.dtype
+        assert out.chosen[k].shape == a.shape and out.chosen[k].dtype == params.policy_prior.dtype
     assert out.unsupported == {} and out.log_evidence is None and out.trees is None
     assert out.params is None and out.learn_state is None
 

@@ -95,8 +95,8 @@ def fix_levels(ctx, levels):
     terminal = (
         None if ctx.terminal_terms_fn is None else lambda carry: ctx.terminal_terms_fn(carry[0])
     )
-    low = jnp.concatenate([jnp.asarray(b.low, jnp.float32) for b in boxes])
-    high = jnp.concatenate([jnp.asarray(b.high, jnp.float32) for b in boxes])
+    low = jnp.concatenate([b.low for b in boxes])
+    high = jnp.concatenate([b.high for b in boxes])
     layout = ControlLayout(
         node_spans=((0, low.shape[0]),),
         factor_nodes=(),

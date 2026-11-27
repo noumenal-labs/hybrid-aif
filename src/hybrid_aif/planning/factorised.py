@@ -42,6 +42,7 @@ from jax import Array
 
 from hybrid_aif.controls import ControlStep
 from hybrid_aif.distributions import Categorical
+from hybrid_aif.dtypes import tree_float_dtype
 from hybrid_aif.interval import Interval
 from hybrid_aif.objectives.base import TermTree, total
 from hybrid_aif.planning.base import (
@@ -203,7 +204,8 @@ def _score_node(
         entries=tuple(own[None, :1] if j == k else m[None] for j, m in enumerate(others))
     )
     warrant, approximate = _step_warrant(init_qs, transition_fn, step_terms, example)
-    g = Interval(jnp.zeros((1,)), jnp.zeros((1,)), warrant, approximate)
+    zero = jnp.zeros((1,), tree_float_dtype(init_qs))  # G accumulates in the beliefs' dtype
+    g = Interval(zero, zero, warrant, approximate)
     for t in range(horizon):
         qs, tree = expand(qs, t)
         g = _repeat_nodes(g, n)
@@ -234,10 +236,12 @@ def factorised_plan(
     priors = _node_priors(ctx, counts)
     args = (ctx.init_beliefs, ctx.transition_fn, ctx.step_terms_fn, ctx.terminal_terms_fn)
 
-    marginals = [jnp.full((horizon, n), 1.0 / n, jnp.float32) for n in levels]
-    posteriors = [Categorical(logits=jnp.zeros((c,), jnp.float32)) for c in counts]
+    #  the arrays made here are in the beliefs' float dtype
+    dtype = tree_float_dtype(ctx.init_beliefs)
+    marginals = [jnp.full((horizon, n), 1.0 / n, dtype) for n in levels]
+    posteriors = [Categorical(logits=jnp.zeros((c,), dtype)) for c in counts]
     trees: list[TermTree | None] = [None] * len(levels)
-    movement = jnp.zeros((), jnp.float32)
+    movement = jnp.zeros((), dtype)
 
     def score(k: int) -> TermTree | Interval:
         others = tuple(None if j == k else marginals[j] for j in range(len(levels)))
@@ -245,7 +249,7 @@ def factorised_plan(
 
     for sweep in range(sweeps):
         last = sweep == sweeps - 1
-        movement = jnp.zeros((), jnp.float32)
+        movement = jnp.zeros((), dtype)
         for k, n in enumerate(levels):
             if n == 1 and not (last and metrics):
                 continue  # one level: a constant marginal, scored once for the tree
@@ -263,7 +267,7 @@ def factorised_plan(
             posteriors[k], marginals[k] = q, new
 
     first = enumerate_policies(levels, 1, (True,) * len(levels))
-    logits = jnp.zeros((first.shape[0],), jnp.float32)
+    logits = jnp.zeros((first.shape[0],), dtype)
     for k, n in enumerate(levels):
         logits = logits + _first_logits(posteriors[k], grids[k], n)[first[:, 0, k]]
     policies = FactorisedPolicies(

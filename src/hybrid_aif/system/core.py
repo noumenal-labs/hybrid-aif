@@ -61,6 +61,8 @@ from hybrid_aif.distributions import (
     MLPConditional,
 )
 from hybrid_aif.distributions.neural import LearnedVector, MLPCategorical, PredictorHead
+from hybrid_aif.dtypes import as_float, table_dtype, tree_float_dtype, widened
+from hybrid_aif.dtypes import cast as _cast
 from hybrid_aif.envs._process import DiscreteProcess, HybridProcess
 from hybrid_aif.envs.generative import CONTROL_TAG, GenerativeEnv, GenerativeEnvParams
 from hybrid_aif.factors import (
@@ -501,6 +503,12 @@ class SystemParams(eqx.Module):
     def E(self):
         """AIF-letter alias for ``policy_prior`` (read-only; the field is the writable name)."""
         return self.policy_prior
+
+    def cast(self, dtype: object, where: Callable | None = None) -> "SystemParams":
+        """These params with every float array in ``dtype`` (float32 or float64), or with only
+        the part ``where`` picks cast (``where=lambda p: p.likelihood["camera"]``):
+        :func:`hybrid_aif.dtypes.cast` on the params."""
+        return _cast(self, dtype, where)
 
 
 class LearnState(eqx.Module):
@@ -2405,13 +2413,14 @@ class System(eqx.Module, metaclass=_SystemMeta):
 
     def _node_priors(self, params: SystemParams) -> dict[str, Categorical]:
         """Each discrete control node's prior, by name: uniform over its levels (C2's
-        independence at every step)."""
+        independence at every step), in :func:`table_dtype` of ``params``."""
         names = self._names(params)
         if not names.node_beliefs:
             return {}
         levels = self._control_levels(params)
+        dtype = table_dtype(params)
         return {
-            n: Categorical(logits=jnp.zeros((levels[k],)))
+            n: Categorical(logits=jnp.zeros((levels[k],), dtype))
             for k, n in enumerate(names.controls)
             if n in names.node_beliefs
         }
@@ -2506,14 +2515,15 @@ class System(eqx.Module, metaclass=_SystemMeta):
         face: str,
     ) -> tuple[Categorical, ...]:
         """Each observed action node's prior, in column order: the entry ``given`` carries, else
-        uniform over its control node's levels."""
+        uniform over its control node's levels (in :func:`table_dtype` of ``params``)."""
         self._check_sensed_kinds(params, face)
         levels = self._control_levels(params)
+        dtype = table_dtype(params)
         out = []
         for k, name in zip(self._sensed_columns, self._sensed, strict=True):
             q = None if given is None else given.get(name)
             if q is None:
-                out.append(Categorical(logits=jnp.zeros((levels[k],))))
+                out.append(Categorical(logits=jnp.zeros((levels[k],), dtype)))
                 continue
             if not isinstance(q, Categorical) or q.probs.shape[-1] != levels[k]:
                 raise ValueError(
@@ -2549,6 +2559,7 @@ class System(eqx.Module, metaclass=_SystemMeta):
                 k: kernels[self.action_names[k]] for k in columns if self.action_names[k] in kernels
             },
             layout=space.layout,
+            dtype=table_dtype(params),
         )
 
     def _sensed_predictions(
@@ -2736,7 +2747,10 @@ class System(eqx.Module, metaclass=_SystemMeta):
                 out.append(d.average(tuple(out[g] for g in deps)))
             else:
                 out.append(d)
-        return tuple(out)
+        #  in the dtype the first tick's posterior takes (the widest of the model's tables and
+        #  initial priors), so a filter over a model of mixed dtypes keeps one dtype from the start
+        dtype = jnp.promote_types(table_dtype(params), tree_float_dtype(out))
+        return tuple(widened(b, dtype) for b in out)
 
     def _families(self, params: SystemParams) -> tuple[str, ...]:
         params = self._p(params)
@@ -2896,7 +2910,8 @@ class System(eqx.Module, metaclass=_SystemMeta):
         for k in free:
             if space.kinds[k] == FLOAT:
                 box = space.boxes[k]
-                unit = jax.random.uniform(keys[k], (space.sizes[k],))
+                dtype = jnp.result_type(box.low, box.high)  # drawn in the box's dtype
+                unit = jax.random.uniform(keys[k], (space.sizes[k],), dtype)
                 out[table.control_names[k]] = box.low + (box.high - box.low) * unit
             elif tuple_ is not None:
                 out[table.control_names[k]] = tuple_[k].astype(jnp.int32)
@@ -3339,7 +3354,7 @@ class System(eqx.Module, metaclass=_SystemMeta):
             _pooling.PooledEntry(
                 f"likelihood:{name}" if name in mods else f"transition:{name}",
                 nodes.index(node),
-                jnp.asarray(params.readings[name], jnp.result_type(float)),
+                as_float(params.readings[name]),  # a float keeps its dtype
             )
             for name, node in self.readings
         )

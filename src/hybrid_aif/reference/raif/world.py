@@ -73,6 +73,7 @@ def tiny_core(
     activation: str = "silu",
     norm: bool = True,
     winit: str = "default",
+    dtype: object = None,
 ) -> RSSMCore:
     """R-AIF's ``tiny`` world model as an :class:`RSSMCore`, state-based.
 
@@ -80,7 +81,9 @@ def tiny_core(
     reward/continuation heads, ``mlp_units 64`` / 2 layers on the encoder and decoder,
     ``unimix 0.01``, a 255-bin ``symlog_disc`` reward over [-20, 20]. ``winit`` reaches every
     block: ``"normal"`` is their ``winit: normal, fan: avg`` with no bias where a layer is
-    normed; ``"default"`` is eqx's initializer with every bias kept.
+    normed; ``"default"`` is eqx's initializer with every bias kept. ``dtype`` is the dtype every
+    block's weights are drawn in, so the one it computes in
+    (:mod:`hybrid_aif.distributions.neural`); ``None`` is the default float dtype.
 
     Design: ``docs/experiments/raif-mountain-car/divergence-register.md`` (divergences 17, 26).
     """
@@ -95,6 +98,7 @@ def tiny_core(
             activation=activation,
             norm=norm,
             init=init_of(winit),
+            dtype=dtype,
         ),
         prior=MLPCategorical.from_shapes(
             (deter,),
@@ -107,6 +111,7 @@ def tiny_core(
             norm=norm,
             unimix=unimix,
             init=init_of(winit),
+            dtype=dtype,
         ),
         posterior=MLPCategorical.from_shapes(
             (deter, embed),
@@ -119,6 +124,7 @@ def tiny_core(
             norm=norm,
             unimix=unimix,
             init=init_of(winit),
+            dtype=dtype,
         ),
         # their MLP encoder branch: the last normed, activated layer is the embedding,
         # hence out_activation and depth = mlp_layers - 1
@@ -133,6 +139,7 @@ def tiny_core(
             out_activation=True,
             symlog_inputs=True,
             init=init_of(winit),
+            dtype=dtype,
         ),
         decoder=PredictorHead.from_shapes(
             (deter, flat),
@@ -144,6 +151,7 @@ def tiny_core(
             activation=activation,
             norm=norm,
             init=init_of(winit),
+            dtype=dtype,
         ),
         reward=PredictorHead.from_shapes(
             (deter, flat),
@@ -158,6 +166,7 @@ def tiny_core(
             norm=norm,
             out_scale=0.0,  # their reward outscale 0.0
             init=init_of(winit),
+            dtype=dtype,
         ),
         cont=PredictorHead.from_shapes(
             (deter, flat),
@@ -168,8 +177,9 @@ def tiny_core(
             activation=activation,
             norm=norm,
             init=init_of(winit),
+            dtype=dtype,
         ),
-        initial=LearnedVector.zeros(deter),
+        initial=LearnedVector.zeros(deter, dtype=dtype),
         obs_dim=int(obs_dim),
         action_dim=int(action_dim),
     )
@@ -194,10 +204,12 @@ def tiny_rssm(
     ``initial: 'zeros'``). ``policy_len`` is their ``imag_horizon``: the explicit rollout
     steps before the ``g_tail`` critic closes the horizon. The carry reads a continuous control
     node, its box ``[action_low, action_high]`` in ``params.control``; its action node emits the
-    value to the env. The G side is
-    mounted on the returned pair by the agent.
+    value to the env. The box's bounds are float arrays in the default float dtype, or in
+    ``dtype`` when given (a keyword argument for :func:`tiny_core`). The G side is mounted on the
+    returned pair by the agent.
     """
     core = tiny_core(obs_dim, action_dim, key=key, **tiny)  # type: ignore[arg-type]
+    bounds = jnp.result_type(float) if tiny.get("dtype") is None else tiny["dtype"]
     system = System(
         A_deps=((0, 1), (0, 1), (0, 1)),  # every head reads [deter, flat stoch]
         B_deps=((1,), (0,)),  # deter <- stoch_{t-1} (+ action); stoch <- deter_t
@@ -225,8 +237,8 @@ def tiny_rssm(
         recognition={EMBED_VARIABLE: core.encoder, CODE_NAME: core.posterior},
         control={
             control_name(CARRY_NAME): Box(
-                jnp.full((action_dim,), action_low, jnp.float32),
-                jnp.full((action_dim,), action_high, jnp.float32),
+                jnp.full((action_dim,), action_low, bounds),
+                jnp.full((action_dim,), action_high, bounds),
             )
         },
     )
@@ -247,6 +259,7 @@ def crspp_rssm(
     activation: str = "silu",
     norm: bool = True,
     winit: str = "default",
+    dtype: object = None,
 ) -> tuple[System, SystemParams]:
     """R-AIF's CRSPP prior-preference model: ``tiny_rssm`` without the action or the heads.
 
@@ -257,7 +270,7 @@ def crspp_rssm(
     is supplied per call by :func:`hybrid_aif.reference.raif.crspp.crspp_recognize`. The
     ``cosine_sim_to_pref_rollout`` row owns it through ``System.scoring`` and
     ``SystemParams.scoring``. ``policy_len`` is carried but unused: the row rolls the agent's
-    horizon.
+    horizon. ``dtype`` is the dtype its networks' weights are drawn in, as in :func:`tiny_core`.
 
     Design: ``docs/design/amortization-debt-ledger.md`` entry 5.
     """
@@ -286,6 +299,7 @@ def crspp_rssm(
                 activation=activation,
                 norm=norm,
                 init=init_of(winit),
+                dtype=dtype,
             ),
             MLPCategorical.from_shapes(
                 (deter,),
@@ -298,9 +312,10 @@ def crspp_rssm(
                 norm=norm,
                 unimix=unimix,
                 init=init_of(winit),
+                dtype=dtype,
             ),
         ),
-        initial_state_prior=(LearnedVector.zeros(deter), DerivedInitial()),
+        initial_state_prior=(LearnedVector.zeros(deter, dtype=dtype), DerivedInitial()),
         recognition={
             CODE_NAME: MLPCategorical.from_shapes(
                 (deter, int(embed)),
@@ -313,6 +328,7 @@ def crspp_rssm(
                 norm=norm,
                 unimix=unimix,
                 init=init_of(winit),
+                dtype=dtype,
             )
         },
     )

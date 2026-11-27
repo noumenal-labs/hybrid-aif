@@ -43,11 +43,13 @@ def _random_model(rng, offset_only: bool, nu=None) -> LinearGaussianObservationM
         a = rng.normal(size=(K + 1, K + 1))
         v = a @ a.T / (K + 1) * rng.uniform(0.2, 3)
     b = rng.normal(size=(D, D))
+    #  float32, the dtype the tolerances were measured in: the leaf reads a fixed set of draws
+    #  of the posterior, and a float64 posterior draws another set
     return LinearGaussianObservationMNIW(
-        M=jnp.asarray(rng.normal(size=(D, K + 1)) * 1.5),
-        V_inv=jnp.asarray(np.linalg.inv(v)),
-        Psi=jnp.asarray(b @ b.T + 0.5 * np.eye(D)),
-        nu=jnp.asarray(rng.uniform(D + 3, 12) if nu is None else nu),
+        M=jnp.asarray(rng.normal(size=(D, K + 1)) * 1.5, jnp.float32),
+        V_inv=jnp.asarray(np.linalg.inv(v), jnp.float32),
+        Psi=jnp.asarray(b @ b.T + 0.5 * np.eye(D), jnp.float32),
+        nu=jnp.asarray(rng.uniform(D + 3, 12) if nu is None else nu, jnp.float32),
     )
 
 

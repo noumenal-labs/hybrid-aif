@@ -12,8 +12,9 @@ are canonicalised, so the input-type differences that make a loop retrace cannot
   enabled), a float keeps its dtype unless it is narrower than float32, and a Python float
   becomes the default float dtype;
 - schedules (``lr``, ``decay``, ``alpha``, the per-slot rates): a Python number becomes an array
-  of the default float dtype, except a Python ``lr`` of exactly 0.0 and a Python ``decay`` of
-  exactly 1.0, which ``learn`` reads at trace time and which stay static;
+  (float32; under JAX's 64-bit mode a weakly typed one, which takes the dtype of each table it
+  scales), except a Python ``lr`` of exactly 0.0 and a Python ``decay`` of exactly 1.0, which
+  ``learn`` reads at trace time and which stay static;
 - an observation of the wrong form is refused with a sentence before the boundary, by the eager
   faces' own check;
 - ``legal``: a list is read as the eager faces read it, each mask becomes a bool array (an
@@ -59,6 +60,7 @@ from jax import Array
 
 from hybrid_aif import debug
 from hybrid_aif.distributions import Categorical
+from hybrid_aif.dtypes import table_dtype
 from hybrid_aif.inference.discrete import SUPPORT_FLOOR
 from hybrid_aif.system import keyed, validation
 
@@ -144,16 +146,19 @@ def _key(x: Any) -> Any:
 
 
 def _rate(x: Any, static: float | None = None) -> Any:
-    """A rate in the default float dtype (an array keeps its own dtype if it is at least
-    float32), except a Python number equal to ``static``, which ``learn`` reads at trace time
-    (a learning rate of 0.0 skips the slot, a decay of 1.0 is no decay and needs no anchor) and
-    so stays a Python number."""
+    """A rate as an array: an array in its own dtype if it is at least float32; a Python number
+    weakly typed under JAX's 64-bit mode, so it takes the dtype of each table it scales as the
+    number would, and a strong array of the one float dtype with that mode off (a number and an
+    array rate then share one compiled program). A Python number equal to ``static`` stays a
+    Python number: ``learn`` reads it at trace time (a learning rate of 0.0 skips the slot, a
+    decay of 1.0 is no decay and needs no anchor)."""
 
     def leaf(v: Any) -> Any:
-        if isinstance(v, float | int | np.floating | np.integer) and not isinstance(v, bool):
+        if isinstance(v, float | int | np.integer) and not isinstance(v, bool):
             if static is not None and isinstance(v, float | int) and v == static:
                 return v
-            return jnp.asarray(v, jnp.result_type(float))
+            rate = jnp.asarray(float(v))
+            return rate if jax.config.jax_enable_x64 else _strong(rate)
         v = jnp.asarray(v)
         return jax.lax.convert_element_type(v, _float_dtype(v.dtype))
 
@@ -211,9 +216,10 @@ def _complete_priors(system, params, priors, face: str):
     if system._sensed_columns:
         system._check_sensed_kinds(params, face)
         levels = system._control_levels(params)
+        dtype = table_dtype(params)
         for k, name in zip(system._sensed_columns, system._sensed, strict=True):
             if name not in out:
-                out[name] = Categorical(logits=jnp.zeros((levels[k],)))
+                out[name] = Categorical(logits=jnp.zeros((levels[k],), dtype))
     return out
 
 

@@ -1625,6 +1625,13 @@ untouched and still last in line.]* A divergence that makes our arithmetic *more
 the least likely explanation of a worse curve, and it is the most expensive
 to close.
 
+*Note, 2026-11-27.* The reference pins float32 explicitly, through `DTYPE` in
+`reference/raif/columns.py`: its networks draw their weights in it, and its
+episodes, buffers and training batches are made in it or cast to it, so it
+computes in float32 under JAX's 64-bit mode too. A neural component in
+general computes in the dtype of its weights (`distributions/neural.py`,
+**Precision**).
+
 ### (a″) Divergences 10–13: the transcription sweep (four closed, two formulas confirmed)
 
 *Alex's second 2026-09-02 addendum: "the semantic half". The config audit

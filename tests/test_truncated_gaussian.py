@@ -7,6 +7,8 @@ around ``loc``, a one-sided box, and boxes far in either tail.
 Design: docs/design/control-states.md C4 (Bounded Gaussian).
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -246,3 +248,46 @@ def test_draws_from_a_moderately_narrow_box_have_its_moments(c, h):
     want_mean, want_var, _ = _midpoint_quadrature(0.0, 1.0, c - h, c + h)
     assert abs(draws.var() / want_var - 1.0) < 5 * np.sqrt(2.0 / n)
     assert abs(draws.mean() - want_mean) < 5 * np.sqrt(want_var / n)
+
+
+def _one(value: float, dtype) -> jax.Array:
+    return jnp.asarray([value], dtype)
+
+
+def test_float64_leaves_give_float64_moments_density_and_draws():
+    """Under 64-bit mode a member on float64 leaves keeps them, returns its mean, variance,
+    entropy, log-density and draws in float64, and its closed forms on ``N(0, 1)`` restricted
+    to ``[0.5, 2.5]`` match scipy's float64 truncated normal to 1e-12."""
+    from scipy.stats import truncnorm
+
+    with jax.enable_x64(True):
+        f64 = functools.partial(_one, dtype=jnp.float64)
+        tg = TruncatedGaussian(loc=f64(0.0), scale=f64(1.0), low=f64(0.5), high=f64(2.5))
+        assert all(leaf.dtype == jnp.float64 for leaf in (tg.loc, tg.scale, tg.low, tg.high))
+        mean, var, entropy = tg.mean(), tg.variance(), tg.entropy().lower
+        assert mean.dtype == var.dtype == entropy.dtype == jnp.float64
+        assert tg.log_prob(f64(1.0)).dtype == jnp.float64
+        assert tg.sample(KEY, (4,)).dtype == jnp.float64
+        ref = truncnorm(0.5, 2.5)
+        np.testing.assert_allclose(float(mean[0]), ref.mean(), rtol=0, atol=1e-12)
+        np.testing.assert_allclose(float(var[0]), ref.var(), rtol=0, atol=1e-12)
+        np.testing.assert_allclose(float(entropy), ref.entropy(), rtol=0, atol=1e-12)
+
+
+def test_the_leaves_take_the_widest_dtype_among_the_float_arrays_passed():
+    """Under 64-bit mode an all-float32 member stays float32, also with a Python number among
+    its inputs; a float64 array among them makes every leaf float64; Python numbers alone take
+    the default float dtype, float64 there."""
+    with jax.enable_x64(True):
+        f32 = functools.partial(_one, dtype=jnp.float32)
+        narrow = TruncatedGaussian(loc=f32(0.0), scale=f32(1.0), low=f32(-1.0), high=f32(1.0))
+        assert narrow.loc.dtype == jnp.float32 and narrow.mean().dtype == jnp.float32
+        assert narrow.sample(KEY).dtype == jnp.float32
+        beside = TruncatedGaussian(loc=f32(0.0), scale=1.0, low=-1, high=f32(1.0))
+        assert all(leaf.dtype == jnp.float32 for leaf in (beside.loc, beside.scale, beside.low))
+        wide = TruncatedGaussian(
+            loc=f32(0.0), scale=_one(1.0, jnp.float64), low=f32(-1.0), high=f32(1.0)
+        )
+        assert all(leaf.dtype == jnp.float64 for leaf in (wide.loc, wide.scale, wide.low))
+        alone = TruncatedGaussian(loc=[0.0], scale=1.0, low=-1.0, high=1.0)
+        assert alone.loc.dtype == jnp.float64

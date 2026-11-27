@@ -24,6 +24,7 @@ from jax import Array
 
 from hybrid_aif.distributions import MLPConditional
 from hybrid_aif.distributions.neural import adam, apply_gradient
+from hybrid_aif.dtypes import as_float
 from hybrid_aif.system import LearnState, System, SystemParams
 
 #: The ensemble optimizer's defaults: adam at ``lr 1e-4`` with ``eps 1e-5`` (not
@@ -127,8 +128,8 @@ def ensemble_loss(
     Pure and differentiable in ``members``; each member's NLL is
     :meth:`~hybrid_aif.distributions.MLPConditional.diag_nll` (the diagonal form,
     which keeps gradients finite under jit). ``member_weights`` is an ``(M,)``
-    weight per member (default ones; a zero removes that member's gradient); any
-    other shape raises ``ValueError``. The reduction is a sum, which matters where
+    weight per member (default ones in the losses' dtype; a zero removes that member's
+    gradient); any other shape raises ``ValueError``. The reduction is a sum, which matters where
     adam is not scale-free (``eps`` and the clip).
     """
     batch.check(members)
@@ -142,9 +143,9 @@ def ensemble_loss(
 
     per_member = jnp.stack([one(member) for member in members])
     weights = (
-        jnp.ones((len(members),), jnp.float32)
+        jnp.ones((len(members),), per_member.dtype)
         if member_weights is None
-        else jnp.asarray(member_weights, jnp.float32)
+        else as_float(member_weights)
     )
     if weights.shape != (len(members),):
         raise ValueError(

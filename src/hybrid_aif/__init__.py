@@ -33,6 +33,7 @@ from hybrid_aif.distributions import (
     PredictorHead,
     TruncatedGaussian,
 )
+from hybrid_aif.dtypes import cast
 from hybrid_aif.durations import accumulated_target, compose, discretise
 from hybrid_aif.factors import (
     DerivedInitial,
@@ -56,7 +57,7 @@ from hybrid_aif.reads import Emission
 from hybrid_aif.replay import Replay, replay, replay_document, stack_traces
 from hybrid_aif.system import System, SystemParams
 
-__version__ = "0.22.0"
+__version__ = "0.23.0"
 
 __all__ = [
     "Box",
@@ -106,6 +107,7 @@ __all__ = [
     "System",
     "SystemParams",
     "build",
+    "cast",
     "describe",
     "register_transition",
     "registered_transitions",

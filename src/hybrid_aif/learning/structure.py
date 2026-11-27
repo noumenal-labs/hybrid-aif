@@ -160,8 +160,9 @@ def level_scores(
     under the level by every modality that reads the factor, each modality's other parents
     contracted with their beliefs (mean-field), summed; and whether any of those modalities is
     present at the tick. An absent modality contributes nothing."""
-    k = params.transition[f].concentration.shape[0]
-    total = jnp.zeros((k,))
+    conc = params.transition[f].concentration
+    k = conc.shape[0]
+    total = jnp.zeros((k,), conc.dtype)  # the sum starts in the weights' dtype
     observed = jnp.asarray(False)
     for m, decl in enumerate(params.likelihood):
         deps = system.A_deps[m]
@@ -200,9 +201,11 @@ def growth_decision(scores: Array, live: Array, log_growth: Array) -> tuple[Arra
     return jnp.any(dead) & (best_live < scores[woken] + log_growth), woken
 
 
-def hard_assignment(k: int, level: Array) -> Categorical:
-    """The one-hot belief on ``level`` over ``k`` levels."""
-    return Categorical(logits=jnp.where(jnp.arange(k) == level, 0.0, -jnp.inf))
+def hard_assignment(k: int, level: Array, dtype: object = None) -> Categorical:
+    """The one-hot belief on ``level`` over ``k`` levels, its logits in ``dtype`` (``None``: the
+    default float dtype)."""
+    zero = jnp.zeros((), dtype)
+    return Categorical(logits=jnp.where(jnp.arange(k) == level, zero, -jnp.inf))
 
 
 class Growth:
@@ -232,7 +235,7 @@ def grow_beliefs(
         grow, level = growth_decision(scores, live_levels(weights), jnp.log(weights.growth))
         grow = grow & observed & jnp.asarray(gate)
         k = weights.concentration.shape[0]
-        hard = hard_assignment(k, level)
+        hard = hard_assignment(k, level, beliefs[f].logits.dtype)
         out[f] = Categorical(logits=jnp.where(grow, hard.logits, beliefs[f].logits))
         grew[f], woken[f] = grow, level
     return tuple(out), Growth(grew, woken)
@@ -312,7 +315,7 @@ def grow_batch(
 
     def scores_of(working: SystemParams) -> Array:
         """``(N, K)``: every datum under every level of the working copy."""
-        total = jnp.zeros((n, k))
+        total = jnp.zeros((n, k), weights.concentration.dtype)
         for m in mods:
             decl = working.likelihood[m]
             total = total + jax.vmap(lambda y, d=decl: _modality_scores(d, y, (k,)))(
@@ -332,7 +335,7 @@ def grow_batch(
 
     def wake(working: SystemParams, level: Array, y_index: Array) -> SystemParams:
         """The working copy with ``level`` seeded from datum ``y_index`` alone."""
-        onehot = hard_assignment(k, level)
+        onehot = hard_assignment(k, level, working.transition[f].concentration.dtype)
         beliefs = tuple(onehot if g == f else None for g in range(n_facs))
         obs = tuple(
             jnp.take(observations[m], y_index, axis=0) if m in mods else None for m in range(n_mods)
@@ -556,8 +559,9 @@ def merge_levels(
 def factor_evidence(system: System, params: SystemParams, prior: SystemParams, f: int) -> Array:
     """The summed evidence of every slot factor ``f`` is an axis of, its own initial prior
     excepted: that prior mirrors the weights (the woken levels copied, the counts absorbed
-    alike by default), so scoring it would count the weights' evidence twice."""
-    total = jnp.zeros(())
+    alike by default), so scoring it would count the weights' evidence twice. The sum starts in
+    the factor's weights' dtype."""
+    total = jnp.zeros((), params.transition[f].concentration.dtype)
     for slot in ("likelihood", "transition", "initial_state_prior"):
         for i, decl in enumerate(getattr(params, slot)):
             if slot == "initial_state_prior" and i == f:
@@ -578,7 +582,7 @@ def pair_scores(system: System, params: SystemParams, f: int) -> Array:
     weights = params.transition[f]
     k = weights.concentration.shape[0]
     live = live_levels(weights)
-    total = jnp.zeros((k, k))
+    total = jnp.zeros((k, k), weights.concentration.dtype)
     for m in _own_modalities(system, f):
         decl = params.likelihood[m]
         if is_emission(decl):

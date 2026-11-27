@@ -74,6 +74,10 @@ re-recorded with its tolerance measured.
   (for all 24 seeds, by a median 1.4e-4 against 1.7e-4), and under x64, where the plan stays
   float32, the spread does not improve (4.5e-4 against 4.3e-4). The float64 floor (1.5e-8 of the
   RMS) is not reached: the control box is cast to float32 (`controls.py`).
+
+  *Note, 2026-11-27.* The control box now keeps the dtype of its bounds, so a model whose
+  parameters and box are 64-bit is planned with a 64-bit plan and its floor is the 64-bit one
+  (`sqrt(eps)` of float64). The spread above was not measured again.
 - *Quality against the previous rule.* Over a battery of fixtures and seeded warm starts the
   returned `G` is better than the previous rule's by more than 1e-5 in most cases that differ
   and worse by more than 1e-5 in a few unconverged ones (over 203 cases: better in 64, worse in

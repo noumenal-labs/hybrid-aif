@@ -21,7 +21,10 @@ This package is the pure-math bottom layer: no wiring, no block ids, no update r
 6. **Sampling.** ``sample(key, sample_shape)`` takes a JAX PRNG key and a static sample shape;
    discrete draws are ``int32``. It is the default PRNG backend's kernel; distributions never
    change per backend.
-7. **Dtype.** float32 unless a class documents otherwise.
+7. **Dtype.** A float array a caller passes keeps its dtype (at least float32); float arrays of
+   different dtypes promote to the wider; a Python number or an integer array takes the dtype
+   of the float arrays beside it, or alone the default float dtype (float32, float64 under JAX's
+   64-bit mode) (:func:`~hybrid_aif.dtypes.as_floats`).
 """
 
 import abc
@@ -46,8 +49,10 @@ class Distribution(eqx.Module):
     key and a static sample shape; discrete draws are ``int32``), :meth:`mean` (the moment
     view), and :meth:`entropy` and :meth:`kl_to`, which return an
     :class:`~hybrid_aif.interval.Interval`: zero-width where a closed form exists, a bound pair
-    otherwise (mixtures). Arrays are float32 unless a class says otherwise. The full contract is
-    the docstring of :mod:`hybrid_aif.distributions.base`.
+    otherwise (mixtures). A float array passed in keeps its dtype, float arrays of different
+    dtypes promote to the wider, and a Python number or an integer array takes the dtype of the
+    float arrays beside it. The full contract is the docstring of
+    :mod:`hybrid_aif.distributions.base`.
     """
 
     @property

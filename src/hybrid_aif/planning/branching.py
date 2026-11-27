@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from hybrid_aif.distributions import Categorical, ConditionalCategorical
+from hybrid_aif.dtypes import tree_float_dtype
 
 
 def _probs(q) -> Array:
@@ -86,7 +87,7 @@ def make_branch_fn(
     specs = [(likelihood[m], tuple(A_deps[m])) for m in modalities]
 
     def branch(carry: tuple) -> tuple:
-        p = jnp.ones((1,))
+        p = jnp.ones((1,), tree_float_dtype(carry))  # in the beliefs' dtype
         stacked = jax.tree_util.tree_map(lambda x: x[None], carry)
         stats: list[Array] = []
         for A, parents in specs:

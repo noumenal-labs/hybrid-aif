@@ -28,6 +28,9 @@ from tests.test_loop_invariance import (
 )
 
 TICKS = 20
+#: The default float dtype's name, the dtype ``jnp.ones`` makes: float32, or float64 under JAX's
+#: 64-bit mode.
+DEFAULT_FLOAT = "float64" if jax.config.jax_enable_x64 else "float32"
 FACES = ("infer_states", "infer_policies", "act", "update_empirical_prior", "learn")
 
 MODELS = {
@@ -199,7 +202,9 @@ def test_the_standalone_watcher_names_a_changed_shape_and_a_changed_static():
         watched(jnp.ones(3), 2.0)
         watched(jnp.ones(3), 2.0)
     assert watched.traces == 1
-    with pytest.warns(RetraceWarning, match=r"x changed from float32\[3\] to float32\[4\]"):
+    assert jnp.ones(3).dtype == DEFAULT_FLOAT
+    changed = rf"x changed from {DEFAULT_FLOAT}\[3\] to {DEFAULT_FLOAT}\[4\]"
+    with pytest.warns(RetraceWarning, match=changed):
         watched(jnp.ones(4), 2.0)
     with pytest.warns(RetraceWarning, match=r"scale is a static .* from 2.0 to 3.0"):
         watched(jnp.ones(4), 3.0)
@@ -327,7 +332,7 @@ def test_legal_given_as_lists_traces_and_matches_eager():
 def test_a_float_legal_mask_is_refused_with_a_sentence():
     system, params, _, beliefs = _tmaze_obs()
     compiled = system.compiled()
-    with pytest.raises(ValueError, match=r"legal\['u_location'\] is a float32 array"):
+    with pytest.raises(ValueError, match=rf"legal\['u_location'\] is a {DEFAULT_FLOAT} array"):
         compiled.act(jax.random.PRNGKey(0), params, beliefs, legal={"u_location": jnp.ones((5,))})
 
 
@@ -409,7 +414,7 @@ def test_the_watcher_does_not_count_a_dispatch_to_a_cached_program():
     with warnings.catch_warnings():
         warnings.simplefilter("error", RetraceWarning)
         watched(jnp.ones(3))
-        watched(np.ones(3, np.float32))  # a new dispatch signature, the same traced program
+        watched(np.ones(3, DEFAULT_FLOAT))  # a new dispatch signature, the same traced program
     assert watched.traces == 1
     jax.clear_caches()
     with pytest.warns(RetraceWarning, match="cache was cleared"):

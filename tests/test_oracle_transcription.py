@@ -760,7 +760,7 @@ def test_the_dist_head_linears_are_drawn_uniform_as_theirs_are():
     for i, shape in enumerate([(64, 32), (7, 3), (256, 512)]):
         key = jax.random.PRNGKey(40 + i)
         theirs = their_initializer_uniform_avg(key, shape)
-        ours = uniform_avg(key, shape, shape[0], shape[1])
+        ours = uniform_avg(key, shape, shape[0], shape[1], jnp.float32)  # theirs is float32
         np.testing.assert_allclose(np.asarray(ours), np.asarray(theirs), rtol=1e-6, atol=1e-8)
         limit = float(np.sqrt(3.0 / np.mean(shape)))
         assert float(jnp.max(jnp.abs(ours))) <= limit
@@ -806,7 +806,7 @@ def test_the_winit_normal_initializer_is_theirs_key_for_key():
         key = jax.random.PRNGKey(20 + i)
         theirs = their_initializer_normal_avg(key, shape)
         #  ours draws (out, in) for eqx's kernel layout; fans are the same pair
-        ours = trunc_normal_avg(key, shape, shape[0], shape[1])
+        ours = trunc_normal_avg(key, shape, shape[0], shape[1], jnp.float32)  # as theirs
         np.testing.assert_allclose(np.asarray(ours), np.asarray(theirs), rtol=1e-6, atol=1e-8)
         std = float(np.sqrt(1.0 / np.mean(shape)) / 0.87962566103423978)
         assert float(jnp.max(jnp.abs(ours))) <= 2.0 * std + 1e-6  # truncated at ±2σ_param

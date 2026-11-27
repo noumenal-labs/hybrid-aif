@@ -611,14 +611,15 @@ def _episode(key: jax.Array, swing: bool, env: MountainCar) -> WorldBatch:
     the observation ``a_{t-1}`` produced, with ``cont = 1 − done``. Two policies,
     both fixed-key: a noisy energy-pumping swing (which solves the task, so the
     data contains successes and terminations) and a temporally correlated random
-    walk (which almost never does).
+    walk (which almost never does). Every draw and column is float32 in either mode, so
+    the data are the same numbers under JAX's 64-bit mode.
     """
     k_reset, k_pol = jax.random.split(key)
     obs0, state = env.reset(k_reset)
 
     def tick(carry, k):
         state, prev_action, done = carry
-        noise = jax.random.uniform(k, (1,), minval=-1.0, maxval=1.0)
+        noise = jax.random.uniform(k, (1,), jnp.float32, minval=-1.0, maxval=1.0)
         action = (
             jnp.where(state[0][1] >= 0.0, 1.0, -1.0) * 0.9 + 0.1 * noise
             if swing
@@ -629,14 +630,14 @@ def _episode(key: jax.Array, swing: bool, env: MountainCar) -> WorldBatch:
 
     _, (obs, action, reward, cont) = jax.lax.scan(
         tick,
-        (state, jnp.zeros(1), jnp.zeros((), bool)),
+        (state, jnp.zeros(1, jnp.float32), jnp.zeros((), bool)),
         jax.random.split(k_pol, env.time_limit),
     )
     return WorldBatch(
         obs=jnp.concatenate([obs0[0][None], obs[:-1]]),
-        action=jnp.concatenate([jnp.zeros((1, 1)), action[:-1]]),
-        reward=jnp.concatenate([jnp.zeros(1), reward[:-1]]),
-        cont=jnp.concatenate([jnp.ones(1), cont[:-1]]),
+        action=jnp.concatenate([jnp.zeros((1, 1), jnp.float32), action[:-1]]),
+        reward=jnp.concatenate([jnp.zeros(1, jnp.float32), reward[:-1]]),
+        cont=jnp.concatenate([jnp.ones(1, jnp.float32), cont[:-1]]),
     )
 
 
@@ -653,26 +654,28 @@ def trained():
 
     40 episodes × 100 agent steps, 32 for training and 8 held out; 300 gradient
     steps of ``fit_world`` on batches of 8 whole episodes. ~1 minute on CPU, and
-    the assertions below all read this one run.
+    the assertions below all read this one run. The model, the environment and the batch
+    draws are float32 in either mode (``dtype=jnp.float32``, int32 indices), so under JAX's
+    64-bit mode the run is the same numbers.
 
     Chunk 2a runs it **through the declared System**: the model is
     ``worlds.tiny_rssm``'s ``(System, SystemParams)`` pair, the optimizer carry is
     ``system.init_learn_state(params)``, and the trainer reads and writes the
     slots. Everything after this fixture is a statement about a declared model.
     """
-    env = MountainCar()
+    env = MountainCar(dtype=jnp.float32)
     data = _collect(jax.random.PRNGKey(0), 40, env)
     train = jax.tree_util.tree_map(lambda x: x[:32], data)
     held = jax.tree_util.tree_map(lambda x: x[32:], data)
 
-    system, params = tiny_rssm(2, env.action_dim, key=jax.random.PRNGKey(1))
+    system, params = tiny_rssm(2, env.action_dim, key=jax.random.PRNGKey(1), dtype=jnp.float32)
     learn_state = system.init_learn_state(params)
     step = jax.jit(lambda p, s, b, k: fit_world(system, p, s, b, key=k, lr=3e-4))
 
     history = []
     for i in range(300):
         k_batch, k_step = jax.random.split(jax.random.PRNGKey(1000 + i))
-        idx = jax.random.randint(k_batch, (8,), 0, train.obs.shape[0])
+        idx = jax.random.randint(k_batch, (8,), 0, train.obs.shape[0], dtype=jnp.int32)
         batch = jax.tree_util.tree_map(lambda x, idx=idx: x[idx], train)
         params, learn_state, losses = step(params, learn_state, batch, k_step)
         history.append(losses)

@@ -96,7 +96,7 @@ def _mlp_likelihood() -> tuple[System, SystemParams]:
         state_names=("x",),
         epistemic=False,
     )
-    kw = dict(width=8, depth=1)
+    kw = dict(width=8, depth=1, dtype=jnp.float32)  # the recording's dtype, in either mode
     params = SystemParams(
         likelihood={"y": MLPConditional.from_shapes((dim,), 1, key=jax.random.PRNGKey(7), **kw)},
         transition={

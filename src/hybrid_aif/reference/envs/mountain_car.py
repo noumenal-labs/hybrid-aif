@@ -18,7 +18,12 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
+from hybrid_aif.dtypes import float_dtype
 from hybrid_aif.envs.base import Env, Obs, State
+
+
+def _precision(dtype: object):
+    return None if dtype is None else float_dtype(dtype)
 
 
 class MountainCar(Env):
@@ -44,6 +49,9 @@ class MountainCar(Env):
     reset_low: float = eqx.field(static=True, default=-0.6)
     #: The upper end of the uniform reset position.
     reset_high: float = eqx.field(static=True, default=-0.4)
+    #: The float dtype :meth:`reset` draws the state in, or ``None`` for the default float dtype
+    #: (float32, or float64 under JAX's 64-bit mode).
+    dtype: object = eqx.field(static=True, default=None, converter=_precision)
 
     def __check_init__(self) -> None:
         if self.action_repeat < 1:
@@ -80,11 +88,13 @@ class MountainCar(Env):
     # ------------------------------------------------------------------ env faces
 
     def reset(self, key: Array, params=None) -> tuple[Obs, State]:
-        """``position ~ U(-0.6, -0.4)``, ``velocity = 0`` (gymnasium's reset)."""
+        """``position ~ U(-0.6, -0.4)``, ``velocity = 0`` (gymnasium's reset), drawn in
+        :attr:`dtype`."""
+        dtype = jnp.result_type(float) if self.dtype is None else self.dtype
         position = jax.random.uniform(
-            key, (), minval=self.reset_low, maxval=self.reset_high, dtype=jnp.float32
+            key, (), minval=self.reset_low, maxval=self.reset_high, dtype=dtype
         )
-        state = (jnp.stack([position, jnp.zeros((), jnp.float32)]),)
+        state = (jnp.stack([position, jnp.zeros((), position.dtype)]),)
         return self.observe(state), state
 
     def step(self, key: Array, state: State, action: Array, params=None) -> tuple[Obs, State]:
@@ -99,11 +109,13 @@ class MountainCar(Env):
 
         Runs ``action_repeat`` raw steps, freezing the state once the goal is reached. ``reward``
         is −1 per raw step taken before the goal; ``done`` is termination at or before this step.
+        The state, the observation and the reward are in the dtype the state and the action
+        promote to.
         """
         del key, params  # the dynamics are deterministic; only reset draws
         x = state[0]
         done = self.reached_goal((x,))
-        reward = jnp.zeros((), jnp.float32)
+        reward = jnp.zeros((), jnp.result_type(x, jnp.asarray(action)))
         for _ in range(self.action_repeat):
             x_next = self.physics_step(x, action)
             hit = x_next[0] >= self.goal_position

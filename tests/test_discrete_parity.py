@@ -124,15 +124,22 @@ def _log_stable(p):
     return np.log(np.clip(p, float(MINVAL), None)).astype(np.float32)
 
 
+def oracle():
+    """The context the pymdp oracle runs in: JAX's 64-bit mode off, in which it was written (under
+    that mode its scans' carries change dtype); the arrays it is handed are float32."""
+    return jax.enable_x64(False)
+
+
 def _run_both(A_deps, A, num_obs, priors, obs, num_iters=16):
-    obs_onehot = [jax.nn.one_hot(o, n) for o, n in zip(obs, num_obs, strict=True)]
-    qs_ref = run_factorized_fpi(
-        [jnp.asarray(a) for a in A],
-        obs_onehot,
-        [jnp.asarray(p) for p in priors],
-        A_deps,
-        num_iter=num_iters,
-    )
+    with oracle():
+        obs_onehot = [jax.nn.one_hot(o, n) for o, n in zip(obs, num_obs, strict=True)]
+        qs_ref = run_factorized_fpi(
+            [jnp.asarray(a, jnp.float32) for a in A],
+            obs_onehot,
+            [jnp.asarray(p, jnp.float32) for p in priors],
+            A_deps,
+            num_iter=num_iters,
+        )
     ours = fpi(
         [
             ConditionalCategorical(log_table=jnp.asarray(_log_stable(a)), parent_ndims=len(deps))
@@ -171,8 +178,9 @@ def test_fpi_parity_tmaze():
     pytest.importorskip("pymdp.envs")
     from pymdp.envs import TMaze
 
-    env = TMaze(reward_condition=0)
-    A = [np.asarray(a) for a in env.A]
+    with oracle():
+        env = TMaze(reward_condition=0)
+    A = [np.asarray(a, np.float32) for a in env.A]
     A_deps = env.A_dependencies
     num_obs = [a.shape[0] for a in A]
     # Uniform priors so both location and context posteriors are non-degenerate.
@@ -193,16 +201,17 @@ def test_dirichlet_update_parity():
     _, posteriors = _run_both(A_deps, A, num_obs, priors, obs)
     qs = [q.probs for q in posteriors]
 
-    qA_ref, _ = update_obs_likelihood_dirichlet(
-        [jnp.asarray(p) for p in pA],
-        [jnp.asarray(a) for a in A],
-        [jnp.asarray([o]) for o in obs],  # leading time axis of length 1
-        [q[None] for q in qs],
-        A_dependencies=A_deps,
-        categorical_obs=False,
-        num_obs=num_obs,
-        lr=1.0,
-    )
+    with oracle():
+        qA_ref, _ = update_obs_likelihood_dirichlet(
+            [jnp.asarray(p) for p in pA],
+            [jnp.asarray(a) for a in A],
+            [jnp.asarray([o]) for o in obs],  # leading time axis of length 1
+            [q[None] for q in qs],
+            A_dependencies=A_deps,
+            categorical_obs=False,
+            num_obs=num_obs,
+            lr=1.0,
+        )
     qA = update_likelihood_dirichlet(
         [jnp.asarray(p) for p in pA],
         [jnp.asarray(o, dtype=jnp.int32) for o in obs],

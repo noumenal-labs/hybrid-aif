@@ -423,16 +423,27 @@ def test_the_chain_and_the_leaves_read_the_maps_at_one_mean():
 
 
 def _maps_read(monkeypatch, decomposition, belief):
-    """Reads of the two noise maps per plan step, evaluating one plan eagerly."""
+    """Reads of the two noise maps per plan step, evaluating one plan eagerly. A read inside
+    ``jax.eval_shape`` is not counted: under JAX's 64-bit mode a scan first evaluates its body's
+    output dtypes abstractly (:func:`hybrid_aif.dtypes.settled_scan`), which computes nothing."""
     ctx, init, *_ = e5_model(decomposition, belief)
-    counts = {"n": 0}
+    counts = {"n": 0, "abstract": 0}
     real = GridNoiseMap.__call__
+    real_eval_shape = jax.eval_shape
 
     def counted(self, loc):
-        counts["n"] += 1
+        counts["n"] += counts["abstract"] == 0
         return real(self, loc)
 
+    def eval_shape(*args, **kwargs):
+        counts["abstract"] += 1
+        try:
+            return real_eval_shape(*args, **kwargs)
+        finally:
+            counts["abstract"] -= 1
+
     monkeypatch.setattr(GridNoiseMap, "__call__", counted)
+    monkeypatch.setattr(jax, "eval_shape", eval_shape)
     with jax.disable_jit():
         _score_tree(ctx, init)
     return counts["n"] / HORIZON

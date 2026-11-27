@@ -82,7 +82,12 @@ def _assert_trees_equal(batched, single, row):
             for bound in ("lower", "upper"):
                 got = np.asarray(getattr(iv, bound))[row]
                 want = np.asarray(getattr(single[term][key], bound))[0]
-                assert np.array_equal(got, want), (term, key, bound, got, want)
+                if jax.config.jax_enable_x64:
+                    #  float64 reassociation between the batched and the single plan, which
+                    #  float32 rounds away
+                    np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12)
+                else:
+                    assert np.array_equal(got, want), (term, key, bound, got, want)
 
 
 PAYOFF_PLANS = [(0, 0, 0), (1, 2, 2), (2, 1, 2), (2, 2, 1), (1, 1, 0), (0, 2, 1)]

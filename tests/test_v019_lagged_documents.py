@@ -57,8 +57,19 @@ def leaves(prefix, out):
     return flat
 
 
+def assert_recorded(got, want, err_msg=""):
+    """``got`` is the float32 array release 0.19.0 recorded, bit for bit. Under JAX's 64-bit mode
+    a document's inline values build in float64 and the replay computes in float64, so ``got``
+    is the recording to float32 rounding: a tolerance of 1e-6 (measured, 3.6e-7)."""
+    if jax.config.jax_enable_x64:
+        assert np.asarray(got).dtype == np.float64, err_msg  # the replay computed in float64
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6, err_msg=err_msg)
+    else:
+        np.testing.assert_array_equal(got, want, err_msg=err_msg)
+
+
 def assert_as_recorded(tag, run, ref):
-    """Every array release 0.19.0 recorded under ``tag``, bit for bit."""
+    """Every array release 0.19.0 recorded under ``tag`` (:func:`assert_recorded`)."""
     got = leaves(f"{tag}.beliefs", run.beliefs)
     if run.free_energy is not None:
         got[f"{tag}.free_energy"] = np.asarray(run.free_energy)
@@ -67,7 +78,17 @@ def assert_as_recorded(tag, run, ref):
     keys = [k for k in ref.files if k.startswith(f"{tag}.")]
     assert keys
     for k in keys:
-        np.testing.assert_array_equal(got[k], ref[k], err_msg=k)
+        assert_recorded(got[k], ref[k], err_msg=k)
+
+
+def assert_same(a, b):
+    """Bitwise with JAX's 64-bit mode off. With it on, the document's numbers were written in
+    float32 and a natively declared model computes in float64, so the two agree to float32
+    rounding: a relative tolerance of 1e-6."""
+    if jax.config.jax_enable_x64:
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-6)
+    else:
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
 def sources_trace():
@@ -107,7 +128,7 @@ def test_the_built_system_is_the_native_declaration():
     for a, b in zip(
         jax.tree_util.tree_leaves(params), jax.tree_util.tree_leaves(native_params), strict=True
     ):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        assert_same(a, b)
     xs, kinds = sources_trace()
     obs = {"obs_x": xs, "obs_kind": kinds}
     ours = replay(system, params, obs, {}, metrics=False)
@@ -117,7 +138,7 @@ def test_the_built_system_is_the_native_declaration():
         jax.tree_util.tree_leaves(theirs.beliefs),
         strict=True,
     ):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        assert_same(a, b)
 
 
 def test_replay_document_gives_release_0_19_0s_own_replay():
@@ -159,9 +180,9 @@ def test_a_noise_map_beside_the_option_is_kept():
     assert system.observes == (("prev_x", "x_read"),)
     ref = recorded("noise_map")
     run = replay_document(doc, {"obs_x": jnp.asarray(ref["xs"])}, {}, metrics=False)
-    np.testing.assert_array_equal(np.asarray(run.beliefs["x"].loc), ref["loc"])
-    np.testing.assert_array_equal(np.asarray(run.beliefs["x"].chol), ref["chol"])
-    np.testing.assert_array_equal(np.asarray(run.free_energy), ref["free_energy"])
+    assert_recorded(np.asarray(run.beliefs["x"].loc), ref["loc"])
+    assert_recorded(np.asarray(run.beliefs["x"].chol), ref["chol"])
+    assert_recorded(np.asarray(run.free_energy), ref["free_energy"])
     redescribed, _ = describe(system, params, arrays="inline")
     assert redescribed["factors"]["prev_x"]["likelihood"]["options"] == {
         "noise_map": doc["factors"]["prev_x"]["likelihood"]["options"]["noise_map"]
@@ -190,7 +211,7 @@ def test_a_composite_reads_its_components_sources_under_their_prefix():
         else:
             name, field = key.rsplit(".", 1)
             got = getattr(run.beliefs[name], field)
-        np.testing.assert_array_equal(np.asarray(got), ref[key], err_msg=key)
+        assert_recorded(np.asarray(got), ref[key], err_msg=key)
 
 
 def test_the_reported_document_builds():
@@ -235,9 +256,32 @@ def test_the_sources_document_redescribes_as_the_native_one():
         },
         observes={"prev_x": "x_read", "prev_type": "kind_read"},
     )
-    assert describe(system, params, arrays="inline") == describe(
-        native, native_params, arrays="inline"
-    )
+    ours = describe(system, params, arrays="inline")
+    theirs = describe(native, native_params, arrays="inline")
+    if jax.config.jax_enable_x64:
+        #  the document's numbers were written in float32 and the native model computes its
+        #  tables in float64: the two documents agree to float32 rounding
+        assert ours.arrays == theirs.arrays
+        assert_documents_close(ours.document, theirs.document)
+    else:
+        assert ours == theirs
+
+
+def assert_documents_close(a, b, path="document"):
+    """``a == b`` with every float compared to a relative tolerance of 1e-6."""
+    assert type(a) is type(b), path
+    if isinstance(a, dict):
+        assert a.keys() == b.keys(), path
+        for k in a:
+            assert_documents_close(a[k], b[k], f"{path}[{k!r}]")
+    elif isinstance(a, list):
+        assert len(a) == len(b), path
+        for i, (x, y) in enumerate(zip(a, b, strict=True)):
+            assert_documents_close(x, y, f"{path}[{i}]")
+    elif isinstance(a, float):
+        assert a == pytest.approx(b, rel=1e-6), path
+    else:
+        assert a == b, path
 
 
 def test_describe_parameters_reads_the_document_as_the_native_one():

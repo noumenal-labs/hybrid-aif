@@ -869,8 +869,9 @@ def test_the_acting_start_is_the_training_restart(tmp_path):
     start = run_mc.episode_start_beliefs(system, params)
     states, _, _ = core.observe(
         jax.random.PRNGKey(0),
-        jnp.full((1, 1), 0.7),  # zeroed at is_first
-        jnp.asarray([[-0.5, 0.01]]),
+        #  the reference's data are float32 in either mode (columns.DTYPE)
+        jnp.full((1, 1), 0.7, jnp.float32),  # zeroed at is_first
+        jnp.asarray([[-0.5, 0.01]], jnp.float32),
         is_first=jnp.ones((1,), bool),
     )
     assert jnp.array_equal(start["deter"], states.deter[0])

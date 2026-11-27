@@ -97,7 +97,7 @@ def linear_gaussian(decl, parents: tuple, realise: str, name: str):
                 f"emission {name!r}: its kernel is per-mode over {len(lead)} discrete parent(s) "
                 f"and the emission names {len(modes)} after the observed state"
             )
-        w = jnp.ones(())
+        w = jnp.ones((), c.dtype)  # the mixture weights start in the kernel's dtype
         for value, levels in zip(modes, lead, strict=True):
             w = w[..., None] * _weights(value, levels)
         Hs = jnp.broadcast_to(H, (*lead, d_obs, H.shape[-1])).reshape(-1, d_obs, H.shape[-1])
@@ -105,7 +105,7 @@ def linear_gaussian(decl, parents: tuple, realise: str, name: str):
         Rs = jnp.broadcast_to(R, (*lead, d_obs, d_obs)).reshape(-1, d_obs, d_obs)
         w = w.reshape(-1)
     else:
-        Hs, cs, Rs, w = H[None], c[None], R[None], jnp.ones((1,))
+        Hs, cs, Rs, w = H[None], c[None], R[None], jnp.ones((1,), c.dtype)
     m = jnp.einsum("jod,d->jo", Hs, mu) + cs
     mean = jnp.einsum("j,jo->o", w, m)
     if realise == "mode":

@@ -75,9 +75,10 @@ class Gaussian(ExponentialFamily):
         return -0.5 * (self.dim * _LOG_2PI + maha) - self._half_log_det()
 
     def sample(self, key: Array, sample_shape: tuple[int, ...] = ()) -> Array:
-        eps = jax.random.normal(
-            key, sample_shape + self.batch_shape + (self.dim,), dtype=self.loc.dtype
-        )
+        """A draw ``loc + chol ε``, ``ε`` standard normal in the wider of the float dtypes of
+        ``loc`` and ``chol``."""
+        dtype = jnp.result_type(self.loc, self.chol)
+        eps = jax.random.normal(key, sample_shape + self.batch_shape + (self.dim,), dtype=dtype)
         return self.loc + (self.chol @ eps[..., None])[..., 0]
 
     def mean(self) -> Array:
@@ -105,7 +106,8 @@ class Gaussian(ExponentialFamily):
         return Interval.exact(0.5 * (trace + maha - self.dim + log_det_ratio))
 
     def natural(self) -> tuple[Array, ...]:
-        prec = cho_solve((self.chol, True), jnp.broadcast_to(jnp.eye(self.dim), self.cov.shape))
+        eye = jnp.eye(self.dim, dtype=self.chol.dtype)
+        prec = cho_solve((self.chol, True), jnp.broadcast_to(eye, self.cov.shape))
         eta1 = (prec @ self.loc[..., None])[..., 0]
         return (eta1, -0.5 * prec)
 

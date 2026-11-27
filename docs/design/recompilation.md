@@ -146,7 +146,9 @@ boundary (the module docstring is the precise statement):
 - `lr`, `decay`, `alpha` and the per-slot rates: Python numbers become arrays of the default
   float dtype, except a Python `lr` of `0.0` and a Python `decay` of `1.0`, which `learn` reads
   at trace time (a slot skipped, no decay and so no anchor) and which stay static, as `replay`
-  keeps its `0.0`.
+  keeps its `0.0`. *Note, 2026-11-27.* Under JAX's 64-bit mode a Python rate is a weakly typed
+  array instead, so it takes the dtype of each table it scales and widens none (a number and an
+  array rate are then two programs); with that mode off it is the float32 array it was.
 - `legal`: a list is read as the eager faces read it, each mask becomes a bool array (an integer
   mask as bool; a float mask is refused with a sentence, where the eager faces fail with a NumPy
   error), and a concrete mask the eager faces refuse (no legal level at some step, a bare mask of

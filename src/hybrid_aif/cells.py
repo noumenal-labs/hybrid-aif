@@ -16,6 +16,7 @@ from jax import Array
 from jax.scipy.special import ndtr
 
 from hybrid_aif.distributions import Categorical, Gaussian, MixtureGaussian
+from hybrid_aif.dtypes import as_float
 
 
 def _tuple(value, n: int, what: str, cast) -> tuple:
@@ -84,8 +85,9 @@ class Grid:
 
 def _axis_masses(mean: Array, std: Array, n: int, low: float, high: float) -> Array:
     """The mass of ``Normal(mean, std)`` in each of ``n`` equal cells over ``[low, high]``, the
-    first and last absorbing the tails: ``(..., n)``, summing to one."""
-    edges = jnp.linspace(low, high, n + 1)[1:-1]
+    first and last absorbing the tails: ``(..., n)``, summing to one, in the float dtype of
+    ``mean`` and ``std``."""
+    edges = jnp.linspace(low, high, n + 1, dtype=jnp.result_type(mean, std))[1:-1]
     cdf = ndtr((edges - mean[..., None]) / std[..., None])
     zeros = jnp.zeros((*cdf.shape[:-1], 1), cdf.dtype)  # an axis of one cell has no edges
     cdf = jnp.concatenate([zeros, cdf, zeros + 1.0], axis=-1)
@@ -133,10 +135,12 @@ def component_cell_mass(belief: MixtureGaussian, grid: Grid) -> Array:
 def cell_index(point: Array, grid: Grid) -> Array:
     """The cell of ``grid`` that ``point`` (a state of shape ``(..., dim)``) falls in, as an
     ``int32`` index into the cells in :class:`Grid`'s order (``(...)``): the first and last cell
-    on each axis absorb the tail beyond the extent, as :func:`cell_mass` does."""
+    on each axis absorb the tail beyond the extent, as :func:`cell_mass` does; the edges are in
+    ``point``'s float dtype."""
+    point = as_float(point)
     index = jnp.zeros(point.shape[:-1], jnp.int32)
     for a, n, low, high in zip(grid.axes, grid.shape, grid.low, grid.high, strict=True):
-        edges = jnp.linspace(low, high, n + 1)[1:-1]
+        edges = jnp.linspace(low, high, n + 1, dtype=point.dtype)[1:-1]
         along = jnp.sum(point[..., a, None] > edges, axis=-1).astype(jnp.int32)
         index = index * n + along
     return index

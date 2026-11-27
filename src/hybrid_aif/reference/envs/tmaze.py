@@ -15,6 +15,7 @@ the scalar probability arguments, so batches of param sets can be built under
 import jax.numpy as jnp
 from jax import Array
 
+from hybrid_aif.dtypes import as_floats
 from hybrid_aif.envs._process import DiscreteProcess
 from hybrid_aif.envs.generative import GenerativeEnvParams
 
@@ -47,15 +48,16 @@ def tmaze(
     chance the rewarded arm pays, ``punishment_probability`` the chance the other arm punishes,
     ``cue_validity`` the chance the cue location shows the true context, and
     ``reward_condition`` fixes the context (``None``: 50/50). The probabilities may be traced,
-    so batches of parameter sets build under ``vmap``.
+    so batches of parameter sets build under ``vmap``. Every table is in the dtype
+    :func:`~hybrid_aif.dtypes.as_floats` gives the three probabilities: the widest float array
+    among them, else the default float dtype.
     """
-    rp = jnp.asarray(reward_probability, jnp.float32)
-    pp = jnp.asarray(punishment_probability, jnp.float32)
-    cv = jnp.asarray(cue_validity, jnp.float32)
+    rp, pp, cv = as_floats(reward_probability, punishment_probability, cue_validity)
+    dtype = rp.dtype
 
-    A_loc = jnp.eye(NUM_LOCATIONS, dtype=jnp.float32)
+    A_loc = jnp.eye(NUM_LOCATIONS, dtype=dtype)
 
-    A_reward = jnp.zeros((3, NUM_LOCATIONS, 2), jnp.float32)
+    A_reward = jnp.zeros((3, NUM_LOCATIONS, 2), dtype)
     for loc in (CENTRE, CUE, MIDDLE):
         A_reward = A_reward.at[0, loc, :].set(1.0)
     for cond, (arm, other) in enumerate(((LEFT, RIGHT), (RIGHT, LEFT))):
@@ -64,25 +66,25 @@ def tmaze(
         A_reward = A_reward.at[2, other, cond].set(pp)
         A_reward = A_reward.at[0, other, cond].set(1.0 - pp)
 
-    A_cue = jnp.zeros((3, NUM_LOCATIONS, 2), jnp.float32)
+    A_cue = jnp.zeros((3, NUM_LOCATIONS, 2), dtype)
     for loc in (CENTRE, LEFT, RIGHT, MIDDLE):
         A_cue = A_cue.at[0, loc, :].set(1.0)
     for cond in range(2):
         A_cue = A_cue.at[cond + 1, CUE, cond].set(cv)
         A_cue = A_cue.at[2 - cond, CUE, cond].set(1.0 - cv)
 
-    B_loc = jnp.zeros((NUM_LOCATIONS, NUM_LOCATIONS, NUM_LOCATIONS), jnp.float32)
+    B_loc = jnp.zeros((NUM_LOCATIONS, NUM_LOCATIONS, NUM_LOCATIONS), dtype)
     for frm in range(NUM_LOCATIONS):
         for act in range(NUM_LOCATIONS):
             to = act if (frm, act) in _CONNECTIONS else frm
             B_loc = B_loc.at[to, frm, act].set(1.0)
-    B_ctx = jnp.eye(2, dtype=jnp.float32).reshape(2, 2, 1)
+    B_ctx = jnp.eye(2, dtype=dtype).reshape(2, 2, 1)
 
-    D_loc = jnp.zeros(NUM_LOCATIONS, jnp.float32).at[CENTRE].set(1.0)
+    D_loc = jnp.zeros(NUM_LOCATIONS, dtype).at[CENTRE].set(1.0)
     if reward_condition is None:
-        D_ctx = jnp.full(2, 0.5, jnp.float32)
+        D_ctx = jnp.full(2, 0.5, dtype)
     else:
-        D_ctx = jnp.zeros(2, jnp.float32).at[reward_condition].set(1.0)
+        D_ctx = jnp.zeros(2, dtype).at[reward_condition].set(1.0)
 
     env = DiscreteProcess(A_deps=((0,), (0, 1), (0, 1)), B_deps=((0,), (1,)))
     params = GenerativeEnvParams(

@@ -1269,6 +1269,34 @@ One page, shipped-only. Details: `project-brief.md` (architecture),
   batched; `Env`, `GenerativeEnv`, `as_env` and `broadcast_params` stay. Design:
   `design/batched-run.md` R1–R14.
 
+- **v0.23.0**: **float precision follows the model.** The package computes in the float dtype
+  of the arrays it is given: a caller's float array keeps its dtype (at least float32), arrays
+  of different dtypes compute in the wider where they meet, a Python number or an integer array
+  takes the dtype of the float arrays beside it (alone, the default float dtype), an array the
+  package makes takes the dtype of what it is combined with, and nothing is narrowed implicitly
+  (the rule is the module docstring of `hybrid_aif/dtypes.py`). Under JAX's 64-bit mode
+  (`jax_enable_x64`) a 64-bit model therefore runs in 64-bit, continuous controls included,
+  where parts of it were cast to 32-bit before. `cast(tree, dtype, where=None)` moves the float
+  arrays of any tree (a `SystemParams`, beliefs, one distribution, a network, an episode) to
+  float32 or float64, integer and boolean arrays as they are, `where=` restricting it to a part
+  of the tree as `equinox.tree_at` takes it; `SystemParams.cast` is the same call on the
+  params. There are two declared exceptions. A neural network computes in the dtype of its
+  weights (its `dtype` property) and casts its inputs to it, `dtype=` on its constructor
+  choosing the dtype the weights are drawn in; the R-AIF reference draws in float32 (`DTYPE` in
+  `reference/raif/columns.py`) and computes in 32-bit in either mode. A replay buffer stores in
+  the dtype it was declared with. A model with parts in different float dtypes (a mixed model)
+  runs in the wider one and costs set-up time: `run` settles the dtype of each value it carries
+  before its loop by tracing the first round, and refuses a value that first widens in a later
+  round, naming it (the remedy is one float dtype for the model, its rates and its inputs); a
+  hand-written loop over such a model compiles `env.step` twice. Upgrading: with 64-bit mode
+  off results are those of 0.22.0, except that a custom step returning a half-precision carry
+  from a 32-bit reset keeps it at 32-bit. Under 64-bit mode results change wherever a value was
+  rounded to 32-bit; `env.null_action()` is in the default float dtype; and an inline value of
+  a model description builds in the default float dtype, so a 32-bit model described with
+  inline arrays comes back mixed (pass `arrays="file"`, or `cast` the built params). API:
+  "Float precision" in `api/system.rst`; notes dated 2026-11-27 in `design/batched-run.md`,
+  `design/recompilation.md`, `design/amortization.md` and `design/gradient-planner-floor.md`.
+
 ## In the field / in flight
 
 - **Observing a variable (v0.20.0)**: `System.observes` names, per modality, the variable it observes, an action node or an emission of the System, and

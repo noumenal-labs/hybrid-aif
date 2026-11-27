@@ -27,6 +27,23 @@ mean then scale pre-activation, read one of two ways (:attr:`MLPConditional.head
 **LayerNorm.** A normed hidden layer runs ``linear → norm → activation`` (eps 1e-3) and carries
 no bias; the head layer is never normed and keeps its bias.
 
+**Precision.** A network computes in the dtype of its weights. It casts its inputs (parents, carry,
+child, target, a scored code) to that dtype before computing, an integer or boolean input becoming a
+float of it, so its outputs are in that dtype whatever feeds it; downstream they promote by the
+package's rule (:mod:`hybrid_aif.dtypes`). A wider input is rounded to the network's dtype: the
+weights' dtype is the network's declared precision, and this is the one place a computation narrows
+a value (elsewhere only an explicit :func:`~hybrid_aif.dtypes.cast` or a replay buffer's storage
+dtype does). The read-only property ``dtype`` is that dtype: the first layer's weight's (an
+:class:`MLPConditional` or :class:`MLPPredictor` always has at least one layer, its read-out), a
+:class:`GRUCell`'s input projection's, a :class:`LearnedVector`'s value's, and the trunk's for the
+two classes built on an :class:`MLPPredictor`. ``dtype=`` on a constructor only chooses the dtype
+the weights are drawn in (float32, or float64 under JAX's 64-bit mode; ``None``, the default float
+dtype). Precision is changed after construction by :func:`~hybrid_aif.dtypes.cast` alone:
+``cast(net, jnp.float32)``, or for one network of a model
+``params.cast(jnp.float64, where=lambda p: p.recognition["encoder"])``. A network whose layers
+are in different dtypes casts its inputs to its first layer's dtype, and its values promote
+where they meet a wider layer.
+
 Design: docs/design/amortization.md A1, A2, A9, A10
 """
 
@@ -36,11 +53,13 @@ from typing import NamedTuple
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from jax import Array
 
 from hybrid_aif.distributions.categorical import Categorical
 from hybrid_aif.distributions.gaussian import Gaussian
+from hybrid_aif.dtypes import float_dtype
 
 #: The default optimizer, at unit learning rate: ``learn`` scales the updates by the slot's
 #: resolved rate, which equals ``optax.adam(lr)`` and keeps the rate traceable.
@@ -76,35 +95,62 @@ def _inverse_softplus(y: float) -> float:
     return float(jnp.log(jnp.expm1(jnp.asarray(y))))
 
 
+def _precision(dtype: object) -> np.dtype | None:
+    """A constructor's ``dtype`` argument checked (:func:`~hybrid_aif.dtypes.float_dtype`), or
+    ``None``."""
+    return None if dtype is None else float_dtype(dtype)
+
+
+def _draw_dtype(dtype: np.dtype | None) -> np.dtype:
+    """The dtype weights are drawn in: ``dtype``, or the default float dtype."""
+    return jnp.result_type(float) if dtype is None else dtype
+
+
+def _weights_dtype(weight: Array) -> np.dtype:
+    """The float dtype a network computes in: that of ``weight``, one of its weight arrays."""
+    return jnp.result_type(weight)
+
+
+def _input(x: Array, dtype: np.dtype) -> Array:
+    """An input as an array in ``dtype``, the dtype of the network that reads it."""
+    return jnp.asarray(x).astype(dtype)
+
+
 #: The standard deviation of a unit normal truncated to [-2, 2]. Dividing a truncated
 #: draw by it makes the weights' std come out at ``sqrt(scale / denom)`` exactly rather
 #: than 0.8796× it.
 _TRUNC_NORMAL_STD = 0.87962566103423978
 
 
-def trunc_normal_avg(key: Array, shape: tuple[int, ...], fan_in: int, fan_out: int) -> Array:
+def trunc_normal_avg(
+    key: Array, shape: tuple[int, ...], fan_in: int, fan_out: int, dtype: object = None
+) -> Array:
     """Truncated-normal weights with variance scaled by the average fan, at scale 1.0.
 
     ``std = sqrt(1 / mean(fan_in, fan_out)) / 0.87962566…`` times a unit normal truncated to
-    ``[-2, 2]`` (DreamerV3's ``winit: normal, fan: avg``). Returns a float32 array of ``shape``;
-    biases are the caller's. The fans are arguments so a caller can draw half of a fused layer at
-    that half's own fan.
+    ``[-2, 2]`` (DreamerV3's ``winit: normal, fan: avg``). Returns an array of ``shape`` drawn in
+    ``dtype`` (float32 or float64), by default the default float dtype; biases are the caller's.
+    The fans are arguments so a caller can draw half of a fused layer at that half's own fan.
     """
     denom = (float(fan_in) + float(fan_out)) / 2.0
     std = (1.0 / denom) ** 0.5 / _TRUNC_NORMAL_STD
-    return std * jax.random.truncated_normal(key, -2.0, 2.0, shape, jnp.float32)
+    dtype = _draw_dtype(_precision(dtype))
+    return std * jax.random.truncated_normal(key, -2.0, 2.0, shape, dtype)
 
 
-def uniform_avg(key: Array, shape: tuple[int, ...], fan_in: int, fan_out: int) -> Array:
+def uniform_avg(
+    key: Array, shape: tuple[int, ...], fan_in: int, fan_out: int, dtype: object = None
+) -> Array:
     """Uniform weights with variance scaled by the average fan, at scale 1.0.
 
     ``U(−limit, limit)`` with ``limit = sqrt(3 / mean(fan_in, fan_out))``: the second moment of
-    :func:`trunc_normal_avg` in a uniform shape (DreamerV3's ``winit: uniform``). Returns a float32
-    array of ``shape``. Under ``init="trunc_normal_avg"`` a stack's read-out layer draws this.
+    :func:`trunc_normal_avg` in a uniform shape (DreamerV3's ``winit: uniform``). Returns an array
+    of ``shape`` drawn in ``dtype``, by default the default float dtype. Under
+    ``init="trunc_normal_avg"`` a stack's read-out layer draws this.
     """
     denom = (float(fan_in) + float(fan_out)) / 2.0
     limit = (3.0 / denom) ** 0.5
-    return jax.random.uniform(key, shape, jnp.float32, -limit, limit)
+    return jax.random.uniform(key, shape, _draw_dtype(_precision(dtype)), -limit, limit)
 
 
 class MLPConditional(eqx.Module):
@@ -122,6 +168,9 @@ class MLPConditional(eqx.Module):
 
     The final layer emits ``2 * child_dim`` numbers, the mean and then the scale
     pre-activation, read as ``head`` says.
+
+    It computes in :attr:`dtype`, its weights' dtype: the parents and the child are cast to it,
+    so the head's mean and scale are in it (see the module docstring).
     """
 
     #: The linear layers; the trainable leaves live here.
@@ -234,6 +283,7 @@ class MLPConditional(eqx.Module):
         maxstd: float = 1.0,
         init: str = "default",
         propagation: str = "first_order",
+        dtype: object = None,
     ) -> "MLPConditional":
         """A randomly-initialized net: ``depth`` hidden layers of ``width`` units.
 
@@ -248,8 +298,10 @@ class MLPConditional(eqx.Module):
           fan), every bias zero. ``init="default"`` is ``eqx.nn.Linear``'s initializer throughout.
 
         ``propagation`` sets the static field of that name: ``"first_order"`` (default) or
-        ``"unscented"``.
+        ``"unscented"``. ``dtype`` (float32 or float64) is the dtype the weights are drawn in, so
+        the one the net computes in; ``None`` is the default float dtype.
         """
+        dtype = _precision(dtype)
         parent_dims = tuple(int(d) for d in parent_dims)
         child_dim = int(child_dim)
         if depth < 0:
@@ -265,7 +317,7 @@ class MLPConditional(eqx.Module):
         layers = [
             #  a normed hidden layer carries no bias (module docstring);
             #  the head layer (i == depth) is never normed and always keeps its bias
-            eqx.nn.Linear(a, b, use_bias=not (norm and i < depth), key=k)
+            eqx.nn.Linear(a, b, use_bias=not (norm and i < depth), dtype=dtype, key=k)
             for i, (a, b, k) in enumerate(zip(sizes[:-1], sizes[1:], list(keys), strict=True))
         ]
         if init == "trunc_normal_avg":
@@ -277,14 +329,14 @@ class MLPConditional(eqx.Module):
                     #  uniform at its own fan (fan_out = child_dim)
                     weight = jnp.concatenate(
                         [
-                            uniform_avg(wkeys[i], (child_dim, fan_in), fan_in, child_dim),
-                            uniform_avg(wkeys[-1], (child_dim, fan_in), fan_in, child_dim),
+                            uniform_avg(wkeys[i], (child_dim, fan_in), fan_in, child_dim, dtype),
+                            uniform_avg(wkeys[-1], (child_dim, fan_in), fan_in, child_dim, dtype),
                         ],
                         axis=0,
                     )
                 else:
                     out = layer.out_features
-                    weight = trunc_normal_avg(wkeys[i], (out, fan_in), fan_in, out)
+                    weight = trunc_normal_avg(wkeys[i], (out, fan_in), fan_in, out, dtype)
                 layer = eqx.tree_at(lambda m: m.weight, layer, weight)
                 if layer.bias is not None:  # every bias starts at zero
                     layer = eqx.tree_at(lambda m: m.bias, layer, jnp.zeros_like(layer.bias))
@@ -302,7 +354,11 @@ class MLPConditional(eqx.Module):
             layers=tuple(layers),
             parent_dims=parent_dims,
             child_dim=child_dim,
-            norms=(tuple(eqx.nn.LayerNorm(w, eps=1e-3) for w in sizes[1:-1]) if norm else ()),
+            norms=(
+                tuple(eqx.nn.LayerNorm(w, eps=1e-3, dtype=dtype) for w in sizes[1:-1])
+                if norm
+                else ()
+            ),
             activation=activation,
             min_scale=min_scale,
             frozen=frozen,
@@ -320,6 +376,11 @@ class MLPConditional(eqx.Module):
         return sum(self.parent_dims)
 
     @property
+    def dtype(self) -> np.dtype:
+        """The float dtype the net computes in: its first layer's weight's."""
+        return _weights_dtype(self.layers[0].weight)
+
+    @property
     def learnable(self) -> bool:
         """Capability: a non-frozen net's weights are a trainable block."""
         return not self.frozen
@@ -332,7 +393,7 @@ class MLPConditional(eqx.Module):
                 f"got {len(parents)} parent value(s) for {len(self.parent_dims)} declared "
                 f"parent(s) (parent_dims={self.parent_dims})"
             )
-        cast = [jnp.asarray(p) for p in parents]
+        cast = [_input(p, self.dtype) for p in parents]
         for i, (p, d) in enumerate(zip(cast, self.parent_dims, strict=True)):
             if p.shape != (d,):
                 raise ValueError(
@@ -391,7 +452,7 @@ class MLPConditional(eqx.Module):
         Design: docs/design/amortization.md chunk 2c note §(e) item 1
         """
         mean, scale = self._head(parents)
-        z = (jnp.asarray(child) - mean) / scale
+        z = (_input(child, self.dtype) - mean) / scale
         return (
             0.5 * jnp.sum(z**2, axis=-1)
             + jnp.sum(jnp.log(scale), axis=-1)
@@ -505,14 +566,17 @@ def apply_gradient(
 # ============================================================== the shared MLP trunk
 
 
-def _concat_parents(parents: tuple[Array, ...], parent_dims: tuple[int, ...]) -> Array:
-    """The parent convention: one unbatched vector per declared parent, concatenated."""
+def _concat_parents(
+    parents: tuple[Array, ...], parent_dims: tuple[int, ...], dtype: np.dtype
+) -> Array:
+    """The parent convention: one unbatched vector per declared parent, each cast to ``dtype``
+    (the reading network's), concatenated."""
     if len(parents) != len(parent_dims):
         raise ValueError(
             f"got {len(parents)} parent value(s) for {len(parent_dims)} declared parent(s) "
             f"(parent_dims={parent_dims})"
         )
-    cast = [jnp.asarray(p) for p in parents]
+    cast = [_input(p, dtype) for p in parents]
     for i, (p, d) in enumerate(zip(cast, parent_dims, strict=True)):
         if p.shape != (d,):
             raise ValueError(
@@ -530,6 +594,7 @@ def _linear_stack(
     init: str = "default",
     hidden: int | None = None,
     norm: bool = False,
+    dtype: np.dtype | None = None,
 ) -> tuple[eqx.nn.Linear, ...]:
     """``len(sizes) − 1`` linears chained ``sizes[0] → sizes[1] → … → sizes[-1]``.
 
@@ -539,7 +604,8 @@ def _linear_stack(
     :func:`trunc_normal_avg` on hidden layers (biasless when ``norm``) and :func:`uniform_avg` on
     the read-out, every kept bias starting at zero. ``out_scale`` multiplies the read-out weights
     and zeroes its bias (``0.0`` starts at the constant zero output). ``norm`` only places biases;
-    the caller builds the LayerNorms. Raises ``ValueError`` on an unknown ``init``.
+    the caller builds the LayerNorms. The weights are drawn in ``dtype``, by default the default
+    float dtype. Raises ``ValueError`` on an unknown ``init``.
     """
     if init not in ("default", "trunc_normal_avg"):
         raise ValueError(
@@ -552,12 +618,12 @@ def _linear_stack(
     layers = []
     for i, (a, b, k) in enumerate(zip(sizes[:-1], sizes[1:], list(keys), strict=True)):
         if init == "default":
-            layers.append(eqx.nn.Linear(a, b, key=k))
+            layers.append(eqx.nn.Linear(a, b, dtype=dtype, key=k))
             continue
         is_hidden = i < n_hidden  # hidden: truncated normal, and biasless under a norm
-        layer = eqx.nn.Linear(a, b, use_bias=not (is_hidden and norm), key=k)
+        layer = eqx.nn.Linear(a, b, use_bias=not (is_hidden and norm), dtype=dtype, key=k)
         draw = trunc_normal_avg if is_hidden else uniform_avg
-        layer = eqx.tree_at(lambda m: m.weight, layer, draw(k, (b, a), a, b))
+        layer = eqx.tree_at(lambda m: m.weight, layer, draw(k, (b, a), a, b, dtype))
         if layer.bias is not None:  # a kept bias starts at zero
             layer = eqx.tree_at(lambda m: m.bias, layer, jnp.zeros_like(layer.bias))
         layers.append(layer)
@@ -575,6 +641,9 @@ class MLPPredictor(eqx.Module):
     The trunk the other classes here are built from; paired with a loss it is a head without a
     density family (:class:`PredictorHead`). ``depth`` hidden layers of ``width`` units, each
     optionally layer-normed (eps 1e-3) then activated, and a final linear to ``out_dim``.
+
+    It computes in :attr:`dtype`, its weights' dtype: the parents are cast to it before the first
+    layer, so the output is in it (see the module docstring).
     """
 
     #: The linear layers (the trainable leaves).
@@ -641,13 +710,17 @@ class MLPPredictor(eqx.Module):
         frozen: bool = False,
         symlog_inputs: bool = False,
         init: str = "default",
+        dtype: object = None,
     ) -> "MLPPredictor":
         """A randomly-initialized trunk: ``depth`` hidden layers of ``width`` units.
 
         ``width`` is required. ``norm=True`` puts a LayerNorm (eps 1e-3) before each activation.
         ``out_scale`` scales the final layer's weights and zeroes its bias (``0.0`` starts at the
-        constant zero prediction). ``init`` is as in :func:`_linear_stack`.
+        constant zero prediction). ``init`` is as in :func:`_linear_stack`. ``dtype`` (float32 or
+        float64) is the dtype the weights are drawn in, so the one the trunk computes in; ``None``
+        is the default float dtype.
         """
+        dtype = _precision(dtype)
         parent_dims = tuple(int(d) for d in parent_dims)
         out_dim = int(out_dim)
         if depth < 0:
@@ -655,10 +728,13 @@ class MLPPredictor(eqx.Module):
         sizes = [sum(parent_dims), *([width] * depth), out_dim]
         activated = len(sizes) - 1 if out_activation else len(sizes) - 2
         layers = _linear_stack(
-            sizes, key, out_scale=out_scale, init=init, hidden=activated, norm=norm
+            sizes, key, out_scale=out_scale, init=init, hidden=activated, norm=norm, dtype=dtype
         )
         norms = (
-            tuple(eqx.nn.LayerNorm(layer.out_features, eps=1e-3) for layer in layers[:activated])
+            tuple(
+                eqx.nn.LayerNorm(layer.out_features, eps=1e-3, dtype=dtype)
+                for layer in layers[:activated]
+            )
             if norm
             else ()
         )
@@ -683,13 +759,18 @@ class MLPPredictor(eqx.Module):
         return sum(self.parent_dims)
 
     @property
+    def dtype(self) -> np.dtype:
+        """The float dtype the trunk computes in: its first layer's weight's."""
+        return _weights_dtype(self.layers[0].weight)
+
+    @property
     def learnable(self) -> bool:
         """Capability: a non-frozen trunk's weights are a trainable block."""
         return not self.frozen
 
     def __call__(self, parents: tuple[Array, ...]) -> Array:
         """The raw output vector, shape ``(out_dim,)``."""
-        h = _concat_parents(parents, self.parent_dims)
+        h = _concat_parents(parents, self.parent_dims, self.dtype)
         if self.symlog_inputs:
             h = symlog(h)
         act = _ACTIVATIONS[self.activation]
@@ -756,6 +837,9 @@ class MLPCategorical(eqx.Module):
     as a straight-through one-hot. The child value is the one-hot code, shape ``(num_vars,
     num_classes)``; :attr:`flat_dim` is its width as a downstream parent. There is no ``moments``:
     :meth:`probs` is this family's moment view.
+
+    It computes in :attr:`dtype`, the trunk's: the parents and a scored code are cast to it, so
+    the logits are in it (see the module docstring).
     """
 
     #: The network from the concatenated parents to the ``num_vars * num_classes`` logits.
@@ -797,10 +881,11 @@ class MLPCategorical(eqx.Module):
         unimix: float = 0.01,
         frozen: bool = False,
         init: str = "default",
+        dtype: object = None,
     ) -> "MLPCategorical":
         """A randomly-initialized head: ``depth`` normed, activated hidden layers of ``width`` units
-        (required), then a linear to the ``num_vars·num_classes`` logits. ``init`` is as in
-        :meth:`MLPPredictor.from_shapes`.
+        (required), then a linear to the ``num_vars·num_classes`` logits. ``init`` and ``dtype``
+        are as in :meth:`MLPPredictor.from_shapes`.
         """
         trunk = MLPPredictor.from_shapes(
             parent_dims,
@@ -812,6 +897,7 @@ class MLPCategorical(eqx.Module):
             norm=norm,
             frozen=frozen,
             init=init,
+            dtype=dtype,
         )
         return cls(
             trunk=trunk, num_vars=int(num_vars), num_classes=int(num_classes), unimix=float(unimix)
@@ -837,6 +923,11 @@ class MLPCategorical(eqx.Module):
         return self.trunk.frozen
 
     @property
+    def dtype(self) -> np.dtype:
+        """The float dtype the head computes in: its trunk's."""
+        return self.trunk.dtype
+
+    @property
     def learnable(self) -> bool:
         return self.trunk.learnable
 
@@ -858,7 +949,7 @@ class MLPCategorical(eqx.Module):
         return jax.nn.softmax(self.logits(parents), axis=-1)
 
     def _as_code(self, child: Array) -> Array:
-        child = jnp.asarray(child)
+        child = _input(child, self.dtype)
         if child.shape == (self.num_vars, self.num_classes):
             return child
         if child.shape == (self.flat_dim,):
@@ -979,20 +1070,24 @@ def symlog_mse_nll(prediction: Array, target: Array) -> Array:
     return jnp.sum((jnp.asarray(prediction) - symlog(target)) ** 2, axis=-1)
 
 
-def disc_bins(num_bins: int = 255, low: float = -20.0, high: float = 20.0) -> Array:
-    """The ``symlog_disc`` head's bin centres: ``num_bins`` evenly spaced over ``[low, high]``."""
+def disc_bins(
+    num_bins: int = 255, low: float = -20.0, high: float = 20.0, dtype: object = None
+) -> Array:
+    """The ``symlog_disc`` head's bin centres: ``num_bins`` evenly spaced over ``[low, high]``, in
+    ``dtype`` (by default the default float dtype)."""
     if num_bins < 2:
         raise ValueError(f"num_bins must be at least 2, got {num_bins}")
     if not high > low:
         raise ValueError(f"need low < high, got low={low}, high={high}")
-    return jnp.linspace(low, high, num_bins)
+    return jnp.linspace(low, high, num_bins, dtype=_draw_dtype(_precision(dtype)))
 
 
 def twohot(target: Array, bins: Array) -> Array:
     """Two-hot encoding of a scalar target over ``bins`` (DreamerV3's ``DiscDist``).
 
     Mass on the two bracketing bins, split linearly, so the encoding's expectation is the target
-    (clipped at the ends). Vectorize over a batch with ``vmap``.
+    (clipped at the ends). The encoding is in the dtype the target and the bins promote to.
+    Vectorize over a batch with ``vmap``.
     """
     target, bins = jnp.asarray(target), jnp.asarray(bins)
     if target.shape != ():
@@ -1007,8 +1102,8 @@ def twohot(target: Array, bins: Array) -> Array:
     d_above = jnp.where(equal, 1.0, jnp.abs(bins[above] - target))
     total = d_below + d_above
     return (
-        jax.nn.one_hot(below, n) * (d_above / total)[..., None]
-        + jax.nn.one_hot(above, n) * (d_below / total)[..., None]
+        jax.nn.one_hot(below, n, dtype=total.dtype) * (d_above / total)[..., None]
+        + jax.nn.one_hot(above, n, dtype=total.dtype) * (d_below / total)[..., None]
     )
 
 
@@ -1053,6 +1148,10 @@ class PredictorHead(eqx.Module):
     :meth:`nll` is the training loss and :meth:`predict` the decoded prediction, in the value's own
     units. Not a Distribution or a :class:`~hybrid_aif.distributions.Conditional`, and role-free.
     The three loss names are a closed list; an unknown name raises.
+
+    It computes in :attr:`dtype`, the trunk's: the parents and a target are cast to it, so the loss
+    and the prediction are in it (see the module docstring). The bins are made in the dtype of the
+    logits that read them.
 
     Design: docs/design/amortization-p0-addendum.md §2
     """
@@ -1113,10 +1212,12 @@ class PredictorHead(eqx.Module):
         frozen: bool = False,
         symlog_inputs: bool = False,
         init: str = "default",
+        dtype: object = None,
     ) -> "PredictorHead":
         """A randomly-initialized head. ``out_dim`` is required for ``symlog_mse`` and rejected by
         the other two losses, which fix the trunk's width (one logit per bin; one logit). ``width``
-        is required; the trunk arguments are :meth:`MLPPredictor.from_shapes`'s.
+        is required; the trunk arguments, ``dtype`` among them, are
+        :meth:`MLPPredictor.from_shapes`'s.
         """
         if loss not in _HEAD_LOSSES:
             raise ValueError(
@@ -1149,6 +1250,7 @@ class PredictorHead(eqx.Module):
                 frozen=frozen,
                 symlog_inputs=symlog_inputs,
                 init=init,
+                dtype=dtype,
             ),
             loss=loss,
             num_bins=int(num_bins),
@@ -1181,15 +1283,24 @@ class PredictorHead(eqx.Module):
         return self.trunk.frozen
 
     @property
+    def dtype(self) -> np.dtype:
+        """The float dtype the head computes in: its trunk's."""
+        return self.trunk.dtype
+
+    @property
     def learnable(self) -> bool:
         return self.trunk.learnable
 
     @property
     def bins(self) -> Array:
-        """A ``symlog_disc`` head's bin centres (a constant; XLA folds it)."""
+        """A ``symlog_disc`` head's bin centres (a constant; XLA folds it), in the head's
+        :attr:`dtype`."""
+        return self._bins(self.dtype)
+
+    def _bins(self, dtype: object) -> Array:
         if self.loss != "symlog_disc":
             raise ValueError(f"a {self.loss} head has no bins")
-        return disc_bins(self.num_bins, self.bin_low, self.bin_high)
+        return disc_bins(self.num_bins, self.bin_low, self.bin_high, dtype)
 
     # ---------------------------------------------------------------- the contract
 
@@ -1200,10 +1311,11 @@ class PredictorHead(eqx.Module):
     def nll(self, target: Array, parents: tuple[Array, ...]) -> Array:
         """This head's loss on one target: the training half of the contract."""
         out = self.trunk(parents)
+        target = _input(target, self.dtype)
         if self.loss == "symlog_mse":
             return symlog_mse_nll(out, target)
         if self.loss == "symlog_disc":
-            return symlog_disc_nll(out, target, self.bins)
+            return symlog_disc_nll(out, target, self._bins(out.dtype))
         return binary_nll(out[0], target)
 
     def predict(self, parents: tuple[Array, ...]) -> Array:
@@ -1216,7 +1328,7 @@ class PredictorHead(eqx.Module):
         if self.loss == "symlog_mse":
             return symexp(out)
         if self.loss == "symlog_disc":
-            return symlog_disc_mean(out, self.bins)
+            return symlog_disc_mean(out, self._bins(out.dtype))
         return jax.nn.sigmoid(out[0])
 
     # ---------------------------------------------------------------- the optax step
@@ -1242,6 +1354,9 @@ class GRUCell(eqx.Module):
 
     ``inputs`` are unbatched vectors of widths ``input_dims``, in declaration order; the carry is
     passed separately.
+
+    It computes in :attr:`dtype`, its input projection's weight's dtype: the carry and the inputs
+    are cast to it, so the next carry is in it (see the module docstring).
     """
 
     #: The projection of the non-carry inputs to ``hidden`` units.
@@ -1296,6 +1411,7 @@ class GRUCell(eqx.Module):
         activation: str = "silu",
         norm: bool = True,
         init: str = "default",
+        dtype: object = None,
     ) -> "GRUCell":
         """A randomly-initialized cell; ``hidden`` (required) is the width the
         non-carry inputs are projected to.
@@ -1303,8 +1419,10 @@ class GRUCell(eqx.Module):
         ``norm=True`` puts a LayerNorm (eps 1e-3) after each of the two linears. ``init="default"``
         keeps both biases and ``eqx.nn.Linear``'s draw; ``init="trunc_normal_avg"`` draws
         :func:`trunc_normal_avg` weights on both linears, drops their biases when normed and starts
-        any kept bias at zero.
+        any kept bias at zero. ``dtype`` (float32 or float64) is the dtype the weights are drawn
+        in, so the one the cell computes in; ``None`` is the default float dtype.
         """
+        dtype = _precision(dtype)
         if init not in ("default", "trunc_normal_avg"):
             raise ValueError(
                 f"unknown init {init!r}; the initializers are ['default', 'trunc_normal_avg']"
@@ -1314,13 +1432,13 @@ class GRUCell(eqx.Module):
         k_in, k_gate = jax.random.split(key)
         n_in, n_gate = sum(input_dims), deter_dim + hidden
         use_bias = init == "default" or not norm
-        input_proj = eqx.nn.Linear(n_in, hidden, use_bias=use_bias, key=k_in)
-        gate = eqx.nn.Linear(n_gate, 3 * deter_dim, use_bias=use_bias, key=k_gate)
+        input_proj = eqx.nn.Linear(n_in, hidden, use_bias=use_bias, dtype=dtype, key=k_in)
+        gate = eqx.nn.Linear(n_gate, 3 * deter_dim, use_bias=use_bias, dtype=dtype, key=k_gate)
         if init == "trunc_normal_avg":
 
             def reinit(layer: eqx.nn.Linear, k: Array) -> eqx.nn.Linear:
                 fan_in, fan_out = layer.in_features, layer.out_features
-                weight = trunc_normal_avg(k, (fan_out, fan_in), fan_in, fan_out)
+                weight = trunc_normal_avg(k, (fan_out, fan_in), fan_in, fan_out, dtype)
                 layer = eqx.tree_at(lambda m: m.weight, layer, weight)
                 if layer.bias is not None:  # a kept bias starts at zero
                     layer = eqx.tree_at(lambda m: m.bias, layer, jnp.zeros_like(layer.bias))
@@ -1331,7 +1449,10 @@ class GRUCell(eqx.Module):
             input_proj=input_proj,
             gate=gate,
             norms=(
-                (eqx.nn.LayerNorm(hidden, eps=1e-3), eqx.nn.LayerNorm(3 * deter_dim, eps=1e-3))
+                (
+                    eqx.nn.LayerNorm(hidden, eps=1e-3, dtype=dtype),
+                    eqx.nn.LayerNorm(3 * deter_dim, eps=1e-3, dtype=dtype),
+                )
                 if norm
                 else ()
             ),
@@ -1340,15 +1461,20 @@ class GRUCell(eqx.Module):
             activation=activation,
         )
 
+    @property
+    def dtype(self) -> np.dtype:
+        """The float dtype the cell computes in: its input projection's weight's."""
+        return _weights_dtype(self.input_proj.weight)
+
     def __call__(self, deter: Array, *inputs: Array) -> Array:
         """The next carry, shape ``(deter_dim,)``. Unbatched; batch with ``vmap``."""
-        deter = jnp.asarray(deter)
+        deter = _input(deter, self.dtype)
         if deter.shape != (self.deter_dim,):
             raise ValueError(
                 f"deter has shape {deter.shape}, expected ({self.deter_dim},) — the carry is an "
                 "unbatched vector; batch with vmap"
             )
-        x = self.input_proj(_concat_parents(inputs, self.input_dims))
+        x = self.input_proj(_concat_parents(inputs, self.input_dims, self.dtype))
         if self.norms:
             x = self.norms[0](x)
         x = _ACTIVATIONS[self.activation](x)
@@ -1370,6 +1496,8 @@ class LearnedVector(eqx.Module):
     The canonical use is an episode-start carry: zeros through ``tanh``, so a fresh one starts at
     the zero carry and stays in [-1, 1]. Role-free; its gradient arrives from whatever consumes its
     value. Trainable, it is DreamerV3's ``initial: 'learned'``; frozen, ``initial: 'zeros'``.
+
+    It has no inputs, so its output is in :attr:`dtype`, the dtype of ``value``.
     """
 
     #: The pre-activation parameter.
@@ -1391,13 +1519,25 @@ class LearnedVector(eqx.Module):
             )
 
     @classmethod
-    def zeros(cls, dim: int, *, activation: str = "tanh", frozen: bool = False) -> "LearnedVector":
-        """The zero pre-activation — hence, under ``tanh``, the zero output."""
-        return cls(value=jnp.zeros((int(dim),), jnp.float32), activation=activation, frozen=frozen)
+    def zeros(
+        cls, dim: int, *, activation: str = "tanh", frozen: bool = False, dtype: object = None
+    ) -> "LearnedVector":
+        """The zero pre-activation — hence, under ``tanh``, the zero output — in ``dtype``
+        (float32 or float64), by default the default float dtype."""
+        return cls(
+            value=jnp.zeros((int(dim),), _draw_dtype(_precision(dtype))),
+            activation=activation,
+            frozen=frozen,
+        )
 
     @property
     def dim(self) -> int:
         return int(jnp.shape(self.value)[0])
+
+    @property
+    def dtype(self) -> np.dtype:
+        """The float dtype of the vector and its output: its value's."""
+        return _weights_dtype(self.value)
 
     @property
     def learnable(self) -> bool:

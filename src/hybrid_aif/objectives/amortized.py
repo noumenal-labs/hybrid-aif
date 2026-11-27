@@ -31,6 +31,7 @@ from jax.scipy.special import xlogy
 
 from hybrid_aif.distributions import MLPConditional
 from hybrid_aif.distributions.neural import PredictorHead, init_opt_state
+from hybrid_aif.dtypes import as_float, tree_float_dtype
 from hybrid_aif.inference import amortized as _amortized
 from hybrid_aif.interval import Interval
 from hybrid_aif.objectives import registry
@@ -83,7 +84,7 @@ def _action_vector(
     if action is None:
         raise ValueError("the ensemble_disagreement row scores an action and was given none")
     if controls is not None:
-        return jnp.asarray(action, jnp.float32)
+        return as_float(action)
     return jnp.concatenate(
         [
             jax.nn.one_hot(jnp.asarray(action)[k], n)
@@ -551,13 +552,19 @@ RETNORM_KEY = "imagine.retnorm"
 SLOW_KEY = "imagine.slow_updates"
 
 
-def scoring_moments(name: str) -> dict[str, Array]:
+def scoring_moments(name: str, entry: object = None) -> dict[str, Array]:
     """The fresh ``LearnState.moments`` entries one scoring row's trainer carries.
 
     Created up front so a trainer fills its entries and never adds one, keeping
     the carry's pytree structure fixed across calls. Only ``g_tail`` has any
-    (:data:`RETNORM_KEY`, :data:`SLOW_KEY`); every other row returns ``{}``.
+    (:data:`RETNORM_KEY` and :data:`SLOW_KEY`); every other scoring term gets ``{}``. The return
+    normalizer's statistics are in the float dtype of ``entry``, the term's parameters (the
+    critic pair), whose values they normalize (:func:`~hybrid_aif.dtypes.tree_float_dtype`: the
+    default float dtype when ``entry`` holds no float array).
     """
     if name == "g_tail":
-        return {RETNORM_KEY: jnp.zeros((2,), jnp.float32), SLOW_KEY: jnp.zeros((), jnp.int32)}
+        return {
+            RETNORM_KEY: jnp.zeros((2,), tree_float_dtype(entry)),
+            SLOW_KEY: jnp.zeros((), jnp.int32),
+        }
     return {}

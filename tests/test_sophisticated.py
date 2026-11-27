@@ -59,7 +59,12 @@ def test_a_pragmatic_agent_goes_to_the_cue_when_it_plans_on_what_the_cue_will_sa
 
 
 def test_without_an_outcome_to_branch_on_the_cue_is_worth_nothing_to_it():
+    from tests.test_run_parity import as_recorded
+
+    #  the argmax among tied policies is set by float32 rounding: the model is float32 in
+    #  either mode (cast under JAX's 64-bit mode)
     open_loop, params = tmaze_system(policy_len=4, epistemic=False)
+    params = as_recorded(params)
     beliefs = _initial_beliefs(open_loop, params)
     blind = _replanned(open_loop, planner="sophisticated")
     assert _first_action(blind, params, beliefs) != CUE

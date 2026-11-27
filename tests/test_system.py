@@ -178,7 +178,12 @@ def test_info_gain_selects_at_variable_granularity():
     channel's information about the location alone, with the context
     marginalised (V9), so the cue buys nothing and the drive to look is gone.
     """
+    from tests.test_run_parity import as_recorded
+
+    #  which of the policies tied in value the argmax takes is set by float32 rounding: the
+    #  model is float32 in either mode (cast under JAX's 64-bit mode)
     _, params = tmaze_system()
+    params = as_recorded(params)
 
     def plan(selector):
         system = tmaze_system(epistemic=selector)[0]

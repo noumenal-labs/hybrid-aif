@@ -67,6 +67,7 @@ from hybrid_aif.distributions import (
     InverseGamma,
     InverseWishart,
 )
+from hybrid_aif.dtypes import as_float, tree_float_dtype
 from hybrid_aif.factors import (
     LinearGaussianTransition,
     NonlinearGaussianTransition,
@@ -643,7 +644,7 @@ def _cut_axes(decl, name: str, n: int, cuts: Sequence[tuple], floats: Sequence[i
 
 
 def _prior_weights(prior, nu: int, what: str) -> Array:
-    probs = prior.probs if isinstance(prior, Categorical) else jnp.asarray(prior, jnp.float32)
+    probs = prior.probs if isinstance(prior, Categorical) else as_float(prior)
     if probs.shape != (nu,):
         raise ValueError(
             f"{what} has shape {probs.shape} but the node has {nu} level(s); declare "
@@ -2706,14 +2707,15 @@ def subsystem(
             "never sliced; leave it out of inputs and the view keeps it as an input"
         )
 
-    def partner_prior(k: int) -> tuple[object, str]:
+    def partner_prior(k: int, decl: object) -> tuple[object, str]:
         """The declared prior over node ``k`` (uniform by default or given ``None``), and its
-        label."""
+        label; a uniform prior is in the float dtype of ``decl``, the declaration it averages."""
         key = c_nodes[k]
         label = f"inputs[{_key_of_input(composite, k)!r}]"
         if priors.get(key) is not None:
             return priors[key], label
-        return jnp.full(levels[k], 1.0 / levels[k], jnp.float32), label
+        uniform = jnp.full(levels[k], 1.0 / levels[k], tree_float_dtype(decl))
+        return uniform, label
 
     transition: list[object] = []
     view_parents: list[list[tuple[str, int]]] = []
@@ -2745,7 +2747,7 @@ def subsystem(
             )
         terminations = []
         for pos, k in cuts:
-            prior, label = partner_prior(k)
+            prior, label = partner_prior(k, params.transition[f])
             terminations.append((pos, *_termination(prior, levels[k], label)))
         floats = [pos for k, pos in reads if space.kinds[k] == FLOAT]
         transition.append(
@@ -2828,7 +2830,9 @@ def subsystem(
                     f"for it; pass inputs={{{variable!r}: <level or probabilities>}} to "
                     "terminate that axis of the target"
                 )
-            prior, label = partner_prior(k)
+            prior, label = partner_prior(
+                k, (params.obs_targets if key in view_mods else params.state_targets)[key]
+            )
             cuts.append((pos, *_termination(prior, levels[k], label)))
         scope = params.obs_targets if key in view_mods else params.state_targets
         contracted[key] = _contract_target(scope[key], key, cuts)

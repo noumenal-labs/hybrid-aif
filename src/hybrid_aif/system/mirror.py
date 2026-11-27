@@ -60,6 +60,7 @@ from jax import Array
 
 from hybrid_aif.controls import FLOAT
 from hybrid_aif.distributions import Categorical
+from hybrid_aif.dtypes import as_float
 from hybrid_aif.factors import Parameter
 from hybrid_aif.planning.enumerate import enumerate_policies
 from hybrid_aif.reads import Emission
@@ -267,5 +268,6 @@ def _first_step_habit(system: System, params: SystemParams, habit, face: str):
     levels = system._control_levels(system._params_in(params, face))
     tuples = enumerate_policies(levels, 1, (True,) * len(levels))[:, 0, :]
     same = jnp.all(first[:, None, :] == tuples[None, :, :], axis=-1)
-    mass = jax.nn.softmax(logits) @ same.astype(jnp.float32)
+    probs = jax.nn.softmax(as_float(logits))
+    mass = probs @ same.astype(probs.dtype)
     return jnp.log(jnp.maximum(mass, 1e-30))

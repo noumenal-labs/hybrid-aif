@@ -25,6 +25,7 @@ from hybrid_aif.distributions.neural import (
     factored_categorical_entropy,
     symlog_disc_mean,
 )
+from hybrid_aif.dtypes import cast, tree_float_dtype
 from hybrid_aif.interval import Interval
 from hybrid_aif.objectives import registry
 from hybrid_aif.objectives.base import INFOGAIN, term_sign, total
@@ -94,14 +95,15 @@ def agent():
 
 @pytest.fixture(scope="module")
 def batch():
-    """A tiny replay batch in the :class:`Episode` format, with ρ filled."""
+    """A tiny replay batch in the :class:`Episode` format, with ρ filled. The draws and the
+    buffer are float32 in either mode, as the reference's are."""
     t = T
 
     def one(i: int):
         return label(
             raif_episode(
-                obs=jax.random.normal(jax.random.PRNGKey(10 + i), (t, 2)),
-                action=jax.random.normal(jax.random.PRNGKey(20 + i), (t, 1)),
+                obs=jax.random.normal(jax.random.PRNGKey(10 + i), (t, 2), jnp.float32),
+                action=jax.random.normal(jax.random.PRNGKey(20 + i), (t, 1), jnp.float32),
                 reward=jnp.full((t,), -2.0),
                 is_success=jnp.zeros((t,), bool).at[-1].set(i == 0),
                 has_succeeded=jnp.zeros((t,), bool).at[-1].set(i == 0),
@@ -111,7 +113,7 @@ def batch():
             )
         )
 
-    buf = StaticBuffer.empty(B, t, 2, 1, extras=EXTRAS)
+    buf = StaticBuffer.empty(B, t, 2, 1, extras=EXTRAS, dtype=jnp.float32)
     for i in range(B):
         buf = add(buf, one(i))
     return sample(buf, KEY, B)
@@ -385,7 +387,14 @@ def test_init_learn_state_seeds_the_moments_so_the_carry_is_scan_stable(agent, s
     fresh = agent.system.init_learn_state(agent.params)
     assert set(fresh.moments) == {RETNORM_KEY, SLOW_KEY}
     np.testing.assert_array_equal(np.asarray(fresh.moments[RETNORM_KEY]), np.zeros(2))
+    #  made before any return exists, in the dtype of the critic pair whose values it
+    #  normalizes: the agent's float32 in either mode, float64 for a critic cast to it
+    assert tree_float_dtype(agent.params.scoring["g_tail"]) == jnp.float32
     assert fresh.moments[RETNORM_KEY].dtype == jnp.float32
+    with jax.enable_x64(True):
+        wide = cast(agent.params, jnp.float64, where=lambda p: p.scoring["g_tail"])
+        assert tree_float_dtype(wide.scoring["g_tail"]) == jnp.float64
+        assert agent.system.init_learn_state(wide).moments[RETNORM_KEY].dtype == jnp.float64
     assert int(fresh.moments[SLOW_KEY]) == 0 and fresh.moments[SLOW_KEY].dtype == jnp.int32
 
     flat, _, _, _ = starts
@@ -628,7 +637,7 @@ def test_member_weights_default_to_ones_and_fold_the_sum(agent, batch):
     total, out = ensemble_loss(members, ens_batch)
     assert np.array_equal(np.asarray(out.weights), np.ones(4, np.float32))
     np.testing.assert_allclose(float(total), float(jnp.sum(out.per_member)), rtol=1e-6)
-    explicit, _ = ensemble_loss(members, ens_batch, member_weights=jnp.ones(4))
+    explicit, _ = ensemble_loss(members, ens_batch, member_weights=jnp.ones(4, total.dtype))
     assert float(explicit) == float(total)
 
 

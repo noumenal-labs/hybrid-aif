@@ -178,6 +178,7 @@ from hybrid_aif.composition.merge import (
 )
 from hybrid_aif.controls import FLOAT, LEVEL, ControlStep
 from hybrid_aif.distributions import Categorical, ConditionalDirichlet, Dirichlet
+from hybrid_aif.dtypes import as_float, as_floats, table_dtype
 from hybrid_aif.envs.generative import ACTUATOR_TAG
 from hybrid_aif.objectives import hybrid as _hybrid
 from hybrid_aif.planning.base import Planner, get_planner, planner_takes_init
@@ -288,17 +289,22 @@ def _shifted(plan: Array) -> Array:
     return jnp.concatenate([plan[1:], plan[-1:]], axis=0)
 
 
-def _first_plan(policy_len: int, layout, sizes, kinds) -> Array:
+def _first_plan(policy_len: int, layout, sizes, kinds, boxes) -> Array:
     """The warm start of :func:`plan`'s first round: zeros ``(policy_len, width)``, the width
     that of the continuous controls concatenated in node order (``layout``, the flat layout of
-    an all-continuous space, or the float nodes among ``sizes`` and ``kinds``). One rule for the
-    planner's context (:func:`_warm`) and for the state ``run`` settles from the reset
-    (:func:`_settle_static`), which reads the same control space."""
+    an all-continuous space, or the float nodes among ``sizes`` and ``kinds``), in the dtype of
+    the continuous nodes' ``boxes`` (``None`` for a discrete node), the dtype a plan over them
+    takes. One rule for the planner's context (:func:`_warm`) and for the state ``run`` settles
+    from the reset (:func:`_settle_static`), which reads the same control space."""
     if layout is not None:
         width = int(layout.action_dim)
     else:
         width = int(sum(size for size, kind in zip(sizes, kinds, strict=True) if kind == FLOAT))
-    return jnp.zeros((policy_len, width), jnp.float32)
+    if layout is not None and layout.low is not None:
+        bounds = [layout.low, layout.high]
+    else:
+        bounds = [b for box in boxes if box is not None for b in (box.low, box.high)]
+    return jnp.zeros((policy_len, width), as_floats(*bounds)[0].dtype if bounds else float)
 
 
 def _warm(planner, previous):
@@ -308,7 +314,9 @@ def _warm(planner, previous):
 
     def warm(ctx, use_bound="midpoint", metrics=True):
         if previous is None:
-            init = _first_plan(ctx.policy_len, ctx.continuous_controls, ctx.sizes, ctx.kinds)
+            init = _first_plan(
+                ctx.policy_len, ctx.continuous_controls, ctx.sizes, ctx.kinds, ctx.boxes
+            )
         else:
             init = _shifted(previous)
         return planner(ctx, use_bound=use_bound, metrics=metrics, init=init)
@@ -1085,18 +1093,23 @@ def _uniform(node: "_Node") -> tuple:
     return tuple((v, None) for v in node.inputs)
 
 
-def _level_of(value, size: int | None = None) -> "int | Array | None":
+def _level_of(value, size: int | None = None, dtype=None) -> "int | Array | None":
     """The input a sliced view takes for a variable's value: an ``int`` for a concrete level, the
     traced integer scalar itself inside the scanned round, the vector itself otherwise, ``None``
     before the variable has a value. A :class:`Maybe` (a variable the reset left without a
     value, read before it is realised in round 0) is a probability vector over the ``size``
     levels every round: the level's one-hot where it is present, uniform where it is not (the
-    average the view takes of a variable with no value)."""
+    average the view takes of a variable with no value), in ``dtype`` (that of the tables the
+    view averages; the default float dtype when ``None``) or the vector's own."""
     if value is None:
         return None
     if isinstance(value, Maybe):
         level = jnp.asarray(value.value)
-        probs = jax.nn.one_hot(level, size) if level.ndim == 0 else level.astype(jnp.float32)
+        probs = (
+            jax.nn.one_hot(level, size, dtype=dtype or float)
+            if level.ndim == 0
+            else as_float(level)
+        )
         return jnp.where(value.present, probs, jnp.full((size,), 1.0 / size, probs.dtype))
     array = jnp.asarray(value)
     if array.ndim == 0 and jnp.issubdtype(array.dtype, jnp.integer):
@@ -1104,11 +1117,12 @@ def _level_of(value, size: int | None = None) -> "int | Array | None":
     return array
 
 
-def _null(kind_size: tuple[str, int]) -> Array:
+def _null(kind_size: tuple[str, int], dtype=float) -> Array:
+    """The value of no action: level 0 (int32), or a float vector of zeros in ``dtype``."""
     kind, size = kind_size
     if kind == LEVEL:
         return jnp.zeros((), jnp.int32)
-    return jnp.zeros((size,), jnp.float32)
+    return jnp.zeros((size,), dtype)
 
 
 # ---------------------------------------------------------------------------- the clocks
@@ -1230,10 +1244,15 @@ def _select(flag, new, old):
     return jax.tree_util.tree_map(lambda a, b: jnp.where(flag, a, b), new, old)
 
 
-def _like(value, reference, what: str):
+def _like(value, reference, what: str, settling: bool = False):
     """``value`` in the dtype of ``reference`` (the value it replaces in the scan's state), which
     it must match in shape: a port, a carry and the home keep their structure from round to
-    round, since they are the state of the scan over rounds (design batched-run.md R3, R7)."""
+    round, since they are the state of the scan over rounds (design batched-run.md R3, R7). A
+    float is only widened into the state, which :func:`_settle` settles at the widest float dtype
+    round 0 returns (a state settled without a trace that a round would widen is settled again
+    by :func:`_settle`): a float array wider than the state is refused (kept as it is while
+    ``settling``, in round 0 evaluated outside the scan, whose dtypes settle the state), a Python
+    number takes the state's dtype."""
     if reference is None or not hasattr(reference, "dtype"):
         return value
     array = jnp.asarray(value)
@@ -1246,7 +1265,46 @@ def _like(value, reference, what: str):
         )
     if jax.dtypes.issubdtype(array.dtype, jax.dtypes.prng_key):
         return array
-    return jax.lax.convert_element_type(array, jnp.result_type(reference))
+    dtype = jnp.result_type(reference)
+    if (
+        jnp.issubdtype(array.dtype, jnp.floating)
+        and jnp.issubdtype(dtype, jnp.floating)
+        and not _weak(array)
+        and jnp.finfo(array.dtype).bits > jnp.finfo(dtype).bits
+    ):
+        if settling:
+            return array
+        raise ValueError(
+            f"run: {what} is {array.dtype.name} this round and {jnp.dtype(dtype).name} the "
+            "round before; a value keeps its dtype from round to round (each round is one step "
+            "of a scan), and a model, a rate or an input in a wider float dtype than the rest "
+            "can first widen it in a later round, so give them one float dtype "
+            "(cast(params, dtype) casts the model)"
+        )
+    return jax.lax.convert_element_type(array, dtype)
+
+
+def _weak(x) -> bool:
+    """Whether ``x`` is weakly typed (a Python number made an array, which takes the dtype of the
+    arrays beside it)."""
+    return bool(getattr(getattr(x, "aval", x), "weak_type", False))
+
+
+def _widened(x, t):
+    """A reset's leaf ``x`` in the dtype it keeps from round to round, given ``t`` (the leaf
+    round 0 returns, abstract): a float array at the wider of its dtype and ``t``'s, a Python
+    number or weakly typed float at ``t``'s; anything else as it is."""
+    dtype = getattr(t, "dtype", None)
+    if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
+        return x
+    if not (isinstance(x, float | np.ndarray | np.generic) or eqx.is_array(x)):
+        return x
+    array = jnp.asarray(x)
+    if not jnp.issubdtype(array.dtype, jnp.floating):
+        return x
+    if _weak(array):
+        return jnp.asarray(array, dtype)
+    return jnp.asarray(array, jnp.promote_types(array.dtype, dtype))
 
 
 def _like_tree(tree, reference, what: str):
@@ -1599,8 +1657,9 @@ class _Engine:
         r.received[node.name] = seen
         levels: tuple = ()
         if getattr(node.step, "sliced", False):
+            dtype = table_dtype(base)
             levels = tuple(
-                (v, _level_of(self.value(node, v, now, at_boundary), self.types[v][1]))
+                (v, _level_of(self.value(node, v, now, at_boundary), self.types[v][1], dtype))
                 for v in node.inputs
             )
         view, vparams = _take_view(self.system, node, base, levels)
@@ -1649,7 +1708,13 @@ class _Engine:
                 )
             strict = scanned and self.strict
             out = _check_out(
-                node, out, self.types, self.system, False, None if strict else standing
+                node,
+                out,
+                self.types,
+                self.system,
+                False,
+                None if strict else standing,
+                settling=not scanned,
             )
             identity["params"] = learned is vparams
             if strict:
@@ -2563,20 +2628,73 @@ def _settle(engine: _Engine, state: _State, lead: tuple) -> _State:
     axis of a pass, or ``()``), and each step's carry the form round 0 returns: a
     :class:`MindCarry` (``plan()``'s) by filling what round 0 sets with zeros its ``started``
     flag guards, any other carry as it is (Python numbers made arrays), refused naming the step
-    where its form differs from round 0's."""
-    state = _strong(state)
+    where its form differs from round 0's. A float the reset set (a variable's value, a carry's
+    leaf, a parameter of the home, a held option) settles at the wider of its dtype and the one
+    round 0 returns for it, so a round only ever widens a float into the state (:func:`_like`):
+    where that widens a leaf, and once in any case under JAX's 64-bit mode (a step that learns
+    from the second round on first shows a wider table on the settled state), round 0 is
+    evaluated again on the settled state, until it returns no float wider than the state it is
+    handed."""
+    reset = state
     round0 = functools.partial(engine.round, t=0)
     if lead:
         round0 = eqx.filter_vmap(round0)
-    like = eqx.filter_eval_shape(round0, state)[0]
-    values = {v: _zeros_like(like.values[v]) if x is None else x for v, x in state.values.items()}
+    like = eqx.filter_eval_shape(round0, _strong(state))[0]
+    values = {
+        v: _zeros_like(like.values[v]) if x is None else _widened(x, like.values[v])
+        for v, x in state.values.items()
+    }
     present = {v: jnp.zeros(lead, bool) for v, x in state.values.items() if x is None}
-    carries = {}
+    carries, before = {}, {}
     for node in engine.nodes:
         target = like.carries[node.name]
-        carry = _settled_mind(state.carries[node.name], target)
+        carry = _settled_mind(_strong(state.carries[node.name]), target)
+        before[node.name] = carry
         carries[node.name] = _formed(carry, target, node.name)
-    return _strong(state._replace(values=values, carries=carries, present=present))
+    home = _widened_tree(state.home, like.home)
+    held = _widened_tree(state.held, like.held)
+    state = _strong(
+        state._replace(values=values, carries=carries, present=present, home=home, held=held)
+    )
+    set_values = [v for v, x in reset.values.items() if x is not None]
+    was = _strong(([reset.values[v] for v in set_values], before, reset.home, reset.held))
+    now = ([state.values[v] for v in set_values], state.carries, state.home, state.held)
+    if not (jax.config.jax_enable_x64 or _float_widened(was, now)):
+        return state  # one float dtype and nothing widened: the state is settled
+    for _ in range(len(jax.tree_util.tree_leaves(state)) + 1):
+        like = eqx.filter_eval_shape(round0, state)[0]
+        parts = ("values", "carries", "home", "held")
+        wider = _strong(
+            state._replace(**{f: _widened_tree(getattr(state, f), getattr(like, f)) for f in parts})
+        )
+        if not _float_widened(state, wider):
+            break
+        state = wider
+    return state
+
+
+def _widened_tree(tree, like):
+    """``tree`` with each leaf :func:`_widened` against its leaf in ``like``; ``tree`` as it is
+    where the two differ in structure (the scan refuses that, naming what changed)."""
+    none = lambda x: x is None  # noqa: E731
+    if jax.tree_util.tree_structure(tree, is_leaf=none) != jax.tree_util.tree_structure(
+        like, is_leaf=none
+    ):
+        return tree
+    return jax.tree_util.tree_map(_widened, tree, like, is_leaf=none)
+
+
+def _float_widened(was, now) -> bool:
+    """Whether a float leaf of ``was`` is a float of another dtype in ``now`` (the two of one
+    structure)."""
+
+    def floating(x):
+        return hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating)
+
+    return any(
+        floating(a) and floating(b) and a.dtype != b.dtype
+        for a, b in zip(jax.tree_util.tree_leaves(was), jax.tree_util.tree_leaves(now), strict=True)
+    )
 
 
 def _formed(carry, target, name: str):
@@ -2599,7 +2717,15 @@ def _formed(carry, target, name: str):
                     )
                     break
                 typed = jax.dtypes.issubdtype(t.dtype, jax.dtypes.prng_key)
-                out.append(x if typed else jnp.asarray(x, t.dtype))
+                floats = jnp.issubdtype(jnp.result_type(x), jnp.floating) and jnp.issubdtype(
+                    t.dtype, jnp.floating
+                )
+                if typed:
+                    out.append(x)
+                elif floats:
+                    out.append(_widened(x, t))
+                else:
+                    out.append(jnp.asarray(x, t.dtype))
             elif x is t or _same_static(x, t):
                 out.append(x)
             else:
@@ -2660,16 +2786,17 @@ def _settling(engine: _Engine, state: _State) -> str:
     return how
 
 
-def _absent(engine: _Engine, variable: str) -> Array:
+def _absent(engine: _Engine, variable: str, dtype) -> Array:
     """Zeros of the form a :func:`plan` step gives an out-port it returns nothing for at its
     reset: an action node a level (int32) or a continuous node's float vector (:func:`_null`),
     an emission its realisation, a level's probability vector under ``realise="stats"`` and
-    otherwise a level or a float vector of the port's width."""
+    otherwise a level or a float vector of the port's width; a float in ``dtype`` (the model's
+    tables')."""
     kind, size = engine.types[variable]
     emission = dict(engine.system.emissions).get(variable)
     if kind == LEVEL and emission is not None and emission.realise == "stats":
-        return jnp.zeros((size,), jnp.float32)
-    return _null(engine.types[variable])
+        return jnp.zeros((size,), dtype)
+    return _null(engine.types[variable], dtype)
 
 
 def _settle_static(engine: _Engine, state: _State, lead: tuple, one: SystemParams) -> _State:
@@ -2687,10 +2814,11 @@ def _settle_static(engine: _Engine, state: _State, lead: tuple, one: SystemParam
     checks every form (:class:`_Unformed`), and where one does not hold the state is settled by
     the trace after all."""
     state = _strong(state)
+    dtype = table_dtype(one)  # a float the reset left unset, in the dtype of the model's tables
     values, present = {}, {}
     for v, x in state.values.items():
         if x is None:
-            form = _absent(engine, v)
+            form = _absent(engine, v, dtype)
             values[v] = jnp.zeros(lead + form.shape, form.dtype)
             present[v] = jnp.zeros(lead, bool)
         else:
@@ -2704,13 +2832,15 @@ def _settle_static(engine: _Engine, state: _State, lead: tuple, one: SystemParam
         if carry.previous is None:
             filled["previous"] = _zeros_like(carry.beliefs)
         if carry.action is None:
-            nulls = {a: _null(engine.types[a]) for a in node.chosen}
+            nulls = {a: _null(engine.types[a], dtype) for a in node.chosen}
             filled["action"] = {a: jnp.zeros(lead + x.shape, x.dtype) for a, x in nulls.items()}
         if planned.warm_start and carry.plan is None:
             view, vparams = _reset_view(engine.system, node, one)
             view = planned._view(view)
             space = view._space(view._params_in(vparams, "plan"))
-            first = _first_plan(view.policy_len, space.layout, space.sizes, space.kinds)
+            first = _first_plan(
+                view.policy_len, space.layout, space.sizes, space.kinds, space.boxes
+            )
             filled["plan"] = jnp.zeros(lead + first.shape, first.dtype)
         carries[node.name] = _strong(carry._replace(**filled))
     return state._replace(values=values, carries=carries, present=present)
@@ -3178,14 +3308,21 @@ def _flagged_or_raise(flag, bad, label: str, sentence: str) -> None:
 
 
 def _check_out(
-    node: _Node, out: Mapping[str, Array], types, system: System, reset: bool, standing=None
+    node: _Node,
+    out: Mapping[str, Array],
+    types,
+    system: System,
+    reset: bool,
+    standing=None,
+    settling: bool = False,
 ) -> dict[str, Array]:
     """A step's return checked: a mapping keyed by out-ports of the node, each action node one
     level (or a float vector of its width), every emission present from the first round. Shapes
     and dtypes are checked as the step returns them (inside the scan, once, on the trace); a
     level's range is checked here on a concrete value and by :func:`_check_ranges` on a traced
     one. ``standing`` holds the values the ports hold, whose shapes and dtypes the round's values
-    keep (the scan's state)."""
+    keep (the scan's state); ``settling``: the round is evaluated outside the scan, and a value
+    wider than its standing one is kept (:func:`_like`)."""
     if not isinstance(out, Mapping):
         raise TypeError(
             f"run: the step of {node.name!r} returned a {type(out).__name__}; a step returns a "
@@ -3222,7 +3359,10 @@ def _check_out(
         checked[k] = _checked_value(node, k, value, types, system)
         if standing is not None and standing.get(k) is not None:
             checked[k] = _like(
-                checked[k], standing[k], f"{k!r}, returned by the step of {node.name!r}"
+                checked[k],
+                standing[k],
+                f"{k!r}, returned by the step of {node.name!r}",
+                settling,
             )
     return checked
 
@@ -3341,7 +3481,7 @@ def _box_value(name: str, port: str, value, kind: str, size: int) -> Array:
             f"float out-port of width {size}, so return a vector of shape ({size},) of numbers"
             + (" (or one number)" if size == 1 else "")
         )
-    return arr.astype(jnp.result_type(float))
+    return as_float(arr)  # a float keeps its dtype, an integer takes the default float dtype
 
 
 # ----------------------------------------------------------------------- the trajectory
@@ -3697,7 +3837,7 @@ def _actuate(k: Array, n: int, draws: list[tuple[int, Array, Array]]) -> dict[in
     keys = jax.random.split(jax.random.fold_in(k, ACTUATOR_TAG), n)
     out = {}
     for i, kernel, level in draws:
-        log_p = jnp.log(jnp.asarray(kernel, jnp.float32))
+        log_p = jnp.log(as_float(kernel))
         column = jnp.moveaxis(jnp.take(log_p, jnp.asarray(level, jnp.int32), axis=-1), 0, -1)
         out[i] = jax.random.categorical(keys[i], column).astype(jnp.int32)
     return out

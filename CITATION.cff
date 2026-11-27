@@ -12,8 +12,8 @@ authors:
     given-names: Jason
     affiliation: Noumenal Labs
   - name: Noumenal Labs
-version: 0.22.0
-date-released: 2026-11-17
+version: 0.23.0
+date-released: 2026-11-27
 license: MIT
 url: "https://noumenal-labs.github.io/hybrid-aif/"
 repository-code: "https://github.com/noumenal-labs/hybrid-aif"

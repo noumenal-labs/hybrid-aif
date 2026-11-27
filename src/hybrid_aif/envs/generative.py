@@ -25,6 +25,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from hybrid_aif.controls import check_kernel
+from hybrid_aif.dtypes import as_float
 from hybrid_aif.envs._process import DiscreteProcess
 from hybrid_aif.envs.base import Env
 from hybrid_aif.system import keyed
@@ -88,11 +89,11 @@ def make(
         B_deps=tuple(tuple(d) for d in B_deps),
     )
 
-    def as_f32(ts):
-        return tuple(jnp.asarray(t, jnp.float32) for t in ts)
+    def floats(ts):
+        return tuple(as_float(t) for t in ts)
 
     return env, GenerativeEnvParams(
-        likelihood=as_f32(A), transition=as_f32(B), initial_state_prior=as_f32(D)
+        likelihood=floats(A), transition=floats(B), initial_state_prior=floats(D)
     )
 
 

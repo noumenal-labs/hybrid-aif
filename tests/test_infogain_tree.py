@@ -18,6 +18,7 @@ only. G is bitwise identical.
 """
 
 import dataclasses
+import functools
 from collections.abc import Mapping
 
 import jax
@@ -26,6 +27,7 @@ import numpy as np
 import pytest
 
 from hybrid_aif.distributions import Categorical
+from hybrid_aif.dtypes import cast
 from hybrid_aif.objectives import merge, total
 from hybrid_aif.objectives.discrete import expected_obs, expected_states, utility
 from hybrid_aif.planning.enumerate import evaluate_policies
@@ -118,6 +120,19 @@ BIJECTION = {
 NEGATED: set[str] = set()
 
 
+def _as_recorded(*trees):
+    """The trees as the float32 references were recorded: as given with JAX's 64-bit mode off,
+    cast to float32 under it (a float32 model computes in float32 in either mode)."""
+    if not jax.config.jax_enable_x64:
+        return trees
+    out = tuple(cast(t, jnp.float32) for t in trees)
+    floats = {
+        x.dtype for x in jax.tree_util.tree_leaves(out) if jnp.issubdtype(x.dtype, jnp.floating)
+    }
+    assert floats == {np.dtype(np.float32)}
+    return out
+
+
 def _assert_bijection(tree, reference):
     """Every old leaf appears exactly once under its new key, value-for-value."""
     expected = {}
@@ -178,6 +193,7 @@ def test_discrete_leaves_survive_the_rebase(decomposition, reference, reference_
     either way.
     """
     system, params, beliefs = synthetic_system(decomposition, True, policy_len=1)
+    params, beliefs = _as_recorded(params, beliefs)
     _, tree = system.infer_policies(params, _keyed(system, beliefs))
     _assert_bijection(tree, reference)
     _assert_g(tree, reference_g, exact=exact_g)
@@ -187,7 +203,7 @@ def test_tmaze_default_settings_are_bitwise():
     """The default-settings claim, on the canonical fixture: utility + three
     channel-keyed state leaves, folded in the same order as before the rebase."""
     system, params = tmaze_system(policy_len=1)
-    beliefs = _initial_beliefs(system, params)
+    params, beliefs = _as_recorded(params, _initial_beliefs(system, params))
     _, tree = system.infer_policies(params, beliefs)
     _assert_bijection(tree, TMAZE_DEFAULT)
     _assert_g(tree, TMAZE_DEFAULT_G)
@@ -201,6 +217,7 @@ def test_hybrid_channel_leaf_survives_the_rebase():
     its channel key, and G is bitwise (risk + one epistemic leaf, same order)."""
     system, params = make_planning_system(), make_planning_params()
     beliefs = {"mode": Categorical(logits=jnp.zeros(2)), "x": _X1}
+    params, beliefs = _as_recorded(params, beliefs)
     policies = jnp.asarray([[0], [1]], jnp.int32)[..., None]
     tree = system.score_policies(params, beliefs, policies)
     _assert_bijection(tree, SWITCHING_CHANNEL)
@@ -212,7 +229,7 @@ def test_the_belief_entropy_is_the_uncertainty_row_and_g_is_bitwise():
     and G is bitwise what it was, with the position channel's information gain ablated so
     the tree holds the pre-rebase terms only."""
     system = hill_system(policy_len=1, epistemic=False, terms=("uncertainty:state",))
-    params = hill_params()
+    (params,) = _as_recorded(hill_params())
     policies = jnp.arange(3, dtype=jnp.int32)[:, None, None]
     start = dict(params.initial_state_prior)
     tree = system.score_policies(params, start, policies)
@@ -228,13 +245,10 @@ def test_the_belief_entropy_is_the_uncertainty_row_and_g_is_bitwise():
 # ------------------------------------------- V5.2: epistemic=False is exactly no leaves
 
 
-def test_epistemic_false_matches_a_hand_built_pragmatic_reference():
-    """``epistemic=False`` ≡ no epistemic leaves at all: the tree is utility only,
-    and G matches a hand-built utility-only fold bitwise."""
-    system, params = tmaze_system(epistemic=False)
-    beliefs = _initial_beliefs(system, params)
+def _pragmatic_fold(system, params, beliefs):
+    """``(tree, reference)``: the library's tree of ``beliefs`` under ``params`` and the
+    hand-built utility-only fold of the same policies."""
     _, tree = system.infer_policies(params, beliefs)
-    assert set(tree) == {"utility"}
     positional_params = system.to_positional("params", params)
 
     def transition(qs, action):
@@ -249,11 +263,38 @@ def test_epistemic_false_matches_a_hand_built_pragmatic_reference():
 
     positional = system.to_positional("beliefs", beliefs)
     reference = evaluate_policies(system.policies(params), positional, transition, step_terms, None)
+    return tree, reference
+
+
+def test_epistemic_false_matches_a_hand_built_pragmatic_reference():
+    """``epistemic=False`` ≡ no epistemic leaves at all: the tree is utility only,
+    and G matches a hand-built utility-only fold bitwise. Under JAX's 64-bit mode the float32
+    model's two folds agree to an ulp of float32 (the Python constants in the program are taken
+    in float64 there before they meet a float32 array, in the two folds at different places),
+    and the model's own float64 build agrees to 1e-12."""
+    system, params = tmaze_system(epistemic=False)
+    native = params
+    params, beliefs = _as_recorded(params, _initial_beliefs(system, params))
+    tree, reference = _pragmatic_fold(system, params, beliefs)
+    assert set(tree) == {"utility"}
+    if jax.config.jax_enable_x64:
+        assert total(tree).lower.dtype == jnp.float32
+        same = functools.partial(np.testing.assert_allclose, rtol=2e-7, atol=0)
+    else:
+        same = np.testing.assert_array_equal
     for block, leaf in reference["utility"].items():
-        np.testing.assert_array_equal(
-            np.asarray(tree["utility"][block].lower), np.asarray(leaf.lower)
+        same(np.asarray(tree["utility"][block].lower), np.asarray(leaf.lower))
+    same(np.asarray(total(tree).lower), np.asarray(total(reference).lower))
+    if jax.config.jax_enable_x64:
+        tree, reference = _pragmatic_fold(system, native, _initial_beliefs(system, native))
+        assert total(tree).lower.dtype == total(reference).lower.dtype == jnp.float64
+        for block, leaf in reference["utility"].items():
+            np.testing.assert_allclose(
+                np.asarray(tree["utility"][block].lower), np.asarray(leaf.lower), rtol=1e-12
+            )
+        np.testing.assert_allclose(
+            np.asarray(total(tree).lower), np.asarray(total(reference).lower), rtol=1e-12
         )
-    np.testing.assert_array_equal(np.asarray(total(tree).lower), np.asarray(total(reference).lower))
 
 
 # --------------------------------------------------------- V3: the tree's key grammar

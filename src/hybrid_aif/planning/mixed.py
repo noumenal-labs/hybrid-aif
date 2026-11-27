@@ -202,8 +202,8 @@ def mixed_plan(
         discrete = enumerate_policies(levels, horizon, (True,) * len(levels))
     else:
         discrete = _check_discrete(ctx, discrete_policies, levels)
-    low = jnp.concatenate([jnp.asarray(ctx.boxes[k].low, jnp.float32) for k in float_nodes])
-    high = jnp.concatenate([jnp.asarray(ctx.boxes[k].high, jnp.float32) for k in float_nodes])
+    low = jnp.concatenate([ctx.boxes[k].low for k in float_nodes])
+    high = jnp.concatenate([ctx.boxes[k].high for k in float_nodes])
     rate = DEFAULT_LR_FRACTION * (high - low) if lr is None else jnp.asarray(lr, low.dtype)
     plan0 = warm_starts(init, starts, horizon, low, high)
     count_starts, num_policies = plan0.shape[0], discrete.shape[0]

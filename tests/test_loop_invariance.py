@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import pytest
 
 from hybrid_aif import Categorical, ConditionalDirichlet, MixtureGaussian
+from hybrid_aif.dtypes import table_dtype
 from hybrid_aif.objectives.hybrid import pad_mixture
 from hybrid_aif.reference.raif.world import tiny_rssm
 from tests.test_action_node_modalities import payoff_model_by_node, scalar_model
@@ -77,10 +78,14 @@ def run_loop(
         step = count("env.step", lambda e, k, st, a, ep: e.step(k, st, a, ep))
         obs, state = env.reset(k0, env_params)
     priors = system.initial_priors(params)
-    if clamp:
+    if clamp:  # a clamped node's prior is the one-hot in the dtype of the model's tables
+        dtype = table_dtype(params)
         priors = {
             **priors,
-            **{n: Categorical.from_probs(jax.nn.one_hot(v, k)) for n, (v, k) in clamp.items()},
+            **{
+                n: Categorical.from_probs(jax.nn.one_hot(v, k, dtype=dtype))
+                for n, (v, k) in clamp.items()
+            },
         }
     if pad_mixtures:
         priors = {
@@ -140,6 +145,8 @@ def _payoff_mixed():
 
 
 def _small_lg_gradient():
+    """``small_lg``: under JAX's 64-bit mode a mixed model (float32 dynamics, float64 noise),
+    whose initial priors come in the dtype the first tick's posterior takes."""
     return small_lg(), {}
 
 
@@ -172,17 +179,30 @@ MODELS = {
 @pytest.fixture(scope="module", params=sorted(MODELS))
 def loop(request):
     (system, params), options = MODELS[request.param]()
-    return run_loop(system, params, **options)
+    return run_loop(system, params, **options) + (request.param,)
 
 
 def test_each_face_traces_once_over_the_loop(loop):
-    counts = loop[0]
+    """Each face traces once over the loop. Under JAX's 64-bit mode ``small_lg`` is a mixed
+    model (float32 dynamics and initial prior, float64 observation noise and control box): its
+    faces trace once, its initial priors coming in the posterior's float64, but its world's
+    state is drawn float32 at the reset and is float64 from the first step on (it meets the
+    float64 action), so ``env.step`` traces twice."""
+    counts, name = loop[0], loop[-1]
     assert counts, "the loop ran no face"
+    if name == "small_lg_gradient" and jax.config.jax_enable_x64:
+        assert dict(counts) == {
+            "infer_states": 1,
+            "act": 1,
+            "update_empirical_prior": 1,
+            "env.step": 2,
+        }
+        return
     assert set(counts.values()) == {1}, dict(counts)
 
 
 def test_initial_priors_have_the_structure_of_the_pushed_priors(loop):
-    _, first, pushed, _ = loop
+    _, first, pushed, _, _ = loop
     assert signature(first) == signature(pushed)
 
 
@@ -223,13 +243,50 @@ def test_replay_compiles_once_over_a_schedule_of_python_float_rates():
     assert _replay_core._cached._cache_size() - before == 1
 
 
+def test_a_python_rate_and_an_array_rate_share_one_replay_program_with_64_bit_mode_off():
+    """With JAX's 64-bit mode off a Python rate enters ``replay`` as a strong float32 array, the
+    signature of a float32 array rate, so the second call compiles nothing. Under 64-bit mode
+    the Python rate is weakly typed (it takes the dtype of what it scales) and the array rate
+    is another program."""
+    from hybrid_aif.replay import _replay_core, replay
+    from tests.test_learn import _sense_system
+
+    system, params = _sense_system()
+    observations = {m: jnp.zeros((6,), jnp.int32) for m in system.names.modalities}
+    actions = {n: jnp.zeros((6,), jnp.int32) for n in system.names.actions}
+    replay(system, params, observations, actions, learn=True, lr=0.5)
+    before = _replay_core._cached._cache_size()
+    array = jnp.float32(0.25)
+    assert not array.weak_type
+    replay(system, params, observations, actions, learn=True, lr=array)
+    grown = _replay_core._cached._cache_size() - before
+    assert grown == (1 if jax.config.jax_enable_x64 else 0)
+
+
 def test_replay_keeps_a_python_zero_rate_static():
     from hybrid_aif.replay import _traced_rate
 
     assert _traced_rate(0.0) == 0.0 and isinstance(_traced_rate(0.0), float)
-    assert isinstance(_traced_rate(0.5), jax.Array) and _traced_rate(0.5).dtype == jnp.float32
+    rate = _traced_rate(0.5)
+    assert isinstance(rate, jax.Array) and rate.dtype == jnp.result_type(float)
+    assert rate.weak_type == jax.config.jax_enable_x64
     array = jnp.float32(0.5)
     assert _traced_rate(array) is array
+
+
+def test_a_python_rate_takes_the_float_dtype_of_what_it_scales():
+    """Under JAX's 64-bit mode a Python rate is a weakly typed array: it scales a float32 table
+    in float32 (0.1 rounded there, as the number would be) and a float64 one in float64, 0.1
+    unrounded."""
+    from hybrid_aif.replay import _traced_rate
+
+    with jax.enable_x64(True):
+        rate = _traced_rate(0.1)
+        assert rate.weak_type and rate.dtype == jnp.float64
+        f32, f64 = jnp.ones((2,), jnp.float32), jnp.ones((2,), jnp.float64)
+        assert (rate * f32).dtype == jnp.float32 and (rate * f64).dtype == jnp.float64
+        assert float((rate * f64)[0]) == 0.1
+        assert float((rate * f32)[0]) == float(jnp.float32(0.1))
 
 
 def test_the_mountain_car_episode_compiles_once_over_a_decaying_rate(monkeypatch):

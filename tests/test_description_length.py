@@ -182,15 +182,12 @@ def _fisher_log_sqrt_det(mu: np.ndarray, sigma: np.ndarray) -> float:
 def test_the_gaussian_fisher_rao_density(d):
     """``√det I(μ, Σ) = 2^{−d/2} |Σ|^{−(d+2)/2}``: the constant the extent formulas carry, from the
     KL Hessian rather than the formula."""
-    jax.config.update("jax_enable_x64", True)
-    try:
+    with jax.enable_x64(True):
         rng = np.random.default_rng(1)
         a = rng.normal(size=(d, d))
         sigma = a @ a.T + d * np.eye(d)
         want = -0.5 * d * math.log(2) - 0.5 * (d + 2) * np.linalg.slogdet(sigma)[1]
         assert _fisher_log_sqrt_det(rng.normal(size=d), sigma) == pytest.approx(want, abs=1e-6)
-    finally:
-        jax.config.update("jax_enable_x64", False)
 
 
 def test_gaussian_extent_one_dimension_against_monte_carlo():

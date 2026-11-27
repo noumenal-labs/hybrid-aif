@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import importlib.util
+import inspect
 import json
 import pathlib
 import re
@@ -119,14 +120,41 @@ def _shown(system: H.System) -> H.System:
     return dataclasses.replace(system, subsystems=shown)
 
 
-def _assert_same(a, b) -> None:
-    """Bitwise: identical treedef (every static field) and identical leaves, dtypes included."""
+def _default_float() -> type:
+    """The default float dtype: float32, or float64 under JAX's 64-bit mode."""
+    return np.float64 if jax.config.jax_enable_x64 else np.float32
+
+
+#: The most elements ``describe`` writes an array inline with by default (``arrays="auto"``).
+INLINE_MAX = inspect.signature(describe).parameters["inline_max"].default
+
+
+def _written_inline(x: np.ndarray, arrays: str) -> bool:
+    """Whether ``describe(..., arrays=arrays)`` writes the array ``x`` into the document (a list,
+    or the scalar a constant array broadcasts from) rather than by ref into the arrays file."""
+    if arrays == "file":
+        return False
+    constant = x.size > 1 and bool(np.all(x == x.flat[0]))
+    return arrays == "inline" or constant or x.size <= INLINE_MAX
+
+
+def _assert_same(a, b, arrays: str = "auto") -> None:
+    """Bitwise: identical treedef (every static field) and identical leaves, dtypes included.
+
+    Under JAX's 64-bit mode an inline value is built in the default dtype, float64
+    (``docs/description-format.md``), so a float32 leaf of ``a`` that ``describe`` wrote inline
+    (with ``arrays``, its placement) is a float64 leaf of ``b``, with the float32 value exactly;
+    an array written by ref keeps its dtype. With 64-bit mode off every dtype is identical."""
     assert jax.tree_util.tree_structure(a) == jax.tree_util.tree_structure(b)
     la, lb = jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b)
     assert len(la) == len(lb)
     for x, y in zip(la, lb, strict=True):
         x, y = np.asarray(x), np.asarray(y)
-        assert x.dtype == y.dtype
+        if jax.config.jax_enable_x64 and x.dtype != y.dtype:
+            assert _written_inline(x, arrays), (x.shape, x.dtype, y.dtype)
+            assert (x.dtype, y.dtype) == (np.float32, np.float64)
+        else:
+            assert x.dtype == y.dtype
         assert np.array_equal(x, y)
 
 
@@ -172,7 +200,7 @@ def test_a_uniform_anchor_round_trips():
         _, rebuilt_params = _round_trip(system, params, arrays=mode)
         again = rebuilt_params.likelihood["sense"]
         assert again.alpha0.shape == () and float(again.alpha0) == 1.0
-        _assert_same(params, rebuilt_params)
+        _assert_same(params, rebuilt_params, mode)
 
 
 def test_a_dotted_system_without_its_record_comes_back_with_the_record_filled():
@@ -195,7 +223,7 @@ def test_every_array_placement_round_trips(models, mode):
     assert ("arrays_file" in document) == (mode == "file")
     s2, p2 = build(_through_json(document), arrays=arrays)
     _assert_same(system, s2)
-    _assert_same(params, p2)
+    _assert_same(params, p2, mode)
 
 
 def _leaves(clamp):
@@ -236,7 +264,8 @@ def test_the_threshold_is_a_writing_policy_and_build_accepts_either_form(models)
     document = _through_json(document)
     small = document["clamps"]["deter_transition_map"]["norms"][0]["bias"]
     assert not isinstance(small, dict)
-    arrays["moved"] = np.broadcast_to(np.asarray(small, np.float32), (32,)).copy()
+    dtype = params.transition["deter"].map.norms[0].bias.dtype
+    arrays["moved"] = np.broadcast_to(np.asarray(small, dtype), (32,)).copy()
     document["clamps"]["deter_transition_map"]["norms"][0]["bias"] = {"ref": "arrays.npz#moved"}
     big = document["clamps"]["deter_transition_map"]["gate"]["weight"]
     document["clamps"]["deter_transition_map"]["gate"]["weight"] = arrays.pop(
@@ -327,7 +356,7 @@ def test_the_composite_record_is_reconstructed_so_run_routes_and_views_agree(mod
         _assert_same(getattr(want, part), getattr(got, part))
     _assert_same(want["world"].carries, got["world"].carries)
     #  and both are the composite form's run of the merge (``tests/data/migration_driver.npz``,
-    #  ``described``) under its key layout
+    #  ``described``) under its key layout (the float32 model it was recorded with, in either mode)
     fixture = np.load(pathlib.Path(__file__).parent / "data" / "migration_driver.npz")
     for f in system.names.states:
         held = [c[f"world.{f}"] for c in got["world"].carries]
@@ -744,14 +773,14 @@ def test_a_small_probability_is_a_finite_log(tmaze_doc):
     tmaze_doc["clamps"]["D_context"] = [1.0 - 1e-30, 1e-30]
     _, params = build(tmaze_doc)
     logits = np.asarray(params.initial_state_prior["context"].logits)
-    assert logits.dtype == np.float32 and np.isfinite(logits).all()
+    assert logits.dtype == _default_float() and np.isfinite(logits).all()
 
 
 def test_a_ref_in_an_integer_dtype_is_lowered_to_the_default_dtype(tmaze_doc):
     tmaze_doc["variables"]["B_context"]["domain"] = "simplex"
     tmaze_doc["clamps"]["B_context"] = {"ref": "x.npz#B"}
     _, params = build(tmaze_doc, arrays={"B": np.eye(2, dtype=np.int64)[..., None]})
-    assert params.transition["context"].log_table.dtype == np.float32
+    assert params.transition["context"].log_table.dtype == _default_float()
 
 
 def test_a_network_leaf_declares_no_domain_but_real(models):
@@ -794,7 +823,9 @@ def test_a_scalar_clamp_broadcasts_to_the_declared_shape(tmaze_doc):
     tmaze_doc["clamps"]["A_cue"] = -1.0986122886681098
     _, params = build(tmaze_doc)
     table = params.likelihood["cue"].log_table
-    assert table.shape == (3, 5, 2) and bool(jnp.all(table == jnp.float32(-1.0986122886681098)))
+    assert table.dtype == _default_float()
+    want = jnp.asarray(-1.0986122886681098, _default_float())
+    assert table.shape == (3, 5, 2) and bool(jnp.all(table == want))
 
 
 def test_describe_writes_a_constant_array_as_its_scalar(models):
@@ -892,7 +923,7 @@ def test_the_mniw_family_is_written_as_two_priors_and_read_back_as_one():
     assert head_prior["parameters"]["row_cov"] == "y_likelihood_noise"
     s2, p2 = build(_through_json(document), arrays=arrays)
     assert isinstance(p2.likelihood["y"], LinearGaussianObservationMNIW)
-    _assert_same(params, p2)
+    _assert_same(params, p2, "inline")
     #  with the noise clamped, the head's record alone is the standalone matrix-normal head
     doc = _through_json(document)
     del doc["factors"]["y_likelihood_noise"]
@@ -902,7 +933,9 @@ def test_the_mniw_family_is_written_as_two_priors_and_read_back_as_one():
     doc["clamps"]["y_likelihood_noise"] = [[0.4]]
     _, p3 = build(doc)
     assert isinstance(p3.likelihood["y"].head, MatrixNormal)
-    assert np.array_equal(np.asarray(p3.likelihood["y"].noise), np.asarray([[0.4]], np.float32))
+    noise = np.asarray(p3.likelihood["y"].noise)
+    assert noise.dtype == _default_float()
+    assert np.array_equal(noise, np.asarray([[0.4]], _default_float()))
     doc["factors"]["y_likelihood_head"]["prior"]["parameters"]["row_cov"] = "y_likelihood_head"
     with pytest.raises(DescriptionError, match=r"row_cov names 'y_likelihood_head'"):
         build(doc)
@@ -921,7 +954,7 @@ def test_an_independent_noise_prior_round_trips():
     }
     assert "y_likelihood_noise" not in document["clamps"]
     _, p2 = build(_through_json(document))
-    _assert_same(params, p2)
+    _assert_same(params, p2, "inline")
 
 
 def test_a_prior_a_field_does_not_take_is_refused(tmaze_doc):
@@ -1015,7 +1048,7 @@ def test_a_tree_clamp_is_read_leaf_by_leaf_and_must_match_its_tree(models):
     tree = document["clamps"]["stoch_transition_trunk"]
     assert set(tree) == {"layers", "norms"} and "ref" in tree["layers"][0]["weight"]
     s2, p2 = build(document, arrays=arrays)
-    _assert_same(params, p2)
+    _assert_same(params, p2, "file")
     del document["clamps"]["stoch_transition_trunk"]["norms"]
     with pytest.raises(DescriptionError, match=r"the clamp's tree .* differs from the variable's"):
         build(document, arrays=arrays)
@@ -1139,7 +1172,7 @@ def test_the_policy_prior_is_checked_against_the_policy_set(models):
         "parameters": {"logits": "E"},
     }
     _, p2 = build(document)
-    _assert_same(params, p2)
+    _assert_same(params, p2, "inline")
     doc = copy.deepcopy(document)
     doc["variables"]["E"]["shape"] = [24]
     with pytest.raises(
@@ -1214,7 +1247,7 @@ def test_an_independent_matrix_normal_head_stays_independent():
     assert "row_cov" not in document["factors"]["y_likelihood_head"]["prior"]["parameters"]
     _, rebuilt = build(_through_json(document), arrays=arrays)
     assert type(rebuilt.likelihood["y"]) is H.LinearGaussianObservation
-    _assert_same(params, rebuilt)
+    _assert_same(params, rebuilt, "inline")
 
 
 # ================================================================= recognition

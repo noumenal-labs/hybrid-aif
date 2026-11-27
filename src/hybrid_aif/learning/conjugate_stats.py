@@ -296,7 +296,7 @@ def _lg_noise_stats(
         )
     q = beliefs[f]
     if isinstance(q, Gaussian):
-        weights = jnp.ones(())
+        weights = jnp.ones((), q.loc.dtype)
         mu = q.loc[None, :]
         chol = q.chol[None, :, :]
     elif isinstance(q, MixtureGaussian):
@@ -388,7 +388,7 @@ def _lg_joint_stats(
         )
     q = beliefs[f]
     if isinstance(q, Gaussian):
-        w = jnp.ones((1,))
+        w = jnp.ones((1,), q.loc.dtype)
         mu = q.loc[None, :]
         chol = q.chol[None, :, :]
     elif isinstance(q, MixtureGaussian):

@@ -65,7 +65,7 @@ from hybrid_aif.system import System, SystemParams
 from hybrid_aif.system.mirror import mirror
 from tests import survey_frozen
 from tests.test_run_both_ways import _arena
-from tests.test_run_parity import _bump, _run_old_keys, cm, idle, states
+from tests.test_run_parity import _bump, _run_old_keys, as_recorded, cm, idle, states
 
 FIXTURE = np.load(pathlib.Path(__file__).parent / "data" / "clock_parity.npz")
 KEY = jax.random.PRNGKey(1)
@@ -262,7 +262,7 @@ def test_a_held_scheduler_with_a_fast_learner_is_the_recorded_run_bitwise(order)
     steps = {"agent.mission": mission, "agent.rover": _fast_rover(), "world": _gauge_step}
     traj = run(
         system,
-        params,
+        as_recorded(params),
         10,
         jax.random.PRNGKey(1),
         steps,

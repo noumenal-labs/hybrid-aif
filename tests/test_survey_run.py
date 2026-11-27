@@ -28,6 +28,7 @@ prior prices the travel of a survey and of a charge from the cell the option sta
 can observe the recogniser's reading instead of the image (experiment A).
 """
 
+import contextlib
 import dataclasses
 import pathlib
 import sys
@@ -38,6 +39,7 @@ import numpy as np
 import pytest
 
 from hybrid_aif.distributions import MLPConditional
+from hybrid_aif.dtypes import cast
 from hybrid_aif.planning.gradient import make_gradient_planner
 
 FIXTURE = pathlib.Path(__file__).parent / "data" / "survey_run.npz"
@@ -75,12 +77,18 @@ def case_setting(module, case):
     return setting, TICKS[case]
 
 
-def small_camera(pixels, pixel_sd=0.04):
+def small_camera(pixels, pixel_sd=0.04, dtype=None):
     """A camera likelihood of the survey's shape (the vehicle's state and a one-hot terrain, to the
     image's pixels), small and untrained: an ``MLPConditional`` of width 8 and depth 1 from a
-    fixed key, frozen."""
+    fixed key, frozen, in ``dtype`` (the default float dtype when ``None``)."""
     net = MLPConditional.from_shapes(
-        (5, 3), pixels, key=jax.random.PRNGKey(0), init_scale=pixel_sd, width=8, depth=1
+        (5, 3),
+        pixels,
+        key=jax.random.PRNGKey(0),
+        init_scale=pixel_sd,
+        width=8,
+        depth=1,
+        dtype=dtype,
     )
     return dataclasses.replace(net, frozen=True)
 
@@ -111,12 +119,35 @@ def _numeric(obj):
     return isinstance(obj, bool | int | float)
 
 
+@contextlib.contextmanager
+def as_recorded(module):
+    """``module`` (``survey_run``) running the float32 model the pin was recorded with: as it is
+    with JAX's 64-bit mode off, where every float is float32; under 64-bit mode its ``run``
+    casts the coupled params, and the world's carries, to float32 (its showcase models make
+    some arrays in the default float dtype)."""
+    if not jax.config.jax_enable_x64:
+        yield
+        return
+    run = module.run
+
+    def float32_run(system, params, *args, carries=None, **kwargs):
+        carries = None if carries is None else cast(carries, jnp.float32)
+        return run(system, cast(params, jnp.float32), *args, carries=carries, **kwargs)
+
+    module.run = float32_run
+    try:
+        yield
+    finally:
+        module.run = run
+
+
 def run_case(case):
-    """The tick records of a case's run."""
+    """The tick records of a case's run, the float32 model the pin was recorded with."""
     module = example("survey_run")
     setting, ticks = case_setting(module, case)
-    camera = small_camera(example("survey_world").IMG_PIXELS)
-    return module.run_setting(setting, ticks, camera, STEPS, STARTS)["ticks"]
+    camera = small_camera(example("survey_world").IMG_PIXELS, dtype=jnp.float32)
+    with as_recorded(module):
+        return module.run_setting(setting, ticks, camera, STEPS, STARTS)["ticks"]
 
 
 @pytest.fixture(scope="module")
@@ -126,14 +157,21 @@ def runs():
 
 @pytest.mark.parametrize("case", CASES)
 def test_the_survey_runs_match_the_regression_pin(runs, case):
+    """The run reproduces the pin. Under JAX's 64-bit mode the float32 model is replayed with
+    Python constants (``log 2 pi`` and the like) taken in float64 before they meet a float32
+    array, a float32 rounding apart from the recording's: measured, 15 of 135 one-level values and
+    83 of 844 two-level ones differ, by at most 1.0e-5 absolute and 2.1e-5 relative (both an
+    element of a plan the gradient planner descends to over 40 steps), so the relative tolerance
+    there is 5e-5."""
     got = flatten(runs[case], case)
     fixture = np.load(FIXTURE)
     want = {k: fixture[k] for k in fixture.files if k.split("/", 1)[0] == case}
     assert sorted(got) == sorted(want)
+    rtol = 5e-5 if jax.config.jax_enable_x64 else 1e-5
     for k, v in want.items():
         assert got[k].dtype == v.dtype, k
         if v.dtype.kind == "f":
-            np.testing.assert_allclose(got[k], v, rtol=1e-5, atol=1e-6, err_msg=k)
+            np.testing.assert_allclose(got[k], v, rtol=rtol, atol=1e-6, err_msg=k)
         else:
             np.testing.assert_array_equal(got[k], v, err_msg=k)
 

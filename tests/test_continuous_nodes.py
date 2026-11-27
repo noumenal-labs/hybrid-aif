@@ -618,3 +618,33 @@ def test_an_undeclared_table_axis_is_refused_at_every_face():
 def test_an_empty_box_is_refused():
     with pytest.raises(ValueError, match="dim ≥ 1"):
         Box(jnp.zeros(0), jnp.zeros(0))
+
+
+def test_a_box_keeps_the_dtype_of_float_bounds_and_gives_integer_bounds_the_default():
+    """Under 64-bit mode float32 bounds stay float32, also beside a Python number, and float64
+    bounds stay float64 (mixed bounds promote to the wider); integer bounds take the default
+    float dtype, float64 there."""
+    with jax.enable_x64(True):
+        narrow = Box(jnp.zeros(2, jnp.float32), jnp.ones(2, jnp.float32))
+        assert narrow.low.dtype == narrow.high.dtype == jnp.float32
+        beside = Box(-1.0, jnp.ones(2, jnp.float32))
+        assert beside.low.dtype == beside.high.dtype == jnp.float32
+        wide = Box(jnp.zeros(2, jnp.float64), jnp.ones(2, jnp.float64))
+        assert wide.low.dtype == wide.high.dtype == jnp.float64
+        mixed = Box(jnp.zeros(2, jnp.float32), jnp.ones(2, jnp.float64))
+        assert mixed.low.dtype == mixed.high.dtype == jnp.float64
+        whole = Box(jnp.zeros(2, jnp.int32), jnp.ones(2, jnp.int32))
+        assert whole.low.dtype == whole.high.dtype == jnp.float64
+        np.testing.assert_array_equal(np.asarray(whole.high), np.ones(2))
+
+
+def test_a_built_box_takes_the_default_float_dtype():
+    """The document's inline bounds take the build's default dtype: float64 under 64-bit mode."""
+    from hybrid_aif.description import build, describe
+
+    with jax.enable_x64(True):
+        system, params = _native_continuous()
+        doc = describe(system, params, arrays="inline")
+        _, built_params = build(doc.document, arrays=doc.arrays)
+        box = built_params.control["u_u"]
+        assert box.low.dtype == box.high.dtype == jnp.float64

@@ -30,6 +30,7 @@ from hybrid_aif.distributions import (
     MLPConditional,
     TruncatedGaussian,
 )
+from hybrid_aif.dtypes import as_float
 from hybrid_aif.factors import (
     LinearGaussianObservation,
     LinearGaussianObservationMNIW,
@@ -1296,7 +1297,7 @@ def _belief_policies(
                     f"{name!r}: pass a float (P, H, {size}) or (H, {size}) array, or a "
                     f"Gaussian over it; got {value.dtype} {tuple(value.shape)}"
                 )
-            entries.append(value.astype(jnp.float32))
+            entries.append(as_float(value))
             leads.append(tuple(value.shape[:-1]))
             continue
         if isinstance(value, Categorical):

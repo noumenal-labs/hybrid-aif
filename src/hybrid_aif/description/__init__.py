@@ -43,6 +43,7 @@ from hybrid_aif import distributions as _dist
 from hybrid_aif import factors as _factors
 from hybrid_aif.cells import Grid
 from hybrid_aif.controls import FLOAT, Box, action_name, control_name, declared_parents
+from hybrid_aif.dtypes import as_float
 from hybrid_aif.inference.discrete import SUPPORT_FLOOR, _as_log_likelihood
 from hybrid_aif.objectives import registry as _registry
 from hybrid_aif.objectives.base import INFOGAIN
@@ -1313,12 +1314,9 @@ def _leaf_parts(
     for name, record in records.items():
         habit = record.get("policy_prior")
         part = PartParams(
-            None if habit is None else jnp.asarray(habit, jnp.float32),
+            None if habit is None else as_float(habit),
             record.get("precision"),
-            {
-                node: jnp.asarray(v, jnp.float32)
-                for node, v in (record.get("durations") or {}).items()
-            },
+            {node: as_float(v) for node, v in (record.get("durations") or {}).items()},
             dict((scoring or {}).get(name, {})),
         )
         if (
@@ -3660,7 +3658,7 @@ class _Model:
                     f"per level, and {name!r} is not a control node; drop it"
                 )
             self.durations[name] = jnp.broadcast_to(
-                jnp.asarray(record["duration"], jnp.float32), (record["levels"],)
+                as_float(record["duration"]), (record["levels"],)
             )
         if len(self.durations) > 1:
             raise self.fail(
@@ -3685,8 +3683,8 @@ class _Model:
                     )
                 dim = (record["dim"],)
                 try:
-                    low = np.broadcast_to(np.asarray(record["low"], np.float32), dim)
-                    high = np.broadcast_to(np.asarray(record["high"], np.float32), dim)
+                    low = np.broadcast_to(np.asarray(record["low"], _default_dtype()), dim)
+                    high = np.broadcast_to(np.asarray(record["high"], _default_dtype()), dim)
                     self.boxes[u] = Box(jnp.asarray(low), jnp.asarray(high))
                 except Exception as exc:
                     raise self.fail(f"variables[{u!r}]: its bounds are not a box: {exc}") from exc
@@ -4473,17 +4471,20 @@ class _Model:
                     "normalised log-probabilities, domain 'log_simplex' (or probabilities, "
                     "domain 'simplex')"
                 )
+            clamp = self.clamps[var]
             arr = self._array(
-                self.clamps[var],
+                clamp,
                 self.variables[var].get("shape"),
                 domain,
                 f"clamps[{var!r}]",
                 dtype=np.float64,
             )
             _check_domain(domain, arr, f"clamps[{var!r}]", 0)
+            stored = isinstance(clamp, Mapping) and np.issubdtype(arr.dtype, np.floating)
+            dtype = np.promote_types(arr.dtype, np.float32) if stored else _default_dtype()
             arr = _lowered(domain, arr, np.float64)
             self._check_table(fac, var, arr.shape, False)
-            return jnp.asarray(np.exp(np.asarray(arr, np.float64)).astype(np.float32))
+            return jnp.asarray(np.exp(np.asarray(arr, np.float64)).astype(dtype))
         value = self.value(var, "ConditionalCategorical", "log_table", address, axis=0)
         pad = role == "transition" and not any(p in self.nodes for p, _ in fac.parents)
         if isinstance(value, _Learned):
@@ -5322,7 +5323,7 @@ class _Model:
         clamp = self.clamps.get(var)
         if isinstance(clamp, Mapping) and "init" in clamp:
             self._init_args(_Init(clamp["init"]), "LearnedVector", f"clamps[{var!r}]")
-            value = jnp.zeros((self.width[fac.child],), jnp.float32)
+            value = jnp.zeros((self.width[fac.child],), _default_dtype())
         else:
             value = self.value(var, "LearnedVector", "value", f"{fac.address}.parameters.value")
             if isinstance(value, _Learned):

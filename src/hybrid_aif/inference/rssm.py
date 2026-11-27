@@ -32,6 +32,7 @@ from hybrid_aif.distributions.neural import (
     PredictorHead,
     straight_through_onehot,
 )
+from hybrid_aif.dtypes import settled_scan
 from hybrid_aif.factors import Deterministic
 from hybrid_aif.inference import amortized as _amortized
 
@@ -469,7 +470,7 @@ class RSSMCore(eqx.Module):
 
             xs = (keys, actions, embeds, is_first.astype(jnp.bool_))
 
-        _, (states, post_logits, prior_logits) = jax.lax.scan(step, state, xs)
+        _, (states, post_logits, prior_logits) = settled_scan(step, state, xs)
         return states, post_logits, prior_logits
 
     def open_loop(self, key: Array, state: RSSMState, actions: Array) -> tuple[RSSMState, Array]:
@@ -490,7 +491,7 @@ class RSSMCore(eqx.Module):
             new, logits = self.img_step(k, carry, action)
             return new, (new, logits)
 
-        _, (states, logits) = jax.lax.scan(step, state, (keys, actions))
+        _, (states, logits) = settled_scan(step, state, (keys, actions))
         return states, logits
 
     # -------------------------------------------------------------------- the heads

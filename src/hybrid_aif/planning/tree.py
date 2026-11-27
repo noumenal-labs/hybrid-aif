@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 from jax import Array
 
+from hybrid_aif.dtypes import tree_float_dtype
 from hybrid_aif.interval import Interval
 from hybrid_aif.objectives.base import TermTree, total
 from hybrid_aif.planning.base import (
@@ -126,7 +127,8 @@ def evaluate_policy_tree_total(
     b = actions.shape[0]
     warrant, approximate = _step_warrant(init_qs, transition_fn, step_terms, policies)
     qs = jtu.tree_map(lambda x: x[None], init_qs)
-    g = Interval(jnp.zeros((1,)), jnp.zeros((1,)), warrant, approximate)
+    zero = jnp.zeros((1,), tree_float_dtype(init_qs))
+    g = Interval(zero, zero, warrant, approximate)
     for t in range(policy_len):
         qs, tree = expand_level(qs, actions, transition_fn, step_terms, t)
         g = _repeat_nodes(g, b)
@@ -305,11 +307,12 @@ def evaluate_branching_tree(
                 )
                 break
             children, tree = expand_level(qs, actions, transition_fn, step_terms, t)
-            g = _point(tree, use_bound) if tree else jnp.zeros((n * b,))
+            dtype = tree_float_dtype(qs)  # a value made here is in the beliefs' dtype
+            g = _point(tree, use_bound) if tree else jnp.zeros((n * b,), dtype)
             p = None
             if t + 1 < horizon:
                 if branch_fn is None:
-                    p, qs = jnp.ones((n * b, 1)), children
+                    p, qs = jnp.ones((n * b, 1), dtype), children
                 else:
                     p, after = jax.vmap(branch_fn)(children)
                     qs = jtu.tree_map(lambda x: x.reshape((-1,) + x.shape[2:]), after)

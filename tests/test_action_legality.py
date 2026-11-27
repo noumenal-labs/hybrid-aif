@@ -30,6 +30,15 @@ KEY = jax.random.PRNGKey(0)
 _EXAMPLES = pathlib.Path(__file__).resolve().parents[1] / "examples"
 
 
+def assert_same_program(got, want):
+    """Bitwise with JAX's 64-bit mode off. With it on, the two programs agree to float64
+    reassociation (a relative 1e-12), which float32 rounds away."""
+    if jax.config.jax_enable_x64:
+        np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12)
+    else:
+        np.testing.assert_array_equal(got, want)
+
+
 def _example(name: str):
     spec = importlib.util.spec_from_file_location(name, _EXAMPLES / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
@@ -389,7 +398,7 @@ def test_a_concrete_jax_mask_closed_over_by_jit_scores_as_it_does_eagerly():
             return system.infer_policies(p, b, legal=legal)[0].logits
 
         jitted = jax.jit(scored)
-        np.testing.assert_array_equal(np.asarray(jitted(params, beliefs)), np.asarray(eager))
+        assert_same_program(np.asarray(jitted(params, beliefs)), np.asarray(eager))
 
 
 @pytest.mark.parametrize("kind", ["per_policy", "per_node"])
@@ -416,4 +425,4 @@ def test_a_traced_mask_is_applied_without_the_concrete_refusals():
         return system.infer_policies(p, b, legal=m)[0].logits
 
     eager = system.infer_policies(params, beliefs, legal=mask)[0].logits
-    np.testing.assert_array_equal(np.asarray(logits(params, beliefs, mask)), np.asarray(eager))
+    assert_same_program(np.asarray(logits(params, beliefs, mask)), np.asarray(eager))

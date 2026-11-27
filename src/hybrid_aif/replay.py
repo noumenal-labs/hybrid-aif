@@ -24,6 +24,7 @@ from jax import Array
 
 from hybrid_aif.description import build
 from hybrid_aif.distributions import Categorical
+from hybrid_aif.dtypes import settled_scan
 from hybrid_aif.inference import amortized as _amortized
 from hybrid_aif.inference.discrete import SUPPORT_FLOOR
 from hybrid_aif.learning import structure as _structure
@@ -236,7 +237,8 @@ def replay(
     scheduled reduction (``System.reduction_period``) scores its merges against and returns a
     killed level to; ``None`` takes ``params``, right when the replay starts from the prior and
     wrong when ``params`` were already learned. ``lr`` is the learning rate: a nonzero Python
-    number is passed to the compiled scan as a float32 array, so a schedule of rates compiles
+    number is passed to the compiled scan as an array in the params' float dtype (the widest
+    among their arrays), so a schedule of rates compiles
     once, and a Python ``0.0`` is static (it skips learning at trace time). ``lr_by_slot`` is
     :meth:`System.learn`'s per-slot rates, passed to every tick's learn step as given (a Python
     ``0.0`` freezes a slot at trace time; ``{"transition:z:noise": 1.0}`` learns one factor's
@@ -360,11 +362,17 @@ def replay(
 
 
 def _traced_rate(lr):
-    """``lr`` as a float32 array when it is a nonzero Python number, so a schedule of rates
-    compiles once; an array passes through, and a Python ``0.0`` stays static (it skips the
+    """``lr`` as an array when it is a nonzero Python number, so a schedule of rates compiles
+    once: weakly typed under JAX's 64-bit mode, where it takes the dtype of each statistic it
+    scales as the number would, and a strong array of the one float dtype with that mode off (a
+    number and an array rate then share one compiled program). An array passes through (and
+    promotes where it meets a statistic), and a Python ``0.0`` stays static (it skips the
     learning at trace time)."""
     if isinstance(lr, int | float) and not isinstance(lr, bool) and float(lr) != 0.0:
-        return jnp.asarray(lr, jnp.float32)
+        rate = jnp.asarray(float(lr))
+        if jax.config.jax_enable_x64:
+            return rate
+        return jax.lax.convert_element_type(rate, rate.dtype)
     return lr
 
 
@@ -519,7 +527,7 @@ def _replay_core(
         else start
     )
     xs = (observations, actions, mask, valid, plan_keys, legal, externals, ts)
-    carry_final, out = jax.lax.scan(step, carry0, xs)
+    carry_final, out = settled_scan(step, carry0, xs)
     params_final, ls_final = carry_final[3:5] if learn else (None, None)
     (
         beliefs,

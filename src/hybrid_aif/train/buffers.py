@@ -46,6 +46,15 @@ needs                         nothing of the RSSM     ``RSSMCore.observe``'s
 
 Buffer policy (several buffers, routing, fallback) stays in the caller's loop.
 
+**Precision.** An episode's four float columns (``obs``, ``action``, ``reward``, ``cont``) share
+one dtype, the one :func:`~hybrid_aif.dtypes.as_floats` gives the arrays it is built from: the
+widest float array among them, else the default float dtype (float32, or float64 under JAX's
+64-bit mode). A task column keeps its own dtype in the episode. A device-side buffer allocates
+the four float columns in the ``dtype`` passed to ``empty`` (by default the default float
+dtype), a float task column in its :class:`ColumnSpec`'s, and converts each float column of an
+episode written to it to the dtype it stores the column in; an integer or boolean task column
+must have the declared dtype.
+
 Design: docs/design/amortization.md A12 chunk 2c §(d′)
 """
 
@@ -63,6 +72,7 @@ from jax import Array
 
 from hybrid_aif.data.dataset import Dataset
 from hybrid_aif.data.format import check_schema, episode_schema, get_format, public_items
+from hybrid_aif.dtypes import as_floats, float_dtype
 
 # ============================================================== the episode format
 
@@ -72,7 +82,7 @@ class ColumnSpec(NamedTuple):
 
     #: The column's per-step trailing shape.
     shape: tuple[int, ...] = ()
-    #: The column's dtype, by name.
+    #: The column's storage dtype in a device-side buffer, by name.
     dtype: str = "float32"
     #: How :func:`fit_length` pads the column: ``"zero"`` or ``"hold"`` (repeat the last value).
     pad: str = "zero"
@@ -85,17 +95,17 @@ class Episode(NamedTuple):
     pairs ``obs[t]`` with the action then drawn at it, so ``reward[t]`` is the
     reward of ``action[t−1]`` and every flag is a predicate on ``obs[t]``. ``T``
     applied actions make ``T + 1`` rows: a reset row (``is_first``, ``reward = 0``)
-    and a terminal row with the action zeroed.
+    and a terminal row with the action zeroed. The four float columns share one float dtype
+    (the module docstring's **Precision**).
     """
 
-    #: The observations, ``(T, obs_dim)`` float32.
+    #: The observations, ``(T, obs_dim)`` float.
     obs: Array
-    #: ``a_t``, the raw draw taken at ``obs[t]``, ``(T, action_dim)`` float32.
+    #: ``a_t``, the raw draw taken at ``obs[t]``, ``(T, action_dim)`` float.
     action: Array
-    #: The reward that produced ``obs[t]``, that is ``a_{t-1}``'s, ``(T,)`` float32.
+    #: The reward that produced ``obs[t]``, that is ``a_{t-1}``'s, ``(T,)`` float.
     reward: Array
-    #: ``1 - terminal``, a predicate on ``obs[t]`` as recorded by the collector, ``(T,)``
-    #: float32.
+    #: ``1 - terminal``, a predicate on ``obs[t]`` as recorded by the collector, ``(T,)`` float.
     cont: Array
     #: Whether ``obs[t]`` starts the episode (the reset row), ``(T,)`` bool.
     is_first: Array
@@ -142,15 +152,22 @@ def episode(
 ) -> Episode:
     """An :class:`Episode` from its columns, cast to the engine dtypes and checked.
 
-    ``cont`` defaults to all ones. Any further keyword is a task column, stored in
-    ``extras`` with its own dtype and a leading ``T`` axis checked.
+    ``obs``, ``action``, ``reward`` and ``cont`` come out in one float dtype, the one
+    :func:`~hybrid_aif.dtypes.as_floats` gives them: the widest float array among them, else
+    the default float dtype. ``cont`` defaults to all ones. Any further keyword is a task column,
+    stored in ``extras`` with its own dtype and a leading ``T`` axis checked.
     """
     t = int(jnp.asarray(obs).shape[0])
+    if cont is None:
+        obs, action, reward = as_floats(obs, action, reward)
+        cont = jnp.ones((t,), obs.dtype)
+    else:
+        obs, action, reward, cont = as_floats(obs, action, reward, cont)
     core = {
-        "obs": jnp.asarray(obs, jnp.float32),
-        "action": jnp.asarray(action, jnp.float32),
-        "reward": jnp.asarray(reward, jnp.float32),
-        "cont": jnp.ones((t,), jnp.float32) if cont is None else jnp.asarray(cont, jnp.float32),
+        "obs": obs,
+        "action": action,
+        "reward": reward,
+        "cont": cont,
         "is_first": jnp.asarray(is_first, jnp.bool_),
         "is_last": jnp.asarray(is_last, jnp.bool_),
     }
@@ -413,12 +430,16 @@ class StaticBuffer(eqx.Module):
         obs_dim: int,
         action_dim: int,
         extras: Schema | None = None,
+        dtype: object = None,
     ) -> StaticBuffer:
         """An allocated, empty buffer. Shapes are fixed here and never change.
 
         ``extras`` declares the task's columns (:class:`ColumnSpec` per name); every
-        episode written must carry exactly those.
+        episode written must carry exactly those. ``dtype`` (float32 or float64) is the
+        storage dtype of the four float columns, by default the default float dtype, to
+        which an episode's float columns are converted as they are written.
         """
+        dtype = jnp.result_type(float) if dtype is None else float_dtype(dtype)
         n, t = int(capacity), int(seq_len)
         if capacity < 1:
             raise ValueError(f"capacity must be positive, got {capacity}")
@@ -426,10 +447,10 @@ class StaticBuffer(eqx.Module):
         lead = (n, t) if cls is StaticBuffer else (n,)
         return cls(
             data=Episode(
-                obs=jnp.zeros((*lead, int(obs_dim)), jnp.float32),
-                action=jnp.zeros((*lead, int(action_dim)), jnp.float32),
-                reward=jnp.zeros(lead, jnp.float32),
-                cont=jnp.ones(lead, jnp.float32),
+                obs=jnp.zeros((*lead, int(obs_dim)), dtype),
+                action=jnp.zeros((*lead, int(action_dim)), dtype),
+                reward=jnp.zeros(lead, dtype),
+                cont=jnp.ones(lead, dtype),
                 is_first=jnp.zeros(lead, jnp.bool_),
                 is_last=jnp.zeros(lead, jnp.bool_),
                 extras={
@@ -453,7 +474,10 @@ class StaticBuffer(eqx.Module):
         return len(self) >= int(batch_size)
 
 
-def _check_extras(buffer: StaticBuffer | StreamBuffer, ep: Episode) -> None:
+def _admitted(buffer: StaticBuffer | StreamBuffer, ep: Episode) -> Episode:
+    """``ep`` checked against the buffer's columns and with each float column in the dtype the
+    buffer stores it in (a store converts to its declared dtype); a task column of another
+    per-step shape, or a non-float one of another dtype, is refused."""
     declared = dict(buffer.schema)
     if set(ep.extras) != set(declared):
         raise ValueError(
@@ -461,15 +485,26 @@ def _check_extras(buffer: StaticBuffer | StreamBuffer, ep: Episode) -> None:
             f"allocated for {sorted(declared)}: declare them in .empty(extras=...) — a buffer "
             "holds exactly the columns its schema names"
         )
+    extras = {}
     for name, spec in declared.items():
-        column = ep.extras[name]
-        if column.dtype != jnp.dtype(spec.dtype) or tuple(column.shape[1:]) != tuple(spec.shape):
+        column = jnp.asarray(ep.extras[name])
+        floats = jnp.issubdtype(column.dtype, jnp.floating) and jnp.issubdtype(
+            jnp.dtype(spec.dtype), jnp.floating
+        )
+        same = floats or column.dtype == jnp.dtype(spec.dtype)
+        if not same or tuple(column.shape[1:]) != tuple(spec.shape):
             raise ValueError(
                 f"task column {name!r} is {column.dtype} with per-step shape "
                 f"{tuple(column.shape[1:])} but the buffer's schema says {spec.dtype} "
                 f"{tuple(spec.shape)}; cast or reshape it before writing — a store would cast "
                 "silently"
             )
+        extras[name] = column.astype(buffer.data.extras[name].dtype) if floats else column
+    stored = {
+        name: jnp.asarray(getattr(ep, name)).astype(getattr(buffer.data, name).dtype)
+        for name in ("obs", "action", "reward", "cont")
+    }
+    return ep._replace(**stored, extras=extras)
 
 
 def _schema(extras: Schema | None) -> tuple[tuple[str, ColumnSpec], ...]:
@@ -491,7 +526,7 @@ def add(buffer: StaticBuffer, ep: Episode) -> StaticBuffer:
     ``ep`` is fitted to ``seq_len`` first. Eviction is FIFO by slot. Compute any
     column derived from the whole episode before adding.
     """
-    _check_extras(buffer, ep)
+    ep = _admitted(buffer, ep)
     fitted = fit_length(ep, buffer.seq_len, pad=buffer.pad_rules)
     slot = buffer.cursor % buffer.capacity
     data = jax.tree_util.tree_map(lambda store, row: store.at[slot].set(row), buffer.data, fitted)
@@ -511,7 +546,10 @@ def sample(buffer: StaticBuffer, key: Array, batch_size: int) -> Episode:
     Samples with replacement over the live slots. An empty buffer draws slot 0, so
     guard with :meth:`StaticBuffer.ready`.
     """
-    index = jax.random.randint(key, (int(batch_size),), 0, jnp.maximum(buffer.size, 1))
+    #  drawn as int32, the dtype of the buffer's counters, in either mode
+    index = jax.random.randint(
+        key, (int(batch_size),), 0, jnp.maximum(buffer.size, 1), dtype=jnp.int32
+    )
     return jax.tree_util.tree_map(lambda store: store[index], buffer.data)
 
 
@@ -554,12 +592,16 @@ class StreamBuffer(eqx.Module):
         obs_dim: int,
         action_dim: int,
         extras: Schema | None = None,
+        dtype: object = None,
     ) -> StreamBuffer:
         """An allocated, empty buffer. Shapes are fixed here and never change.
 
         ``extras`` declares the task's columns (:class:`ColumnSpec` per name); every
-        episode written must carry exactly those.
+        episode written must carry exactly those. ``dtype`` (float32 or float64) is the
+        storage dtype of the four float columns, by default the default float dtype, to
+        which an episode's float columns are converted as they are written.
         """
+        dtype = jnp.result_type(float) if dtype is None else float_dtype(dtype)
         n, t = int(capacity), int(seq_len)
         if t < 1:
             raise ValueError(f"seq_len must be positive, got {seq_len}")
@@ -573,10 +615,10 @@ class StreamBuffer(eqx.Module):
         lead = (n, t) if cls is StaticBuffer else (n,)
         return cls(
             data=Episode(
-                obs=jnp.zeros((*lead, int(obs_dim)), jnp.float32),
-                action=jnp.zeros((*lead, int(action_dim)), jnp.float32),
-                reward=jnp.zeros(lead, jnp.float32),
-                cont=jnp.ones(lead, jnp.float32),
+                obs=jnp.zeros((*lead, int(obs_dim)), dtype),
+                action=jnp.zeros((*lead, int(action_dim)), dtype),
+                reward=jnp.zeros(lead, dtype),
+                cont=jnp.ones(lead, dtype),
                 is_first=jnp.zeros(lead, jnp.bool_),
                 is_last=jnp.zeros(lead, jnp.bool_),
                 extras={
@@ -621,7 +663,7 @@ def extend(buffer: StreamBuffer, ep: Episode) -> StreamBuffer:
             f"extend takes ONE episode: obs (T, obs_dim), got {jnp.shape(ep.obs)} — a batch of "
             "episodes is a loop over this call, since each has its own length"
         )
-    _check_extras(buffer, ep)
+    ep = _admitted(buffer, ep)
     t = ep.length
     if t > buffer.capacity:
         raise ValueError(
@@ -651,7 +693,8 @@ def sample_windows(buffer: StreamBuffer, key: Array, batch_size: int) -> Episode
     """
     oldest = (buffer.cursor - buffer.size) % buffer.capacity
     starts = jnp.maximum(buffer.size - buffer.seq_len + 1, 1)
-    offset = jax.random.randint(key, (int(batch_size), 1), 0, starts)
+    #  drawn as int32, the dtype of the buffer's counters, in either mode
+    offset = jax.random.randint(key, (int(batch_size), 1), 0, starts, dtype=jnp.int32)
     index = (oldest + offset + jnp.arange(buffer.seq_len, dtype=jnp.int32)) % buffer.capacity
     window = jax.tree_util.tree_map(lambda store: store[index], buffer.data)
     return window._replace(is_first=window.is_first.at[:, 0].set(True))
@@ -673,11 +716,12 @@ def as_episode(columns: Mapping[str, np.ndarray]) -> Episode:
             "the episode's shape, so the format cannot be filled in without them"
         )
     t = int(np.asarray(columns["obs"]).shape[0])
+    dtype = as_floats(columns["obs"], columns["action"])[0].dtype
     core = {
         "obs": columns["obs"],
         "action": columns["action"],
-        "reward": columns.get("reward", jnp.zeros((t,), jnp.float32)),
-        "cont": columns.get("cont", jnp.ones((t,), jnp.float32)),
+        "reward": columns.get("reward", jnp.zeros((t,), dtype)),
+        "cont": columns.get("cont", jnp.ones((t,), dtype)),
         "is_first": columns.get("is_first", jnp.zeros((t,), jnp.bool_).at[0].set(True)),
         "is_last": columns.get("is_last", jnp.zeros((t,), jnp.bool_).at[-1].set(True)),
     }

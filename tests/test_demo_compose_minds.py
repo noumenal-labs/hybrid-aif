@@ -5,6 +5,7 @@ import pathlib
 
 import jax
 import numpy as np
+import pytest
 
 _PATH = pathlib.Path(__file__).resolve().parents[1] / "examples" / "compose_minds.py"
 _SPEC = importlib.util.spec_from_file_location("compose_minds", _PATH)
@@ -56,6 +57,11 @@ def test_each_coupled_mind_wants_a_dock_and_values_the_two_equally():
     assert round(float(left_left), 3) == 0.455  # the figure the section prints and cites
 
 
+@pytest.mark.skipif(
+    jax.config.jax_enable_x64,
+    reason="pins the split counts of 32 stochastic episodes drawn from float32 beliefs; under "
+    "64-bit mode the example builds its models in float64 and draws another stream",
+)
 def test_stochastic_coupled_minds_from_the_symmetric_start():
     by_tick, first = cm.split_by_tick(
         cm.coupled_episode, 32, start=cm.SYMMETRIC, selection="stochastic"
@@ -79,6 +85,14 @@ def test_acting_on_marginals_the_merged_mind_behaves_as_the_coupled_pair():
     np.testing.assert_array_equal(a, b)
     by_tick, _ = cm.split_by_tick(cm.merged_episode, 32, start=cm.SYMMETRIC, mode="marginal")
     np.testing.assert_array_equal(by_tick, np.zeros(9))
+
+
+@pytest.mark.skipif(
+    jax.config.jax_enable_x64,
+    reason="pins the split counts of 32 stochastic episodes drawn from float32 beliefs; under "
+    "64-bit mode the example builds its models in float64 and draws another stream",
+)
+def test_acting_on_marginals_stochastically_the_merged_mind_splits_as_pinned():
     by_tick, _ = cm.split_by_tick(
         cm.merged_episode, 32, start=cm.SYMMETRIC, selection="stochastic", mode="marginal"
     )

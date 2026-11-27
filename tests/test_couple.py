@@ -362,6 +362,8 @@ def test_a_simultaneous_kernel_run_is_pinned():
     nodes; the world component's node has none, so it is realised as intended. Under the
     composite form's key layout the run is the composite form's, value for value; under the
     round keys of ``run`` the agent's draws move and the rest stands."""
+    from tests.test_run_parity import as_recorded
+
     system, params, steps = _zoo_closed(True)
     traj = _run_old_keys(2, system, params, 12, KEY, steps, record_carries=True)
     assert traj["model.agent"].emitted["a_location"].tolist() == [
@@ -394,7 +396,7 @@ def test_a_simultaneous_kernel_run_is_pinned():
     ]
     location = [0, 0, 0, 0, 0, 0, 4, 2, 4, 1, 4, 0, 4]
     assert _states(traj, "world.world.location").tolist() == location
-    traj = run(system, params, 12, KEY, steps, record_carries=True)
+    traj = run(system, as_recorded(params), 12, KEY, steps, record_carries=True)
     assert traj["model.agent"].emitted["a_location"].tolist() == [
         4,
         0,

@@ -20,7 +20,7 @@ from tests.test_batched_run import pushers
 from tests.test_merge import agent_and_world
 from tests.test_run import KEY, level, wire
 from tests.test_run_nested import _shared
-from tests.test_survey_run import STARTS, STEPS, case_setting, example, small_camera
+from tests.test_survey_run import STARTS, STEPS, as_recorded, case_setting, example, small_camera
 
 
 class _Settled(Exception):  # noqa: N818 - the capture's signal
@@ -67,10 +67,12 @@ def forms(state):
 
 
 def survey():
+    """The one-level survey, the float32 model its pin was recorded with (in either mode)."""
     module = example("survey_run")
     setting, ticks = case_setting(module, "one-level")
-    camera = small_camera(example("survey_world").IMG_PIXELS)
-    return module.run_setting(setting, ticks, camera, STEPS, STARTS)
+    camera = small_camera(example("survey_world").IMG_PIXELS, dtype=jnp.float32)
+    with as_recorded(module):
+        return module.run_setting(setting, ticks, camera, STEPS, STARTS)
 
 
 def pusher_pair(order, batch=None):
@@ -186,5 +188,7 @@ def test_a_carry_whose_dtype_round_0_changes_is_settled_by_the_trace_as_before()
     traj = run(system, params, 3, KEY, steps, record_carries=True)
     assert traj.timing["settled"] == "traced"
     carries = [np.asarray(c) for c in traj["model"].carries]
-    assert [c.dtype for c in carries] == [np.float32] * 4
+    #  round 0's float is the default float dtype (a Python 0.5 beside an integer)
+    default = np.float64 if jax.config.jax_enable_x64 else np.float32
+    assert [c.dtype for c in carries] == [default] * 4
     np.testing.assert_array_equal(carries, [0.0, 0.5, 1.0, 1.5])

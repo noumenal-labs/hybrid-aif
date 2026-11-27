@@ -406,7 +406,7 @@ def resolve_step_targets(
                 chol = jnp.broadcast_to(chol[..., None, :, :], (*batch, count, d, d))
             else:
                 chol = chol.reshape((*batch, count, d, d))
-            weights = jnp.ones(batch)
+            weights = jnp.ones(batch, loc.dtype)
             for _, probs in states:
                 weights = weights[..., None] * jnp.asarray(probs)
                 weights = weights.reshape((*batch, -1))

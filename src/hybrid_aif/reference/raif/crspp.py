@@ -28,6 +28,7 @@ from hybrid_aif.distributions.neural import (
     kl_balance,
     straight_through_onehot,
 )
+from hybrid_aif.dtypes import settled_scan
 from hybrid_aif.factors import Deterministic
 from hybrid_aif.inference import amortized as _amortized
 from hybrid_aif.interval import Interval
@@ -177,7 +178,9 @@ def observe_no_action(
         return (deter, code), (deter, code, post_logits, prior_logits)
 
     keys = jax.random.split(key, embeds.shape[0])
-    _, out = jax.lax.scan(step, (deter0, code0), (keys, embeds, first))
+    #  the start is a read of the initial vector and the prior; a cell or posterior cast to a
+    #  wider dtype than those returns a wider carry
+    _, out = settled_scan(step, (deter0, code0), (keys, embeds, first))
     return out
 
 
@@ -429,7 +432,8 @@ def cosine_sim_to_pref_rollout(st: registry.Statics) -> registry.Step:
         pushed = system._update_empirical_prior(params, qs, None, key=k_t)
         return pushed, features(pushed)
 
-    _, preferred = jax.lax.scan(roll, tuple(start), keys, length=horizon)
+    #  the start is the caller's (aux_beliefs) and may be narrower than the CRSPP's parameters
+    _, preferred = settled_scan(roll, tuple(start), keys, length=horizon)
     width = int(sum(st.structure.widths))
     if preferred.shape[-1] != width:
         raise ValueError(

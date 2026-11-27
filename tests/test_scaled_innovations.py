@@ -749,7 +749,9 @@ def test_the_declaration_and_the_return_must_agree():
         _validated(NonlinearGaussianTransition(Pair(), _noise(jnp.zeros((1, 2)), chol)))
     with pytest.raises(ValueError, match=r"returns float32\[2\].*must return the pair"):
         _validated(_scaled(Mean(), chol))
-    with pytest.raises(ValueError, match=r"returns \(float32\[2\], float32\[1\]\)"):
+    #  the scale ``Short`` makes with ``jnp.ones`` is in the default float dtype
+    scale = "float64" if jax.config.jax_enable_x64 else "float32"
+    with pytest.raises(ValueError, match=rf"returns \(float32\[2\], {scale}\[1\]\)"):
         _validated(_scaled(Short(), chol))
     with pytest.raises(ValueError, match="noise_scale='diagonal'"):
         NonlinearGaussianTransition(Mean(), _noise(jnp.zeros((1, 2)), chol), noise_scale="diagonal")

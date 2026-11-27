@@ -642,6 +642,18 @@ needs them.
   settled every run of the 36 test files that call `run` both ways (831 tests): 213 settles
   equal, no fallback but the test that asks for one. No fixture re-recorded, no tolerance
   changed.
+  *Note, 2026-11-27.* One form per variable does not mean the reset's dtype. The Phase C path
+  settles each float the reset set (a port's value, a carry's leaf, the home, a held option) at
+  the wider of its dtype and the one round 0 returns for it, evaluating round 0 again on the
+  settled state while that widens anything (and once in any case under JAX's 64-bit mode: a
+  `plan(learn=...)` step learns from the second round on, so a learning rate wider than the model
+  first shows on the settled state), so a mixed model (parts cast to different float dtypes)
+  runs in the wider dtype from round 0 on. Between rounds a float is then only widened into the
+  state (`_like`); a later round returning a float wider than the state is refused, naming the
+  variable, with the remedy of giving the model, its rates and its inputs one float dtype. An
+  integer the reset set and round 0 makes a float is converted as before. The static settle
+  ("Settle without a trace" above) gives a float the reset left unset the dtype of the model's
+  tables, where that bullet says float32; with 64-bit mode off the two are the same.
   *Measured* (seconds before the scan, settle + compile; one configuration per process):
 
   | configuration | Phase C (traced settle) | settled from the structure | saved |

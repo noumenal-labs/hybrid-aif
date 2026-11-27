@@ -248,8 +248,9 @@ def test_observe_with_the_encoder_hoisted_matches_the_per_step_scan():
     agent = raif_mountain_car(KEY, **TINY)
     core, _ = assemble(agent.system, agent.params)
     t = 6
-    obs = jax.random.normal(jax.random.PRNGKey(1), (t, core.obs_dim))
-    act = jax.random.normal(jax.random.PRNGKey(2), (t, core.action_dim))
+    dtype = core.initial_state().deter.dtype  # the inputs in the core's own dtype
+    obs = jax.random.normal(jax.random.PRNGKey(1), (t, core.obs_dim), dtype)
+    act = jax.random.normal(jax.random.PRNGKey(2), (t, core.action_dim), dtype)
     first = jnp.zeros((t,), bool).at[0].set(True).at[3].set(True)
     for flags in (None, first):
         got = core.observe(KEY, act, obs, is_first=flags)

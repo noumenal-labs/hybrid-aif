@@ -52,6 +52,7 @@ from hybrid_aif.composition import (
     with_mirror,
 )
 from hybrid_aif.distributions import Categorical, ConditionalDirichlet
+from hybrid_aif.dtypes import cast
 from hybrid_aif.system import keyed
 from hybrid_aif.system.mirror import mirror
 from tests.test_action_nodes import KERNEL, pusher
@@ -108,10 +109,29 @@ def _old_layout(minds: int):
     )
 
 
-def _run_old_keys(minds: int, *args, **kwargs):
+def _run_old_keys(minds: int, system, params, *args, **kwargs):
+    """``run`` under the key layout of the recordings. Under JAX's 64-bit mode the params are
+    cast to float32 first: the recordings are float32 runs, and a float32 model computes in
+    float32 in either mode, so it replays them bit for bit."""
     a, b, c = _old_layout(minds)
     with a, b, c:
-        return run(*args, **kwargs)
+        return run(system, as_recorded(params), *args, **kwargs)
+
+
+def as_recorded(params):
+    """``params`` in the dtype the recordings were made in: as given with JAX's 64-bit mode off
+    (where every float is float32), cast to float32 under it, so a recorded float32 run replays
+    bit for bit in either mode."""
+    if not jax.config.jax_enable_x64:
+        return params
+    params = cast(params, jnp.float32)
+    floats = {x.dtype for x in jax.tree_util.tree_leaves(params) if _floating(x)}
+    assert floats == {np.dtype(np.float32)}
+    return params
+
+
+def _floating(x) -> bool:
+    return hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating)
 
 
 def habit_draw(system, key, params):
@@ -136,7 +156,9 @@ def habit_draw(system, key, params):
     else:
         levels = system._control_levels(system._params_in(params, "habit"))
     keys = jax.random.split(key, len(levels))
-    draws = [jax.random.randint(k, (), 0, n) for k, n in zip(list(keys), levels, strict=True)]
+    draws = [
+        jax.random.randint(k, (), 0, n, jnp.int32) for k, n in zip(list(keys), levels, strict=True)
+    ]
     drawn = jnp.stack(draws).astype(jnp.int32) if draws else jnp.zeros((0,), jnp.int32)
     if system._table.sugar is None:
         return keyed.actions_out(names, drawn)

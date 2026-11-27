@@ -78,9 +78,9 @@ def _model(loc, weights, growth=None, scale: float = 1.0, strength: float = 0.1)
     )
     k = len(weights)
     growth = None if growth is None else jnp.asarray(growth)
-    weights = jnp.asarray(weights, jnp.float32)[:, None]
+    weights = jnp.asarray(weights)[:, None]
     emission = gaussian_emission(
-        jnp.asarray(loc, jnp.float32),
+        jnp.asarray(loc, float),  # the model in the default float dtype, whatever the data
         jnp.broadcast_to(scale * jnp.eye(2), (k, 2, 2)),
         strength=strength,
     )

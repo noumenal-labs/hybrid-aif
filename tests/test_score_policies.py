@@ -38,8 +38,13 @@ def _assert_trees_equal(got, ref):
     assert {t: set(b) for t, b in got.items()} == {t: set(b) for t, b in ref.items()}
     for term, blocks in ref.items():
         for block, iv in blocks.items():
-            assert jnp.array_equal(got[term][block].lower, iv.lower), (term, block)
-            assert jnp.array_equal(got[term][block].upper, iv.upper), (term, block)
+            for bound in ("lower", "upper"):
+                got_b, want_b = getattr(got[term][block], bound), getattr(iv, bound)
+                if jax.config.jax_enable_x64:
+                    #  float64 reassociation between the two paths, which float32 rounds away
+                    np.testing.assert_allclose(got_b, want_b, rtol=1e-12, atol=1e-12)
+                else:
+                    assert jnp.array_equal(got_b, want_b), (term, block)
 
 
 # --------------------------------------------------------------------- discrete

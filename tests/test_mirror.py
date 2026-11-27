@@ -30,6 +30,7 @@ from tests import mirror_cases
 from tests.test_action_node_modalities import maze_with_cue_by_node
 from tests.test_action_nodes import pusher
 from tests.test_emissions import world as emitting_world
+from tests.test_run_parity import as_recorded
 from tests.test_system import tmaze_system
 from tests.test_terrain_field import _rover
 
@@ -38,13 +39,26 @@ DATA = Path(__file__).parent / "data"
 
 @pytest.mark.parametrize("name", sorted(mirror_cases.cases()))
 def test_as_env_over_the_mirror_reproduces_the_recorded_forward_samples(name):
+    """Bitwise. Under JAX's 64-bit mode the neural case (its networks built in float32) differs
+    from the recording by at most two float32 ulps of the largest recorded value (measured: 3.6e-7
+    on the readings, 1.5 ulps there, and 2.4e-7 on the state), the float32 networks compiled under
+    that mode; every other case is bitwise there too."""
     case = mirror_cases.cases()[name]
-    env, params = case.system.as_env(case.params, case.param_key)
+    #  the recordings are float32 draws; under JAX's 64-bit mode the cases are cast to float32
+    #  (as_recorded asserts every float leaf is), whose draws are the recorded stream
+    env, params = case.system.as_env(as_recorded(case.params), case.param_key)
     got = mirror_cases.record(env, params, case.states)
     want = np.load(DATA / f"as_env_{name}.npz")
     assert {k.replace("/", "__") for k in got} == set(want.files)
+    by_ulp = name == "mlp" and jax.config.jax_enable_x64
     for key, value in got.items():
-        np.testing.assert_array_equal(value, want[key.replace("/", "__")], err_msg=key)
+        recorded = want[key.replace("/", "__")]
+        if by_ulp and np.issubdtype(recorded.dtype, np.floating):
+            assert value.dtype == recorded.dtype == np.float32, key
+            ulp = float(np.spacing(np.abs(recorded).max()))  # at the largest recorded value
+            np.testing.assert_allclose(value, recorded, rtol=0, atol=2 * ulp, err_msg=key)
+        else:
+            np.testing.assert_array_equal(value, recorded, err_msg=key)
 
 
 # ----------------------------------------------------------------------- the transform

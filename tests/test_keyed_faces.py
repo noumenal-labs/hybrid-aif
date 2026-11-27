@@ -24,6 +24,11 @@ KEY = jax.random.PRNGKey(0)
 OBS = {"location_obs": jnp.asarray(2), "reward": jnp.asarray(0), "cue": jnp.asarray(0)}
 
 
+#: The default float dtype, the dtype of the models built here from Python numbers: float32, or
+#: float64 under JAX's 64-bit mode.
+DEFAULT_FLOAT = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+
+
 def _example(name: str):
     path = Path(__file__).resolve().parents[1] / "examples" / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"_keyed_{name}", path)
@@ -187,7 +192,7 @@ def test_as_env_speaks_names_and_rolls_out_a_continuous_modality():
     B, T = 2, 5
     traj = run(*with_mirror(system, params), T, KEY, _random_world_steps(), batch=B)
     position = traj["world"].emitted["position"]
-    assert position.shape == (B, T, 1) and position.dtype == jnp.float32
+    assert position.shape == (B, T, 1) and position.dtype == DEFAULT_FLOAT
     assert traj["world"].carry["world.state"].shape == (B, 2)
     action = traj["model"].emitted["a_state"]
     assert action.shape == (B, T) and action.dtype == jnp.int32
@@ -199,7 +204,7 @@ def test_a_mixed_categorical_and_lg_env_rolls_out_with_each_dtype():
         *with_mirror(system, params), 3, KEY, _random_world_steps(), batch=2, record_carries=True
     )
     y = traj["world"].emitted["y"]
-    assert y.dtype == jnp.float32 and y.shape == (2, 3, 1)
+    assert y.dtype == DEFAULT_FLOAT and y.shape == (2, 3, 1)
     mode = traj["world"].carries[-1]["world.mode"]
     assert mode.dtype == jnp.int32 and mode.shape == (2,)
     assert traj["world"].carries[-1]["world.x"].shape == (2, 1)

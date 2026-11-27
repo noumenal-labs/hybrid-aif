@@ -49,6 +49,7 @@ from hybrid_aif.distributions import (
     Gaussian,
     MLPConditional,
 )
+from hybrid_aif.dtypes import as_float
 from hybrid_aif.envs.base import Env, Obs, State
 from hybrid_aif.factors import NonlinearGaussianTransition, transition_point
 
@@ -234,14 +235,14 @@ class HybridProcess(Env):
         )
 
     def null_action(self) -> Array:
-        """The no-op action: level zeros, the flat float zeros under ``controls``, or a mixed
-        space's entries of each (level 0, the zero vector)."""
+        """The no-op action: level zeros, the flat float zeros under ``controls`` (in the
+        default float dtype), or a mixed space's entries of each (level 0, the zero vector)."""
         if self.controls is not None:
-            return jnp.zeros((self.controls.action_dim,), jnp.float32)
+            return jnp.zeros((self.controls.action_dim,), float)
         if self.kinds and any(k != LEVEL for k in self.kinds):
             return ControlStep(
                 entries=tuple(
-                    jnp.int32(0) if k == LEVEL else jnp.zeros((n,), jnp.float32)
+                    jnp.int32(0) if k == LEVEL else jnp.zeros((n,), float)
                     for k, n in zip(self.kinds, self.sizes, strict=True)
                 )
             )
@@ -346,7 +347,7 @@ class HybridProcess(Env):
                         value = jnp.asarray(node_entry(action, c, self.controls), jnp.int32)
                         levels.append(value)
                     else:
-                        value = jnp.asarray(node_entry(action, c, self.controls), jnp.float32)
+                        value = as_float(node_entry(action, c, self.controls))
                     controls.append(value)
                 # a noise prior is sampled from at its point (as_env lowers or draws it first)
                 innov = transition_point(B_f).innovations.condition_on(tuple(levels) or (0,))
@@ -354,7 +355,8 @@ class HybridProcess(Env):
                 if scale is None:
                     next_state.append(mean + innov.sample(k))
                 else:  # the scale at this sampled state and these controls, exactly
-                    eps = jax.random.normal(k, innov.loc.shape)
+                    dtype = jnp.result_type(innov.loc, innov.chol)
+                    eps = jax.random.normal(k, innov.loc.shape, dtype)
                     draw = (innov.chol @ eps[..., None])[..., 0]  # as innov.sample draws
                     next_state.append(mean + (innov.loc + scale * draw))
             else:

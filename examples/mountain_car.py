@@ -162,6 +162,7 @@ from jax import Array
 
 from hybrid_aif.controls import Box
 from hybrid_aif.distributions import Gaussian, MLPConditional
+from hybrid_aif.dtypes import as_float
 from hybrid_aif.factors import LinearGaussianObservation
 from hybrid_aif.planning.cem import cem_plan, mean_action
 from hybrid_aif.reference.envs.mountain_car import MountainCar
@@ -386,7 +387,7 @@ def make_episode(
             reward=jnp.zeros(()),
             steps=jnp.zeros((), jnp.int32),
             error=jnp.zeros(()),
-            lr=jnp.asarray(episode_lr, jnp.float32),
+            lr=as_float(episode_lr),
         )
         out, _ = jax.lax.scan(tick, init, jnp.arange(env.time_limit))
         log = EpisodeLog(
@@ -457,7 +458,7 @@ def main() -> None:
         start = time.perf_counter()
         frac = ep / max(args.episodes - 1, 1)
         rate = args.lr * (args.lr_final / args.lr) ** frac
-        params, learn_state, log = episode(k_ep, params, learn_state, jnp.float32(rate))
+        params, learn_state, log = episode(k_ep, params, learn_state, as_float(rate))
         elapsed = time.perf_counter() - start
         rewards.append(float(log.reward))
         successes.append(float(log.success))

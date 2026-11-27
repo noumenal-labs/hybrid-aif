@@ -14,12 +14,21 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
+from hybrid_aif.dtypes import cast
 from hybrid_aif.train.buffers import ColumnSpec, Episode, episode
 
 IS_SUCCESS = "is_success"
 HAS_SUCCEEDED = "has_succeeded"
 CAN_SELF_IMITATE = "can_self_imitate"
 PREF_LABEL = "pref_label"
+
+#: The precision the R-AIF reference runs in, in every mode: float32. Every network of the agent
+#: draws its weights in this dtype, so it computes in it and casts its inputs to it; every other
+#: parameter, each episode and buffer, and what the reference takes from the environment are
+#: made in it or cast to it, and a training batch is cast to the agent's dtype, so under JAX's
+#: 64-bit mode the reference still computes in float32. Their mixed float16 precision is not
+#: followed (``docs/design/amortization.md`` divergence 9).
+DTYPE = jnp.float32
 
 #: The task columns and how a buffer pads them: the two flags hold their last
 #: value (a padded step is still "after the goal"), the weight and the label are
@@ -58,25 +67,27 @@ def raif_episode(
     pref_label: Array | None = None,
 ) -> Episode:
     """An :class:`Episode` from their recorded columns: ``cont = 1 − is_success``,
-    the four task columns in ``extras`` (ρ zero until :func:`.revise.label`)."""
+    the four task columns in ``extras`` (ρ zero until :func:`.revise.label`). Every float column
+    is cast to :data:`DTYPE`."""
     success = jnp.asarray(is_success, jnp.bool_)
     t = int(success.shape[0])
-    return episode(
+    ep = episode(
         obs,
         action,
         reward,
         is_first=is_first,
         is_last=is_last,
-        cont=1.0 - success.astype(jnp.float32),
+        cont=1.0 - success.astype(DTYPE),
         **{
             IS_SUCCESS: success,
             HAS_SUCCEEDED: jnp.asarray(has_succeeded, jnp.bool_),
-            CAN_SELF_IMITATE: jnp.asarray(can_self_imitate, jnp.float32),
-            PREF_LABEL: jnp.zeros((t,), jnp.float32)
+            CAN_SELF_IMITATE: jnp.asarray(can_self_imitate, DTYPE),
+            PREF_LABEL: jnp.zeros((t,), DTYPE)
             if pref_label is None
-            else jnp.asarray(pref_label, jnp.float32),
+            else jnp.asarray(pref_label, DTYPE),
         },
     )
+    return cast(ep, DTYPE)
 
 
 def recorded_columns(ep: Episode) -> dict[str, np.ndarray]:

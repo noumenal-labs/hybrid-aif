@@ -1474,10 +1474,10 @@ def plan_path(tick, policy):
             np.sin(b["heading"]),
             b["speed"],
             b.get("energy_level", wd.ENERGY_MAX),
-        ],
-        np.float32,
+        ]
     )
-    return np.asarray(_roll(jnp.asarray(x), jnp.asarray(policy["v_plan"], jnp.float32)))
+    plan = jnp.asarray(policy["v_plan"])
+    return np.asarray(_roll(jnp.asarray(x, float), plan))
 
 
 @jax.jit

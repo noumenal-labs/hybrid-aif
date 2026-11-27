@@ -15,6 +15,7 @@ import pytest
 from pymdp.control import construct_policies, get_marginals, update_posterior_policies
 
 from hybrid_aif import Categorical
+from hybrid_aif.dtypes import settled_scan
 from hybrid_aif.interval import Interval
 from hybrid_aif.objectives.base import total
 from hybrid_aif.planning import (
@@ -24,7 +25,6 @@ from hybrid_aif.planning import (
     policy_posterior,
     sample_action,
 )
-from hybrid_aif.planning.enumerate import settled_scan
 
 KEY = jax.random.PRNGKey(0)
 

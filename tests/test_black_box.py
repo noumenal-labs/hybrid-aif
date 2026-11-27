@@ -41,6 +41,9 @@ from tests.test_action_nodes import pusher
 
 KEY = jax.random.PRNGKey(0)
 ORDERS = ("simultaneous", "sequential", "async")
+#: The default float dtype, which a value a step builds from Python numbers or ``jnp.zeros`` takes:
+#: float32, or float64 under JAX's 64-bit mode.
+DEFAULT_FLOAT = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
 
 
 def box():
@@ -223,7 +226,7 @@ def test_two_black_boxes_with_float_ports_drive_each_other():
     for order in ORDERS:
         rec = run(system, params, 4, KEY, {"brain": pull, "body": integrate}, tick_order=order)
         brain, body = rec["brain"], rec["body"]
-        assert body.emitted["x"].shape == (4, 2) and brain.received["x"].dtype == jnp.float32
+        assert body.emitted["x"].shape == (4, 2) and brain.received["x"].dtype == DEFAULT_FLOAT
         #  each box integrates or reacts to what its in-port received
         x = np.concatenate([np.asarray(body.start["x"])[None], np.asarray(body.emitted["x"])])
         np.testing.assert_allclose(x[1:], x[:-1] + np.asarray(body.received["force"][:4]))
@@ -481,7 +484,12 @@ def test_env_step_runs_a_continuous_environment_through_float_ports():
     _, state = car.reset(jax.random.fold_in(k_reset, 1))
     for t in range(5):
         _, state = car.step(None, state, jnp.ones(1))
-        np.testing.assert_array_equal(rec["car"].emitted["x"][t], state[0])
+        if jax.config.jax_enable_x64:
+            #  in float64 the physics fused inside the scan and stepped op by op differ by an
+            #  ulp (XLA fusion); in float32 they agree bitwise
+            np.testing.assert_allclose(rec["car"].emitted["x"][t], state[0], rtol=1e-14, atol=0)
+        else:
+            np.testing.assert_array_equal(rec["car"].emitted["x"][t], state[0])
     with pytest.raises(TypeError, match="pass its .inner"):
         env_step(GenerativeEnv.wrap(*_tabular_env()[:1], pusher()[0]))
 
@@ -629,9 +637,9 @@ def test_a_box_out_port_value_is_normalised_to_one_dtype_across_rounds():
 
     rec = run(*floats, 4, KEY, {"brain": push, "body": idle})
     emitted = rec["brain"].emitted["force"]
-    assert emitted.dtype == jnp.float32 and emitted.shape == (4, 1)
+    assert emitted.dtype == DEFAULT_FLOAT and emitted.shape == (4, 1)
     np.testing.assert_array_equal(emitted[:, 0], [0.5, 1.0, 1.5, 2.0])
-    assert rec["body"].received["force"].dtype == jnp.float32
+    assert rec["body"].received["force"].dtype == DEFAULT_FLOAT
     np.testing.assert_array_equal(rec["brain"].start["force"], [3.0])
 
 

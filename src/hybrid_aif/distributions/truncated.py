@@ -14,11 +14,15 @@ With ``α = (low − loc)/scale``, ``β = (high − loc)/scale`` and the normali
 - entropy ``log(√(2πe)·scale·Z) + (αφ(α) − βφ(β))/(2Z)``.
 
 An infinite bound is read 40 standard deviations beyond the other bound (the mass past it is
-zero in float32), so a half-bounded or unbounded member has finite moments and gradients.
+zero in float32 and in float64), so a half-bounded or unbounded member has finite moments and
+gradients.
 
 ``log Z`` is computed in log space from ``log_ndtr``, a box in the upper tail reflected onto the
 lower one, so a box many standard deviations from ``loc`` keeps a finite normaliser and finite
 moments. Sampling is reparameterised through the inverse CDF, inverted in log space.
+
+The leaves share one dtype, the one :func:`~hybrid_aif.dtypes.as_floats` gives the four inputs:
+the widest among the float arrays passed.
 
 Design: docs/design/control-states.md C4 (Bounded Gaussian).
 """
@@ -32,6 +36,7 @@ from jax import Array
 from jax.scipy.special import log_ndtr, ndtri
 
 from hybrid_aif.distributions.base import Distribution
+from hybrid_aif.dtypes import as_float, as_floats
 from hybrid_aif.interval import Interval
 
 _LOG_2PI = math.log(2.0 * math.pi)
@@ -48,11 +53,13 @@ _CF_TERMS = 24
 #: precision there.
 _NARROW = 1.0
 #: Below this half-width (in standard deviations) a draw comes from the exponential tilt
-#: ``exp(−c t)`` about the lower bound: the dropped ``t²/2`` is under float32 precision there.
+#: ``exp(−c t)`` about the lower bound, which drops the ``t²/2`` of the log density (under
+#: ``2e-6`` there, since ``t ≤ 2h``): an approximation in either precision.
 _TILT_HALF_WIDTH = 1e-3
 _SERIES_TERMS = 12
 #: An infinite bound is read this many standard deviations out (beyond the other bound): the
-#: mass past it is zero in float32, and every quantity stays finite and differentiable.
+#: mass past it is zero in float32 and in float64, and every quantity stays finite and
+#: differentiable.
 _INFINITE = 40.0
 
 
@@ -184,7 +191,7 @@ class TruncatedGaussian(Distribution):
     high: Array
 
     def __init__(self, loc: Array, scale: Array, low: Array, high: Array):
-        arrays = [jnp.asarray(v, jnp.float32) for v in (loc, scale, low, high)]
+        arrays = as_floats(loc, scale, low, high)
         shape = jnp.broadcast_shapes(*(a.shape for a in arrays))
         if not shape:
             raise ValueError(
@@ -290,7 +297,7 @@ class TruncatedGaussian(Distribution):
         var = jnp.where(narrow, half**2 * (r2 - h**2 * r1**2), self.scale**2 * var_std)
         bounded = jnp.isfinite(self.low) & jnp.isfinite(self.high)
         cap = jnp.where(bounded, half**2, jnp.inf)
-        return jnp.clip(var, jnp.finfo(jnp.float32).tiny, cap)
+        return jnp.clip(var, jnp.finfo(var.dtype).tiny, cap)
 
     @property
     def cov(self) -> Array:
@@ -302,7 +309,7 @@ class TruncatedGaussian(Distribution):
 
     def log_prob(self, x: Array) -> Array:
         """Log density at ``x``, summed over dimensions; ``−inf`` outside the box."""
-        x = jnp.asarray(x, jnp.float32)
+        x = as_float(x)
         z = (x - self.loc) / self.scale
         per_dim = _log_phi(z) - jnp.log(self.scale) - self.log_normalisers()
         inside = jnp.all((x >= self.low) & (x <= self.high), axis=-1)
@@ -313,9 +320,11 @@ class TruncatedGaussian(Distribution):
         ``x = loc + scale·Φ⁻¹(Φ(α) + u·Z)``, with ``Φ(α) + u·Z`` formed in log space and a box
         in the upper tail drawn from its reflection. Draws are clipped into the box against
         rounding. A box narrower than :data:`_TILT_HALF_WIDTH` standard deviations, where the
-        inverse CDF runs out of float32 resolution and ``t²/2`` is below it, is drawn from its
-        exponential tilt about the lower bound."""
-        u = jax.random.uniform(key, sample_shape + self.loc.shape, jnp.float32)
+        inverse CDF runs out of float32 resolution, is drawn from its exponential tilt about the
+        lower bound (dropping ``t²/2``, under ``2e-6`` there). ``u`` is drawn in the leaves' dtype
+        and clipped into ``[1e-7, 1 − 1e-7]`` in either precision, so the outermost ``1e-7`` of
+        the mass at each end is not drawn."""
+        u = jax.random.uniform(key, sample_shape + self.loc.shape, self.loc.dtype)
         u = jnp.clip(u, 1e-7, 1.0 - 1e-7)
         narrow, c, h, _, _, _ = self._narrow()
         narrow = narrow & (h < _TILT_HALF_WIDTH)

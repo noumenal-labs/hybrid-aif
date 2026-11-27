@@ -110,9 +110,10 @@ def mean_field_free_energy(
 
     ``−F`` is a lower bound on the tick's log evidence ``log p(o)`` under the priors, exact for
     one factor whose posterior the sweep found; the terms are tempered as :func:`fpi` tempers
-    them, and a masked-out modality contributes nothing.
+    them, and a masked-out modality contributes nothing. The sum starts in the posteriors' float
+    dtype.
     """
-    total = jnp.zeros(())
+    total = jnp.zeros((), jnp.result_type(*(q.probs for q in posteriors), float))
     for prior, q in zip(priors, posteriors, strict=True):
         log_prior = jnp.maximum(prior.log_probs, LOG_ZERO)
         probs = q.probs
@@ -183,7 +184,11 @@ def fpi_support(
         if present is not True:
             observed = jnp.where(jnp.asarray(present), observed, jnp.zeros_like(observed))
         obs_lls.append(observed)
+    #  the factors meet in every sweep, so the sweep runs in the widest float dtype among the
+    #  priors and the observed log-likelihoods, and so starts in it
     log_priors = [jnp.maximum(p.log_probs, LOG_ZERO) for p in priors]
+    dtype = jnp.result_type(*log_priors, *obs_lls)
+    log_priors = [lp.astype(dtype) for lp in log_priors]
 
     def messages(log_q: list[Array], skip: tuple[int, ...] = ()) -> list[list[Array]]:
         q = [jax.nn.softmax(lq, axis=-1) for lq in log_q]

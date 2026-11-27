@@ -9,8 +9,10 @@ ticks that fed the data from its carry. The emission version, which the caller (
 feeds, reproduces every number bit for bit.
 """
 
+import functools
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -93,7 +95,11 @@ def model():
             "kind": Categorical(logits=jnp.zeros(3)),
         },
     )
-    return system, params
+    #  the fixture was recorded in float32: the model is float32 in either mode (cast under
+    #  JAX's 64-bit mode, where it builds in float64)
+    from tests.test_run_parity import as_recorded
+
+    return system, as_recorded(params)
 
 
 def trace(T):
@@ -140,11 +146,17 @@ def test_replay_feeds_the_emissions_it_realises_and_records_them():
     system, params = model()
     xs, kinds = trace(5)
     out = replay(system, params, {"obs_x": xs, "obs_kind": kinds}, {}, metrics=False)
-    np.testing.assert_array_equal(np.asarray(out.beliefs["x"].loc), FIXTURE["replay_x_loc"])
-    np.testing.assert_array_equal(
-        np.asarray(out.beliefs["kind"].probs), FIXTURE["replay_kind_probs"]
-    )
-    np.testing.assert_array_equal(np.asarray(out.free_energy), FIXTURE["replay_free_energy"])
+    if jax.config.jax_enable_x64:
+        #  float32 arrays throughout, but the Python constants in the program are taken in
+        #  float64 under 64-bit mode before they meet one, and the replay differs from the
+        #  recording by up to an ulp of float32 at the last tick
+        assert out.beliefs["kind"].probs.dtype == jnp.float32
+        same = functools.partial(np.testing.assert_allclose, rtol=1e-6, atol=1e-7)
+    else:
+        same = np.testing.assert_array_equal
+    same(np.asarray(out.beliefs["x"].loc), FIXTURE["replay_x_loc"])
+    same(np.asarray(out.beliefs["kind"].probs), FIXTURE["replay_kind_probs"])
+    same(np.asarray(out.free_energy), FIXTURE["replay_free_energy"])
     # what is recorded at tick t is the emission of that tick's posterior
     np.testing.assert_array_equal(
         np.asarray(out.emitted["x_mean"]), np.asarray(out.beliefs["x"].loc)

@@ -5,6 +5,7 @@ fallback controller for fixture-less runs. Seed statistics are
 Design: ``docs/design/amortization.md`` A12 item 6.
 """
 
+import dataclasses
 from collections.abc import Callable
 
 import jax
@@ -12,7 +13,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from hybrid_aif.reference.envs.mountain_car import MountainCar
-from hybrid_aif.reference.raif.columns import raif_episode
+from hybrid_aif.reference.raif.columns import DTYPE, raif_episode
 from hybrid_aif.train.buffers import Episode
 
 #: A policy for :func:`collect_episode`: ``(key, obs) -> action`` of shape ``(1,)``.
@@ -51,16 +52,17 @@ def collect_episode(
     """
     steps = int(env.time_limit if steps is None else steps)
     key, reset_key = jax.random.split(key)
+    env = dataclasses.replace(env, dtype=DTYPE)  # the state, and so the physics, in DTYPE
     obs, state = env.reset(reset_key)
     rows: list[tuple] = []
-    succeeded, incoming = False, jnp.zeros((), jnp.float32)
+    succeeded, incoming = False, jnp.zeros((), DTYPE)
     for t in range(steps + 1):
         key, act_key, step_key = jax.random.split(key, 3)
         current = obs[0]
         success = bool(env.reached_goal(state))
         succeeded = succeeded or success
         is_last = success or t >= steps
-        action = jnp.reshape(jnp.asarray(policy(act_key, current), jnp.float32), (1,))
+        action = jnp.reshape(jnp.asarray(policy(act_key, current), DTYPE), (1,))
         rows.append(
             (
                 current,
@@ -79,10 +81,10 @@ def collect_episode(
     return raif_episode(
         obs=jnp.stack([row[0] for row in rows]),
         action=jnp.stack([row[1] for row in rows]),
-        reward=jnp.stack([jnp.asarray(row[2], jnp.float32) for row in rows]),
+        reward=jnp.stack([jnp.asarray(row[2], DTYPE) for row in rows]),
         is_success=jnp.stack([jnp.asarray(row[3]) for row in rows]),
         has_succeeded=jnp.stack([jnp.asarray(row[4]) for row in rows]),
-        can_self_imitate=jnp.asarray([row[5] for row in rows], jnp.float32),
+        can_self_imitate=jnp.asarray([row[5] for row in rows], DTYPE),
         is_first=jnp.zeros((n,), bool).at[0].set(True),
         is_last=jnp.zeros((n,), bool).at[-1].set(True),
     )

@@ -76,7 +76,7 @@ def _transition(prior=None, **kwargs) -> LinearGaussianTransition:
 
 def _observation(noise=None) -> LinearGaussianObservation:
     noise = _f32(np.sqrt(R) * np.eye(2)) if noise is None else noise
-    return LinearGaussianObservation(H=_f32(H), c=jnp.zeros(2), noise=noise)
+    return LinearGaussianObservation(H=_f32(H), c=_f32(np.zeros(2)), noise=noise)
 
 
 def _system(**kwargs) -> System:

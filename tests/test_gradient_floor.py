@@ -31,6 +31,7 @@ import pytest
 
 from hybrid_aif import Box, Interval, NonlinearGaussianTransition
 from hybrid_aif.controls import ControlLayout
+from hybrid_aif.dtypes import cast
 from hybrid_aif.objectives.base import total
 from hybrid_aif.planning import gradient_plan
 from hybrid_aif.planning.base import PlannerContext
@@ -228,9 +229,12 @@ def _detour_module():
     return module
 
 
-def _detour(which):
+def _detour(which, dtype=None):
+    """The sensor-detour agent ``which``, its params cast to ``dtype`` when given."""
     module = _detour_module()
     system, params = module.agents()[which]
+    if dtype is not None:
+        params = cast(params, dtype)
     return Case(f"detour_{which}", module._context(system, params), None, 400)
 
 
@@ -323,6 +327,11 @@ def test_the_descent_is_the_previous_rule_bitwise_where_the_floor_never_binds(na
 @pytest.mark.parametrize("name", BOUND)
 def test_the_descent_is_the_previous_rule_bitwise_until_the_floor_first_binds(name):
     c = case(name)
+    if jax.config.jax_enable_x64 and name == "detour_posterior":
+        #  the floor binds on the detour at float32 precision; under 64-bit mode the example
+        #  builds it in float64, whose floor (1.5e-8 of the gradient's RMS) never binds there
+        c = _detour("posterior", jnp.float32)
+        assert c.ctx.continuous_controls.low.dtype == jnp.float32
     old = reference_descent(c.ctx, "old", c.steps, c.init)
     new = reference_descent(c.ctx, "new", c.steps, c.init)
     assert new.binding.any(), "listed as bound: move it to UNBOUND if the floor never binds"
@@ -588,10 +597,11 @@ def test_the_metrics_free_planner_returns_the_same_plan_and_g():
 
 
 def test_the_floor_is_the_precision_of_the_plans_dtype():
-    """The floor is ``sqrt(eps)`` of the plan's dtype times the gradient's RMS. The control box
-    fixes the plan at float32 (also with ``x64`` enabled), so the floor is 3.4e-4 of the RMS:
-    a coordinate whose gradient is 7e-7 of it moves by about a thousandth of its full step.
-    The step the library takes equals the one a hand computation of that floor gives."""
+    """The floor is ``sqrt(eps)`` of the plan's dtype times the gradient's RMS. The plan takes
+    the dtype of the control box's bounds; these are float32, so the plan is float32 (also with
+    ``x64`` enabled) and the floor is 3.4e-4 of the RMS: a coordinate whose gradient is 7e-7 of
+    it moves by about a thousandth of its full step. The step the library takes equals the one a
+    hand computation of that floor gives."""
     slope = 1e-6
     ctx = _two_coordinate_context(slope)
     got = gradient_plan(ctx, steps=1, init=jnp.zeros((1, 2), jnp.float32))
@@ -738,3 +748,34 @@ def test_the_planner_face_returns_the_same_tuple():
     got = gradient_plan(c.ctx)
     np.testing.assert_array_equal(np.asarray(out[2]), np.asarray(got.plan[None]))
     assert out[0] is not None and out[1] is not None
+
+
+# ---------------------------------------------------------- the best iterate in the score dtype
+
+
+def test_the_best_iterate_is_chosen_in_the_dtype_of_the_score():
+    """A float32 box over a float64 score (a float32 control box beside a float64 model, under
+    64-bit mode): the iterates' scores differ only past float32's precision, and the best one is
+    picked, and returned, in float64. Compared in float32 the scores tie and the last iterate
+    would be returned in its place."""
+    from hybrid_aif.planning.gradient import descend_scored
+
+    with jax.enable_x64(True):
+        low, high = jnp.zeros((1,), jnp.float32), jnp.ones((1,), jnp.float32)
+        plan0 = jnp.full((1, 1), 0.32, jnp.float32)
+
+        def score(plan):
+            return 1.0 + 1e-9 * jnp.sum((plan.astype(jnp.float64) - 0.3) ** 2)
+
+        assert score(plan0).dtype == jnp.float64 and plan0.dtype == jnp.float32
+        #  a plain gradient step of this rate overshoots the minimum further every step
+        rate = jnp.asarray([1.5e9], jnp.float32)
+        plan, best, trace, _, final = descend_scored(
+            score, plan0, low, high, rate, steps=3, optimizer="gradient"
+        )
+        trace = np.asarray(trace)
+        assert len(set(trace.tolist())) == 3 and len(set(trace.astype(np.float32).tolist())) == 1
+        assert final.dtype == jnp.float64 and plan.dtype == jnp.float32
+        assert int(best) == 0
+        np.testing.assert_array_equal(np.asarray(plan), np.asarray(plan0))
+        assert float(final) == float(score(plan0)) and float(final) != 1.0

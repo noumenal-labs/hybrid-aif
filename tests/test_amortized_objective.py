@@ -184,12 +184,32 @@ def test_act_returns_the_raw_actor_sample_and_leaves_the_box_to_its_consumers():
     beliefs = system.initial_priors(params)
     action, q_pi, tree = system.act(KEY, params, beliefs, plan_key=jax.random.PRNGKey(3))
     action = action["a_deter"]
-    assert action.shape == (1,) and action.dtype == jnp.float32
+    #  every module is built in the default float dtype, so the action is in it
+    default = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+    assert action.shape == (1,) and action.dtype == default
     assert bool(jnp.all(jnp.isfinite(action)))
     assert q_pi.probs.shape == (1,)  # a habit named one plan; nothing left to weigh
     assert tree == {}  # this selection produced no term tree; see the next test
 
-    #  the raw draw leaves the box, and `soft_clip` — not `act` — is what brings it in
+    #  `soft_clip` is a RESCALE, not a clip: sign(a)·1 in value, `1/|a|` in gradient
+    a = jnp.asarray([2.5])
+    bounds = (jnp.full((1,), -1.0), jnp.full((1,), 1.0))
+    assert float(soft_clip(a, bounds)[0]) == pytest.approx(1.0)
+    grad = jax.grad(lambda x: soft_clip(x, bounds).sum())(a)
+    assert float(grad[0]) == pytest.approx(1.0 / 2.5)
+    assert float(jax.grad(lambda x: jnp.clip(x, -1.0, 1.0).sum())(a)[0]) == 0.0
+
+
+@pytest.mark.skipif(
+    jax.config.jax_enable_x64,
+    reason="pins one draw stream: of these 64 act-time draws of the float32-initialised actor "
+    "one leaves the box; under 64-bit mode the actor's weights and draws are other numbers",
+)
+def test_a_raw_actor_draw_leaves_the_box_and_soft_clip_brings_it_in():
+    """The exhibit of the previous test: a raw draw outside the declared box, which
+    :func:`~hybrid_aif.controls.soft_clip`, not ``act``, brings inside."""
+    system, params, _ = agent()
+    beliefs = system.initial_priors(params)
     draws = jnp.stack(
         [
             system.act(k, params, beliefs, plan_key=jax.random.PRNGKey(3))[0]["a_deter"]
@@ -200,13 +220,6 @@ def test_act_returns_the_raw_actor_sample_and_leaves_the_box_to_its_consumers():
     assert outside.any(), "a Gaussian actor over Box(-1, 1) must sometimes leave it"
     brought_in = soft_clip(draws, (jnp.full((1,), -1.0), jnp.full((1,), 1.0)))
     assert bool(jnp.all(jnp.abs(brought_in) <= 1.0 + 1e-6))
-    #  and it is a RESCALE, not a clip: sign(a)·1 in value, `1/|a|` in gradient
-    a = jnp.asarray([2.5])
-    bounds = (jnp.full((1,), -1.0), jnp.full((1,), 1.0))
-    assert float(soft_clip(a, bounds)[0]) == pytest.approx(1.0)
-    grad = jax.grad(lambda x: soft_clip(x, bounds).sum())(a)
-    assert float(grad[0]) == pytest.approx(1.0 / 2.5)
-    assert float(jax.grad(lambda x: jnp.clip(x, -1.0, 1.0).sum())(a)[0]) == 0.0
 
 
 def test_every_new_term_is_registered_with_the_value_sign():

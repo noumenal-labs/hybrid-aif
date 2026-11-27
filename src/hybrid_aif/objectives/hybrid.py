@@ -58,6 +58,7 @@ from hybrid_aif.distributions import (
     MLPConditional,
 )
 from hybrid_aif.distributions.gaussian import sigma_points
+from hybrid_aif.dtypes import as_float
 from hybrid_aif.factors import (
     LGObservation,
     LinearGaussianObservation,
@@ -352,7 +353,7 @@ def _validate_nonlinear(
     layout = tuple(
         jax.ShapeDtypeStruct((), jnp.int32)
         if discrete(what, i)
-        else jax.ShapeDtypeStruct((sizes[i],), jnp.float32)
+        else jax.ShapeDtypeStruct((sizes[i],), jnp.result_type(float))
         for what, i in declared
     )
 
@@ -927,7 +928,8 @@ def neural_emission(decl: MLPConditional) -> LinearGaussianObservation:
     d_obs = decl.child_dim
     mean = mean.reshape(*sizes, d_obs)
     noise = jax.vmap(jnp.diag)(scale).reshape(*sizes, d_obs, d_obs)
-    return LinearGaussianObservation(H=jnp.zeros((*sizes, d_obs, 0)), c=mean, noise=noise)
+    H = jnp.zeros((*sizes, d_obs, 0), mean.dtype)
+    return LinearGaussianObservation(H=H, c=mean, noise=noise)
 
 
 def neural_model(head: NeuralHead, q: Gaussian | MixtureGaussian):
@@ -1276,17 +1278,17 @@ def _lg_inputs(B_f: LinearGaussianTransition, read, entries: dict[int, object]) 
             means, roots = [], []
             for v in values:
                 if is_distribution(v):
-                    means.append(jnp.asarray(v.mean(), jnp.float32))
+                    means.append(v.mean())
                     root = v.chol if isinstance(v, Gaussian) else jnp.linalg.cholesky(v.cov)
-                    roots.append(jnp.asarray(root, jnp.float32))
+                    roots.append(root)
                 else:
-                    v = jnp.asarray(v, jnp.float32)
+                    v = as_float(v)
                     means.append(v)
-                    roots.append(jnp.zeros((v.shape[-1], v.shape[-1]), jnp.float32))
+                    roots.append(jnp.zeros((v.shape[-1], v.shape[-1]), v.dtype))
             u_mean = jnp.concatenate(means, axis=-1)
             u_root = jax.scipy.linalg.block_diag(*roots) if len(roots) > 1 else roots[0]
         else:
-            u_mean = jnp.concatenate([jnp.asarray(v, jnp.float32) for v in values], axis=-1)
+            u_mean = jnp.concatenate([as_float(v) for v in values], axis=-1)
     return _LGInputs(loc, chol, F, G, u_mean, u_root, not read.axes, shared)
 
 
@@ -1447,11 +1449,10 @@ def _nl_inputs(
             controls.append(level)
         elif is_distribution(entry):
             root = entry.chol if isinstance(entry, Gaussian) else jnp.linalg.cholesky(entry.cov)
-            mean = jnp.asarray(entry.mean(), jnp.float32)
-            beliefs.append((at, mean, jnp.asarray(root, jnp.float32)))
+            beliefs.append((at, entry.mean(), root))
             controls.append(None)
         else:
-            controls.append(jnp.asarray(entry, jnp.float32))
+            controls.append(as_float(entry))
     noise = transition_point(B_f).innovations.condition_on(tuple(levels) or (0,))
     return _NLInputs(noise.loc, noise.chol, tuple(controls), tuple(beliefs))
 
@@ -1520,7 +1521,12 @@ def _nonlinear_mixture_step(
     if log_weights is not None:
         logw = log_weights
     else:
-        logw = _mode_log_weights(parent_beliefs) if parent_beliefs else jnp.zeros((M,))
+        #  no state parent: one mode, of log-weight zero in the belief's dtype
+        logw = (
+            _mode_log_weights(parent_beliefs)
+            if parent_beliefs
+            else jnp.zeros((M,), q.log_weights.dtype)
+        )
 
     def mode(j: Array) -> Gaussian:
         levels = jnp.unravel_index(j, mode_shape) if mode_shape else ()
@@ -1621,7 +1627,12 @@ def _mixture_step(
     if log_weights is not None:
         logw = log_weights
     else:
-        logw = _mode_log_weights(parent_beliefs) if parent_beliefs else jnp.zeros((M,))
+        #  no state parent: one mode, of log-weight zero in the belief's dtype
+        logw = (
+            _mode_log_weights(parent_beliefs)
+            if parent_beliefs
+            else jnp.zeros((M,), q.log_weights.dtype)
+        )
     F = inputs.F
     Fs = jnp.broadcast_to(F, (M, d, d)) if F.ndim == 2 else F.reshape((-1, d, d))
     if inputs.u_mean is not None:

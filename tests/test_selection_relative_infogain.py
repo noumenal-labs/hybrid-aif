@@ -327,7 +327,14 @@ def test_tmaze_location_selection_drops_the_cue_drive():
     system = tmaze_system(epistemic=("location",))[0]
     beliefs = _initial_beliefs(system, params)
     q_pi, tree = system.infer_policies(params, beliefs)
-    assert int(system.policies(params)[jnp.argmax(q_pi.probs)][0, 0]) != CUE
+    if jax.config.jax_enable_x64:
+        #  the cue no longer drives: a cue-first policy is at most tied with the best other one,
+        #  and which of the tied policies the argmax takes is set by the last bits of float64
+        first = np.asarray(system.policies(params)[:, 0, 0])
+        logits = np.asarray(q_pi.logits)
+        assert logits[first == CUE].max() <= logits[first != CUE].max() + 1e-9
+    else:
+        assert int(system.policies(params)[jnp.argmax(q_pi.probs)][0, 0]) != CUE
     full = tmaze_system(epistemic=True)[0].infer_policies(params, beliefs)[1]
     assert np.all(
         np.asarray(tree["infogain"]["cue"].upper)
@@ -764,7 +771,7 @@ def test_expected_mode_spread_matches_a_direct_computation():
         _expected_mode_spread(jnp.asarray(head, jnp.float32), jnp.asarray(q_u, jnp.float32), Q_MIX)
     )
     rng = np.random.default_rng(0)
-    w = np.asarray(jax.nn.softmax(Q_MIX.log_weights), np.float64)
+    w = np.array(jax.nn.softmax(Q_MIX.log_weights), np.float64)  # a writable copy
     w /= w.sum()
     n = 200_000
     k = rng.choice(2, size=n, p=w)

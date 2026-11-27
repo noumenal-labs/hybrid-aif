@@ -21,9 +21,10 @@ from jax import Array
 
 from hybrid_aif.controls import soft_clip
 from hybrid_aif.distributions import Categorical
+from hybrid_aif.dtypes import settled_scan, tree_float_dtype
 from hybrid_aif.objectives.base import TermTree
 from hybrid_aif.planning.base import PlannerContext, UseBound, refuse_mixed, register_planner
-from hybrid_aif.planning.enumerate import enumerate_policies, settled_scan
+from hybrid_aif.planning.enumerate import enumerate_policies
 
 
 @register_planner("habit", needs_key=True)
@@ -75,7 +76,8 @@ def _from_module(ctx: PlannerContext, metrics: bool) -> tuple[Categorical, TermT
     _, actions = settled_scan(step, (ctx.init_beliefs, ctx.key), None, length=ctx.policy_len)
     policies = actions[None]
     #  a point mass: the habit named one plan, so there is nothing to weigh
-    return Categorical(logits=jnp.zeros((1,))), ({} if metrics else None), policies
+    logits = jnp.zeros((1,), tree_float_dtype(ctx.init_beliefs))
+    return Categorical(logits=logits), ({} if metrics else None), policies
 
 
 def _from_vector(ctx: PlannerContext, metrics: bool) -> tuple[Categorical, TermTree | None, Array]:

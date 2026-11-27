@@ -77,7 +77,14 @@ from hybrid_aif.reference.raif.agent import (
     to_world_batch,
     train_step,
 )
-from hybrid_aif.reference.raif.columns import EXTRAS, IS_SUCCESS, RECORDED, raif_episode, succeeded
+from hybrid_aif.reference.raif.columns import (
+    DTYPE,
+    EXTRAS,
+    IS_SUCCESS,
+    RECORDED,
+    raif_episode,
+    succeeded,
+)
 from hybrid_aif.reference.raif.crspp import ROW as CRSPP_ROW
 from hybrid_aif.reference.raif.crspp import crspp_recognize, embeddings
 from hybrid_aif.reference.raif.fixtures import load_fixture
@@ -214,7 +221,7 @@ def episode_start_beliefs(system: System, params: SystemParams) -> dict[str, Arr
     return system.update_empirical_prior(
         params,
         initial,
-        system.from_positional("actions", jnp.zeros((dim,), jnp.float32), params),
+        system.from_positional("actions", jnp.zeros((dim,), DTYPE), params),
     )
 
 
@@ -277,6 +284,7 @@ def make_collect_fn(system: System, env: MountainCar, steps: int, *, act_samplin
     Design: ``docs/experiments/raif-mountain-car/execution-ledger-acting.md`` D1–D6.
     """
     time_limit = int(env.time_limit)
+    env = dataclasses.replace(env, dtype=DTYPE)  # the state, and so the physics, in DTYPE
 
     def collect(params: SystemParams, carry: CollectCarry):
         #  the reset targets, hoisted out of the scan: a read of params, broadcast over
@@ -331,7 +339,7 @@ def make_collect_fn(system: System, env: MountainCar, steps: int, *, act_samplin
             return (
                 jax.tree_util.tree_map(pick, initial, carried),
                 jax.tree_util.tree_map(pick, fresh, stepped),
-                jnp.where(is_last, 0.0, reward).astype(jnp.float32),
+                jnp.where(is_last, 0.0, reward).astype(DTYPE),
                 jnp.where(is_last, 0, t_ep + 1).astype(jnp.int32),
                 ran_on & ~is_last,
                 key,
@@ -751,7 +759,7 @@ def build(cfg: Config):
     then overwrites the leaves. ``horizon`` is resolved once, for both the agent and
     :func:`make_chunk_fn`.
     """
-    env = MountainCar(time_limit=cfg.time_limit)
+    env = MountainCar(time_limit=cfg.time_limit, dtype=DTYPE)
     tiny = dict(cfg.tiny)
     horizon = int(tiny.pop("horizon", cfg.horizon))
     agents = [
@@ -764,8 +772,8 @@ def build(cfg: Config):
 
     buffers, reports = [], []
     for s in cfg.seeds:
-        positive = StreamBuffer.empty(cfg.capacity, cfg.seq_len, 2, 1, extras=EXTRAS)
-        general = StreamBuffer.empty(cfg.capacity, cfg.seq_len, 2, 1, extras=EXTRAS)
+        positive = StreamBuffer.empty(cfg.capacity, cfg.seq_len, 2, 1, extras=EXTRAS, dtype=DTYPE)
+        general = StreamBuffer.empty(cfg.capacity, cfg.seq_len, 2, 1, extras=EXTRAS, dtype=DTYPE)
         if cfg.fixtures:
             episodes, provenance = load_fixture(fixture_path(s))
             reports.append((s, seed_stats(episodes, success=IS_SUCCESS), provenance))
@@ -785,7 +793,7 @@ def build(cfg: Config):
                 learn_state=a.learn_state,
                 beliefs=_lanes(episode_start_beliefs(system, a.params), lanes),
                 env_state=r[1],
-                incoming_reward=jnp.zeros((lanes,), jnp.float32),
+                incoming_reward=jnp.zeros((lanes,), DTYPE),
                 t_in_episode=jnp.zeros((lanes,), jnp.int32),
                 succeeded=jnp.zeros((lanes,), jnp.bool_),
                 key=jax.random.split(jax.random.fold_in(k, 1), lanes),

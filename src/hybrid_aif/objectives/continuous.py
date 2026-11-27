@@ -501,7 +501,7 @@ def _emission_conditional_entropy(
         means=jnp.zeros((1, 0), point.c.dtype),
         chols=jnp.zeros((1, 0, 0), point.c.dtype),
     )
-    q_p = _group_probs(tuple(b for b, k in zip(parents, keep, strict=True) if k))
+    q_p = _group_probs(tuple(b for b, k in zip(parents, keep, strict=True) if k), point.c.dtype)
     unsel = tuple(b for b, k in zip(parents, keep, strict=True) if not k)
     log_q_u = _joint_mode_log_probs(unsel) if unsel else jnp.zeros((1,), point.c.dtype)
     head = _split_modes(point.head, sizes, keep, 2)
@@ -831,10 +831,11 @@ def _split_modes(
     return grid.reshape((p, u) + grid.shape[len(sizes) :])
 
 
-def _group_probs(beliefs: tuple[Categorical, ...]) -> Array:
-    """The mean-field joint over ``beliefs``, flattened row-major (``(1,)`` when empty)."""
+def _group_probs(beliefs: tuple[Categorical, ...], dtype) -> Array:
+    """The mean-field joint over ``beliefs``, flattened row-major (``(1,)`` in ``dtype`` when
+    empty)."""
     if not beliefs:
-        return jnp.ones((1,))
+        return jnp.ones((1,), dtype)
     return jax.nn.softmax(_joint_mode_log_probs(beliefs), axis=-1)
 
 
@@ -928,7 +929,9 @@ def selected_obs_entropy(
     m = q if isinstance(q, MixtureGaussian) else MixtureGaussian.from_gaussian(q)
     sizes = tuple(b.probs.shape[-1] for b in mode_beliefs)
     keep = tuple(selected[1:])
-    q_p = _group_probs(tuple(b for b, k in zip(mode_beliefs, keep, strict=True) if k))
+    q_p = _group_probs(
+        tuple(b for b, k in zip(mode_beliefs, keep, strict=True) if k), m.log_weights.dtype
+    )
     unsel = tuple(b for b, k in zip(mode_beliefs, keep, strict=True) if not k)
     log_q_u = _joint_mode_log_probs(unsel) if unsel else jnp.zeros((1,), m.log_weights.dtype)
     model = lg_point(model)

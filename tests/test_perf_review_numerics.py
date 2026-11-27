@@ -197,7 +197,7 @@ def test_async_with_one_mind_is_bitwise_sequential():
 
     from hybrid_aif.composition import plan, run, sample, with_mirror
     from tests.test_merge import merged
-    from tests.test_run_parity import _old_layout, idle
+    from tests.test_run_parity import _old_layout, as_recorded, idle
 
     system, params = with_mirror(*merged(policy_len=3), per_component=True)
     steps = {
@@ -211,7 +211,9 @@ def test_async_with_one_mind_is_bitwise_sequential():
     for order in ("sequential", "async"):
         a, b, c = _old_layout(1)
         with a, b, c:
-            traj = run(system, params, 3, KEY, steps, tick_order=order, record_carries=True)
+            traj = run(
+                system, as_recorded(params), 3, KEY, steps, tick_order=order, record_carries=True
+            )
         held = {
             f: np.asarray([s[f"world.{f}"] for s in traj[f"world.{f.split('.')[0]}"].carries])
             for f in ("agent.location", "agent.context", "world.location", "world.context")

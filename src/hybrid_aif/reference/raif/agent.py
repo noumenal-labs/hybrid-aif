@@ -26,7 +26,8 @@ from jax import Array
 from hybrid_aif.controls import soft_clip
 from hybrid_aif.distributions import MLPConditional
 from hybrid_aif.distributions.neural import PredictorHead
-from hybrid_aif.reference.raif.columns import CAN_SELF_IMITATE, PREF_LABEL
+from hybrid_aif.dtypes import cast, tree_float_dtype
+from hybrid_aif.reference.raif.columns import CAN_SELF_IMITATE, DTYPE, PREF_LABEL
 from hybrid_aif.reference.raif.crspp import ROW as CRSPP_ROW
 from hybrid_aif.reference.raif.crspp import STATE_KEY as CRSPP_STATE_KEY
 from hybrid_aif.reference.raif.crspp import CRSPPLosses, embeddings, fit_crspp
@@ -171,6 +172,9 @@ def raif_mountain_car(
     override all three head sizes at once; ``None`` keeps each head's own. The planner is
     ``"habit"``: G trains the actor through ``imagine`` and is not an act-time score. The
     ensemble enters G as the ``model_uncertainty`` cost, so ``epistemic=False`` (:data:`TERMS`).
+    Every network is drawn in :data:`~hybrid_aif.reference.raif.columns.DTYPE`, so its weights
+    are the same draws in either mode and it computes in that dtype whatever feeds it; the
+    action box, and so every parameter and optimizer moment, is in it too.
 
     Design: ``docs/experiments/raif-mountain-car/divergence-register.md`` (divergences 17, 26).
     """
@@ -180,7 +184,14 @@ def raif_mountain_car(
         actor_units = critic_units = ensemble_units = int(head_units)
     keys = jax.random.split(key, 5 + int(ensemble_size))
     system, params = tiny_rssm(
-        obs_dim, action_dim, key=keys[0], policy_len=horizon, units=units, winit=winit, **tiny
+        obs_dim,
+        action_dim,
+        key=keys[0],
+        policy_len=horizon,
+        units=units,
+        winit=winit,
+        dtype=DTYPE,
+        **tiny,
     )
     core, _ = assemble(system, params)
     flat, feature_dim = core.prior.flat_dim, core.deter_dim + core.prior.flat_dim
@@ -193,12 +204,13 @@ def raif_mountain_car(
         units=units,
         embed=core.embed_dim,  # its posterior reads the agent's embedding
         winit=winit,  # their CRSPP_RSSM carries `winit: normal` as the world model does
+        dtype=DTYPE,
     )
     critic = _value_head(
-        keys[2], feature_dim, critic_units, critic_layers, num_bins, bin_low, bin_high, winit
+        keys[2], feature_dim, critic_units, critic_layers, num_bins, bin_low, bin_high, winit, DTYPE
     )
     slow = _value_head(
-        keys[3], feature_dim, critic_units, critic_layers, num_bins, bin_low, bin_high, winit
+        keys[3], feature_dim, critic_units, critic_layers, num_bins, bin_low, bin_high, winit, DTYPE
     )
     #  the actor and the ensemble members at their own blocks' resolved settings: `norm:
     #  layer` hidden blocks, the bounded `dist: normal` head and the `winit: normal / fan:
@@ -216,6 +228,7 @@ def raif_mountain_car(
         minstd=ACTOR_MINSTD,
         maxstd=ACTOR_MAXSTD,
         init=init_of("normal"),
+        dtype=DTYPE,
     )
     ensemble = tuple(
         MLPConditional.from_shapes(
@@ -230,6 +243,7 @@ def raif_mountain_car(
             minstd=ENSEMBLE_STD,
             maxstd=ENSEMBLE_STD,
             init=init_of("normal"),
+            dtype=DTYPE,
         )
         for k in keys[5 : 5 + int(ensemble_size)]
     )
@@ -268,8 +282,10 @@ def _value_head(
     low: float,
     high: float,
     winit: str = "default",
+    dtype: object = None,
 ) -> PredictorHead:
-    """A 255-bin ``symlog_disc`` value head over ``[deter, flat stoch]`` (A12 item 5)."""
+    """A 255-bin ``symlog_disc`` value head over ``[deter, flat stoch]`` (A12 item 5), its
+    weights drawn in ``dtype`` (``None``: the default float dtype)."""
     return PredictorHead.from_shapes(
         (feature_dim,),
         loss="symlog_disc",
@@ -282,6 +298,7 @@ def _value_head(
         activation="silu",
         out_scale=0.0,  # their critic outscale 0.0: a fresh critic predicts ~0
         init=init_of(winit),
+        dtype=dtype,
     )
 
 
@@ -318,7 +335,10 @@ def train_step(
     convention for the recurrent trainers; the BC term reads ``action`` in the ``a_t``
     convention with ``can_self_imitate`` (by then the imitation mask), and the CRSPP reads
     ``pref_label``. Both columns come from :func:`hybrid_aif.reference.raif.revise.label`
-    at collection time. The order::
+    at collection time. The batch's float columns are cast to the float dtype of the agent's
+    parameters (:func:`~hybrid_aif.dtypes.tree_float_dtype`), which for the agent
+    :func:`raif_mountain_car` builds is :data:`~hybrid_aif.reference.raif.columns.DTYPE`. The
+    order::
 
         1. fit_world       the sequence loss over the declared slots; its forward
                            pass's posterior states are the ONE recognition 2-4 read
@@ -337,6 +357,10 @@ def train_step(
     #  five-way, two unused: the world, CRSPP and imagination streams keep their draws
     k_world, _, k_crspp, _, k_imagine = jax.random.split(key, 5)
     system = agent.system
+    #  the networks cast what they read, but a value outside them (the preference labels the
+    #  CRSPP loss weighs by) meets the losses in the batch's dtype
+    dtype = tree_float_dtype(agent.params)
+    batch = cast(batch, dtype)
     world_batch = to_world_batch(batch)
     params, learn_state, world, states = fit_world(
         system,
@@ -396,11 +420,11 @@ def train_step(
         # posterior states at the same indices, so no re-indexing is needed here —
         # WorldBatch's a_{t-1} convention is the one that shifts (see prev_actions()).
         start_actions=system.from_positional("actions", jnp.reshape(batch.action, (n, -1)), params),
-        bc_weights=jnp.reshape(batch.extras[CAN_SELF_IMITATE].astype(jnp.float32), (n,)),
+        bc_weights=jnp.reshape(batch.extras[CAN_SELF_IMITATE].astype(dtype), (n,)),
         #  their `first_cont = 1 - start['is_terminal']` (agent.py:244), the leading
         #  factor of the per-step rollout weight. Passed in the `a_t` convention (the
         #  start states' own indices), NOT the shifted world-model one.
-        start_cont=jnp.reshape(batch.cont.astype(jnp.float32), (n,)),
+        start_cont=jnp.reshape(batch.cont.astype(dtype), (n,)),
         #  the seam is keyed by row name; the carry is keyed by the CRSPP's factor names.
         aux_beliefs={CRSPP_ROW: agent.crspp.from_positional("beliefs", flat_crspp)},
         actor_lr=actor_lr,
@@ -428,12 +452,15 @@ def to_world_batch(batch: Episode) -> WorldBatch:
     ``is_first`` so :meth:`~hybrid_aif.inference.rssm.RSSMCore.observe` restarts the carry where
     a window crosses an episode boundary. The shifted action is rescaled into the action box
     with :func:`~hybrid_aif.controls.soft_clip`, as their ``obs_step`` does; the recorded column
-    stays raw.
+    stays raw. The box is made in the actions' dtype.
 
     Design: ``docs/experiments/raif-mountain-car/execution-ledger-acting.md`` D5.
     """
     prev = batch.prev_actions()
-    box = (jnp.full(prev.shape[-1:], ACTION_LOW), jnp.full(prev.shape[-1:], ACTION_HIGH))
+    box = (
+        jnp.full(prev.shape[-1:], ACTION_LOW, prev.dtype),
+        jnp.full(prev.shape[-1:], ACTION_HIGH, prev.dtype),
+    )
     return WorldBatch(
         obs=batch.obs,
         action=soft_clip(prev, box),
