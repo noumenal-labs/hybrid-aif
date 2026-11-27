@@ -1,10 +1,10 @@
 # Model description 0.3: variables and factors
 
 *Status: ADJUDICATED 2026-10-05 (Alex + Opus); not built. D1–D8 settled (D3 as restated; D4's
-evidence clamps deferred, its role proposal adopted; D5 tentative; D8's name a first pass). Amends `model-description.md` (M2,
-M3, M4) for the document format only; the runtime `System`/`SystemParams` are unchanged except
-where `control-states.md` changes them. To ship in the same round as the control-states build,
-so consumers meet one format revision, not two.*
+evidence clamps deferred, its role proposal adopted; D5 tentative; D8's name a first pass). Amends
+`model-description.md` (M2, M3, M4) for the document format only; the runtime
+`System`/`SystemParams` are unchanged except where `control-states.md` changes them. To ship in the
+same round as the control-states build, so consumers meet one format revision, not two.*
 
 ## Why
 
@@ -89,10 +89,11 @@ document may omit it on a parameter.
 *2026-11-06: what the upper level observes is the lower level's belief, realised as a value through
 a kernel (`nesting-and-coupling.md` N1, N3); the ruling stands.*
 
-**D5 — Naming the arrays file.** *ADOPTED, tentatively (Alex: "not confident on this one").* "Sidecar" is a bare engineering term. Keep
-`"arrays_file"` and per-array `{"ref": …}`; drop the top-level `"sidecar"` flag, which
-`arrays_file` makes redundant; the write mode becomes `describe(arrays="file")` beside
-`"inline"` and `"auto"`. ("Values" was considered; "arrays" seemed usefully concrete. Revisit before the build if it still grates.)
+**D5 — Naming the arrays file.** *ADOPTED, tentatively (Alex: "not confident on this one").*
+"Sidecar" is a bare engineering term. Keep `"arrays_file"` and per-array `{"ref": …}`; drop the
+top-level `"sidecar"` flag, which `arrays_file` makes redundant; the write mode becomes
+`describe(arrays="file")` beside `"inline"` and `"auto"`. ("Values" was considered; "arrays" seemed
+usefully concrete. Revisit before the build if it still grates.)
 
 **D6 — Migration.** `describe` writes 0.3; `build` still loads 0.2 documents, converting on read,
 so existing stored documents (zeroth-harness's) keep working. *ADOPTED (Alex):* for one release,
@@ -103,8 +104,9 @@ and describing it again.
 external 0.2 documents; a 0.2 document is refused with a sentence naming 0.18.0 as the last
 release that reads it.)*
 
-**D7 — Bundling.** *ADOPTED (Alex).* Ships with the control-states build, which already revises the format
-(state records lose `controlled`/`num_controls`; `observes` → `parents`; `source` defaulted).
+**D7 — Bundling.** *ADOPTED (Alex).* Ships with the control-states build, which already revises
+the format (state records lose `controlled`/`num_controls`; `observes` → `parents`; `source`
+defaulted).
 
 **D8 — The `static` block.** *ADOPTED (Alex, 2026-10-05); the name `options` is a first pass.*
 `static` names a JAX mechanism (the fields a class marks `static=True`), not a modelling role,
@@ -126,8 +128,8 @@ status; see Q18.3.
 under each child by a **label** naming one conditional on it. Each record holds `family`,
 `parents`, `parameters` naming its static arguments by the family's field names, and
 `options`; values live in `clamps` keyed by parameter variable, and a learned parameter's prior
-is a `prior` record under it in `factors` (D1, D2 as amended). `transition_parents`, `observes` and `control_parents` retire into `parents`, with
-control nodes among the parents.
+is a `prior` record under it in `factors` (D1, D2 as amended). `transition_parents`, `observes`
+and `control_parents` retire into `parents`, with control nodes among the parents.
 
 **Time is stated per parent.** Each parent entry carries the offset at which the factor reads
 it, zero for the same step, one for the step before; a record also carries the steps it is
@@ -309,7 +311,8 @@ prefix). Component order is the document's variable order. What this loses is on
 a round trip a System no longer knows that a removed node ever existed, so naming it gets
 "unknown variable" rather than what it became; the runtime record's fields that hold this
 (`identified`, `relayed`, `terminated`) do not survive the round trip and the build brief
-decides whether to drop them from the record and keep that refusal at merge time. A per-component spelling, each component's own document under `components` with a `bindings` list, lowered by
+decides whether to drop them from the record and keep that refusal at merge time. A per-component
+spelling, each component's own document under `components` with a `bindings` list, lowered by
 running the merge, is a later second spelling for hand-authored composites and is not in 0.3.
 A `Wiring` (C13) is not described in 0.3; a wire is an identity between typed ports and lives
 in the harness.
@@ -506,8 +509,8 @@ the one cause named each time. Library-wide collection was declined: across sect
 a list would be one fault and its echoes, and the engine's validators are the same kind.
 
 **Q18 is closed (2026-10-13).** Next: the build brief for the 0.3 writer and reader, with the
-Q17 bake-off as its acceptance test, drafted for Alex's read before an agent takes it. Both landed: the writer and reader with
-`../description-format.md` as the specification, and the bake-off under
+Q17 bake-off as its acceptance test, drafted for Alex's read before an agent takes it. Both landed:
+the writer and reader with `../description-format.md` as the specification, and the bake-off under
 `../experiments/description-bakeoff/`.
 
 ## Description length (noted 2026-10-13)

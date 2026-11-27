@@ -18,9 +18,7 @@ from hybrid_aif.inference import linear_gaussian
 
 
 def test_float64_log_2pi_constants_preserve_double_precision_after_float32_import():
-    prev = jax.config.jax_enable_x64
-    jax.config.update("jax_enable_x64", True)
-    try:
+    with jax.enable_x64(True):
         g = Gaussian(loc=jnp.zeros((2,), dtype=jnp.float64), chol=jnp.eye(2, dtype=jnp.float64))
         expected_entropy = 0.5 * 2 * (1.0 + math.log(2.0 * math.pi))
         np.testing.assert_allclose(float(g.entropy().lower), expected_entropy, rtol=0.0, atol=1e-15)
@@ -39,14 +37,10 @@ def test_float64_log_2pi_constants_preserve_double_precision_after_float32_impor
         )
         expected_log_z = -math.log(2.0 * math.pi) - math.log(2.0)
         np.testing.assert_allclose(float(log_z), expected_log_z, rtol=0.0, atol=1e-15)
-    finally:
-        jax.config.update("jax_enable_x64", prev)
 
 
 def test_float32_distributions_sample_in_float32_when_x64_is_enabled():
-    prev = jax.config.jax_enable_x64
-    jax.config.update("jax_enable_x64", True)
-    try:
+    with jax.enable_x64(True):
         key = jax.random.PRNGKey(0)
         g = Gaussian(loc=jnp.zeros((2,), dtype=jnp.float32), chol=jnp.eye(2, dtype=jnp.float32))
         assert g.sample(key).dtype == jnp.float32
@@ -75,5 +69,3 @@ def test_float32_distributions_sample_in_float32_when_x64_is_enabled():
             nu=jnp.array(4.0, dtype=jnp.float32),
         )
         assert iw.sample(key).dtype == jnp.float32
-    finally:
-        jax.config.update("jax_enable_x64", prev)
