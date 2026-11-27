@@ -392,7 +392,7 @@ def make_linearise(
     }
 
     def linearise(qs: tuple, action) -> tuple[Array, Array]:
-        Fs, G = [], jnp.zeros((d, du), dtype)
+        Fs, placed = [], []
         for f, (lo, hi) in zip(cov.factors, cov.spans, strict=True):
             q = qs[f].predictive if isinstance(qs[f], BeliefPair) else qs[f]
             entries = {k: node_entry(action, k, layout) for k, _ in table.control_parents[f]}
@@ -417,16 +417,25 @@ def make_linearise(
                 for k in reads[f].floats:
                     blocks[k] = G_all[:, at : at + space.sizes[k]]
                     at += space.sizes[k]
-            Fs.append(jnp.asarray(F_f, dtype))
+            Fs.append(F_f)
             for k, block in blocks.items():
                 a, b = cov.node_spans[cov.nodes.index(k)]
-                G = G.at[lo:hi, a:b].add(jnp.asarray(block, dtype).reshape(hi - lo, b - a))
-        return block_diag(*Fs), G
+                placed.append((lo, hi, a, b, block))
+        wide = jnp.result_type(dtype, *Fs, *(block for *_, block in placed))
+        G = jnp.zeros((d, du), wide)
+        for lo, hi, a, b, block in placed:
+            G = G.at[lo:hi, a:b].add(block.reshape(hi - lo, b - a))
+        return block_diag(*(jnp.asarray(F_f, wide) for F_f in Fs)), G
 
     return linearise
 
 
 # ------------------------------------------------------------------------ the record
+
+
+def _widened(x: Array, *others: Array) -> Array:
+    """``x`` in the widest dtype among it and ``others``."""
+    return x.astype(jnp.result_type(x, *others))
 
 
 def _covariances(qs: tuple, cov: Coverage) -> tuple[Array, Array, Array]:
@@ -508,12 +517,13 @@ def _weights(
             at = (steps == horizon - 1).astype(dtype)
         elif target.column is not None and present is not None:
             at = present[:, target.column].astype(dtype)
-        W = W.at[:, lo:hi, lo:hi].add(at[:, None, None] * weight)
+        W = _widened(W, weight).at[:, lo:hi, lo:hi].add(at[:, None, None] * weight)
     R = jnp.zeros((horizon, du, du), dtype)
     for cost in cov.costs:
         a, b = cost.span
         at = (steps == horizon - 1).astype(dtype) if cost.terminal else jnp.ones((horizon,), dtype)
-        R = R.at[:, a:b, a:b].add(at[:, None, None] * cost.precision[None])
+        weight = at[:, None, None] * cost.precision[None]
+        R = _widened(R, weight).at[:, a:b, a:b].add(weight)
     return W, R
 
 
@@ -552,7 +562,9 @@ def closed_loop_terms(record: Record, cov: Coverage, present: Presence | None) -
     horizon = record.F.shape[0]
     mask = None if present is None else presence_from_levels(present, record.levels)
     W, R = _weights(cov, horizon, mask, record.levels, record.F.dtype, record.heads)
-    K = jax.lax.stop_gradient(riccati_gains(record.F, record.G, W, R))
+    floats = (record.F, record.G, record.predictive, record.prior, record.posterior, W, R)
+    F, G, predictive, prior, posterior, W, R = (_widened(x, *floats) for x in floats)
+    K = jax.lax.stop_gradient(riccati_gains(F, G, W, R))
     d = cov.dim
 
     def forward(C, xs):
@@ -565,10 +577,10 @@ def closed_loop_terms(record: Record, cov: Coverage, present: Presence | None) -
 
     _, (S, KCK) = jax.lax.scan(
         forward,
-        jnp.zeros((d, d), record.F.dtype),
-        (record.F, record.G, K, record.prior, record.posterior),
+        jnp.zeros((d, d), F.dtype),
+        (F, G, K, prior, posterior),
     )
-    spread = S - record.predictive  # (H, d, d): what the corrections change on the state
+    spread = S - predictive  # (H, d, d): what the corrections change on the state
     steps = jnp.arange(horizon)
     tree: dict[str, dict[str, Interval]] = {}
 
@@ -656,21 +668,25 @@ def closed_loop(
         nxt = transition_fn(inner, action)
         pred, prior, post = _covariances(beliefs_of(nxt), cov)
         t = rec.t
+
+        def put(steps: Array, value: Array) -> Array:
+            return _widened(steps, value).at[t].set(value)
+
         heads = rec.heads
         if heads:
             after = beliefs_of(nxt)
             neural = [target for target in cov.targets if target.slot is not None]
             heads = tuple(
-                row.at[t].set(neural_read(target.neural, after[target.factor].epistemic)[0])
+                put(row, neural_read(target.neural, after[target.factor].epistemic)[0])
                 for row, target in zip(heads, neural, strict=True)
             )
         rec = Record(
             t=t + 1,
-            F=rec.F.at[t].set(F),
-            G=rec.G.at[t].set(G),
-            predictive=rec.predictive.at[t].set(pred),
-            prior=rec.prior.at[t].set(prior),
-            posterior=rec.posterior.at[t].set(post),
+            F=put(rec.F, F),
+            G=put(rec.G, G),
+            predictive=put(rec.predictive, pred),
+            prior=put(rec.prior, prior),
+            posterior=put(rec.posterior, post),
             levels=rec.levels.at[t].set(step_levels(action)),
             heads=heads,
         )

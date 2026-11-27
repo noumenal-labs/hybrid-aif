@@ -255,9 +255,6 @@ def _downstream():
     return Case("downstream_step0", ctx, init, 100)
 
 
-#: Fixtures whose own scans carry float32 beliefs and fail to type-check under ``x64``.
-FLOAT32_ONLY = {"small_lg", "shared_noise_lg", "lane", "unicycle"}
-
 BUILDERS = {
     "lq_control": _lq,
     "small_lg": _small_lg,
@@ -277,8 +274,6 @@ BUILDERS = {
 
 @functools.cache
 def case(name: str) -> Case:
-    if jax.config.jax_enable_x64 and name in FLOAT32_ONLY:
-        pytest.skip("the fixture's float32 parameters do not scan under x64")
     return BUILDERS[name]()
 
 

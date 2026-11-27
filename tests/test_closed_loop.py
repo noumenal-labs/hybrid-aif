@@ -13,6 +13,7 @@ Design: docs/design/closed-loop-planning.md
 """
 
 import dataclasses
+import warnings
 
 import equinox as eqx
 import jax
@@ -1048,3 +1049,41 @@ def test_merge_keeps_the_planning_belief_and_the_feedback_switch():
     assert joint_planner(differing, dp, feedback="linear_quadratic")[0].feedback == (
         "linear_quadratic"
     )
+
+
+# ------------------------------------------------- 32-bit and 64-bit parameters under one plan
+
+
+def _in_dtype(tree, dtype):
+    def leaf(x):
+        floating = hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating)
+        return jnp.asarray(x, dtype) if floating else x
+
+    return jax.tree_util.tree_map(leaf, tree)
+
+
+def test_a_plan_over_32_bit_beliefs_and_64_bit_noise_is_scored_in_64_bit():
+    """Under 64-bit mode ``small_lg`` holds 32-bit dynamics and a 32-bit prior beside 64-bit
+    observation noise. The plan from that prior is scored in 64-bit, writes nothing to the
+    record at a narrower dtype than it was computed in, and matches the plan of the same
+    parameters all cast to 64-bit."""
+    with jax.enable_x64(True):
+        system, params = small_lg()
+        prior = {"x": params.initial_state_prior["x"]}
+        assert prior["x"].loc.dtype == jnp.float32
+        assert params.likelihood["y"].noise.dtype == jnp.float64
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FutureWarning)
+            got = total(system.infer_policies(params, prior)[1]).midpoint
+        wide = _in_dtype(params, jnp.float64)
+        expected = system.infer_policies(wide, {"x": wide.initial_state_prior["x"]})[1]
+        assert got.dtype == jnp.float64
+        np.testing.assert_allclose(got, total(expected).midpoint, rtol=1e-6)
+
+
+def test_a_32_bit_model_is_planned_in_32_bit_under_64_bit_mode():
+    with jax.enable_x64(True):
+        system, params = small_lg()
+        narrow = _in_dtype(params, jnp.float32)
+        tree = system.infer_policies(narrow, {"x": narrow.initial_state_prior["x"]})[1]
+        assert total(tree).midpoint.dtype == jnp.float32

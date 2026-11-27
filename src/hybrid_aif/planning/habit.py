@@ -23,7 +23,7 @@ from hybrid_aif.controls import soft_clip
 from hybrid_aif.distributions import Categorical
 from hybrid_aif.objectives.base import TermTree
 from hybrid_aif.planning.base import PlannerContext, UseBound, refuse_mixed, register_planner
-from hybrid_aif.planning.enumerate import enumerate_policies
+from hybrid_aif.planning.enumerate import enumerate_policies, settled_scan
 
 
 @register_planner("habit", needs_key=True)
@@ -72,7 +72,7 @@ def _from_module(ctx: PlannerContext, metrics: bool) -> tuple[Categorical, TermT
         #  stop-gradiented rescale (`soft_clip`)
         return (ctx.transition_fn(carry, soft_clip(action, bounds)), key), action
 
-    _, actions = jax.lax.scan(step, (ctx.init_beliefs, ctx.key), None, length=ctx.policy_len)
+    _, actions = settled_scan(step, (ctx.init_beliefs, ctx.key), None, length=ctx.policy_len)
     policies = actions[None]
     #  a point mass: the habit named one plan, so there is nothing to weigh
     return Categorical(logits=jnp.zeros((1,))), ({} if metrics else None), policies

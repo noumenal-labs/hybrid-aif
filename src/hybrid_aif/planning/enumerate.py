@@ -65,6 +65,56 @@ def _enumerate_policies(
     return np.asarray(flat, dtype=np.int32).reshape(len(flat), policy_len, len(num_controls))
 
 
+def _is_float(x) -> bool:
+    return hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating)
+
+
+def _widen(tree, like):
+    """``tree`` with each float leaf in the wider of its dtype and that of its leaf in ``like``
+    (a tree of the same structure)."""
+
+    def leaf(x, ref):
+        if not (_is_float(x) and _is_float(ref)):
+            return x
+        return jnp.asarray(x, jnp.promote_types(x.dtype, ref.dtype))
+
+    return jtu.tree_map(leaf, tree, like)
+
+
+def settled_scan(body, init, xs=None, length: int | None = None):
+    """:func:`jax.lax.scan` over a carry that starts in the float dtypes ``body`` returns for it.
+
+    With JAX's 64-bit mode on (``jax_enable_x64``), a body handed 32-bit beliefs that reads a
+    64-bit parameter returns some leaves of the carry wider than it was given, which
+    ``lax.scan`` refuses. Each float leaf of ``init`` is therefore widened to the dtype one
+    step returns for it, until a step returns no leaf wider than it was handed; a leaf the
+    step returns narrower is widened on the way out. The values are unchanged. With 64-bit
+    mode off every float has one dtype, and this is ``lax.scan``.
+    """
+    if not jax.config.jax_enable_x64:
+        return jax.lax.scan(body, init, xs, length=length)
+    steps = length if xs is None else jtu.tree_leaves(xs)[0].shape[0]
+    if steps == 0:
+        return jax.lax.scan(body, init, xs, length=length)
+    x0 = None if xs is None else jtu.tree_map(lambda x: x[0], xs)
+    structure = jtu.tree_structure(init)
+    for _ in range(structure.num_leaves + 1):
+        spec = jax.eval_shape(lambda carry: body(carry, x0)[0], init)
+        if jtu.tree_structure(spec) != structure:
+            return jax.lax.scan(body, init, xs, length=length)  # scan names the difference
+        wider = _widen(init, spec)
+        before = [getattr(x, "dtype", None) for x in jtu.tree_leaves(init)]
+        if [getattr(x, "dtype", None) for x in jtu.tree_leaves(wider)] == before:
+            break
+        init = wider
+
+    def settled(carry, x):
+        out, y = body(carry, x)
+        return _widen(out, init), y
+
+    return jax.lax.scan(settled, init, xs, length=length)
+
+
 def _merge_trees(base: TermTree, extra: TermTree) -> TermTree:
     out = {term: dict(blocks) for term, blocks in base.items()}
     for term, blocks in extra.items():
@@ -103,7 +153,7 @@ def evaluate_policies(
             return qs_next, step_terms(qs_next, action, t)
 
         ts = jnp.arange(policy_len, dtype=jnp.int32)
-        qs_final, stacked = jax.lax.scan(body, init_qs, (policy, ts))
+        qs_final, stacked = settled_scan(body, init_qs, (policy, ts))
         tree = jtu.tree_map(lambda x: jnp.sum(x, axis=0), stacked)
         if terminal_terms is not None:
             tree = _merge_trees(tree, terminal_terms(qs_final))
@@ -351,7 +401,7 @@ def evaluate_policies_total(
 
         ts = jnp.arange(jtu.tree_leaves(policies)[0].shape[1], dtype=jnp.int32)
         init = (init_qs, Interval(jnp.zeros(()), jnp.zeros(()), warrant, approximate))
-        (qs_final, g), _ = jax.lax.scan(body, init, (policy, ts))
+        (qs_final, g), _ = settled_scan(body, init, (policy, ts))
         if terminal_terms is not None:
             g = g + total(terminal_terms(qs_final))
         return g
