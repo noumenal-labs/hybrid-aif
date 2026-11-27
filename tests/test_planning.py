@@ -24,6 +24,7 @@ from hybrid_aif.planning import (
     policy_posterior,
     sample_action,
 )
+from hybrid_aif.planning.enumerate import settled_scan
 
 KEY = jax.random.PRNGKey(0)
 
@@ -272,3 +273,33 @@ def test_alpha_sharpens_marginal_sampling():
     draws_raw = jnp.stack([sample_action(k, marginals) for k in keys[2000:]])
     assert draws_sharp.mean() > 0.95  # alpha=32 makes the 0.6 mode near-certain
     assert 0.5 < draws_raw.mean() < 0.7  # raw sampling tracks the marginal
+
+
+def test_a_scan_starts_its_carry_in_the_dtypes_its_step_returns():
+    """Under 64-bit mode a 32-bit leaf of the carry that the step returns in 64-bit starts the
+    scan in 64-bit, and so does a leaf that widens only once another has. A leaf the step leaves
+    in 32-bit stays there, one it returns narrower is widened back, and the values are those of
+    the loop written out."""
+    with jax.enable_x64(True):
+        xs = jnp.arange(1.0, 4.0, dtype=jnp.float64)
+        init = (
+            jnp.zeros(2, jnp.float32),
+            jnp.zeros(2, jnp.float32),
+            jnp.ones(2, jnp.float32),
+            jnp.zeros(2, jnp.float64),
+        )
+
+        def body(carry, x):
+            direct, through, kept, narrowed = carry
+            out = (direct + x, through + direct, 2 * kept, jnp.ones(2, jnp.float32))
+            return out, direct
+
+        carry, ys = settled_scan(body, init, xs)
+        expected = init
+        for x in xs:
+            expected, _ = body(expected, x)
+    assert [leaf.dtype for leaf in carry] == [jnp.float64, jnp.float64, jnp.float32, jnp.float64]
+    assert ys.dtype == jnp.float64
+    for got, want in zip(carry, expected, strict=True):
+        np.testing.assert_array_equal(got, want)
+    np.testing.assert_array_equal(ys[:, 0], [0.0, 1.0, 3.0])
