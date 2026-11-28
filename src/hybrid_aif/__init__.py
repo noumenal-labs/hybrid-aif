@@ -57,7 +57,7 @@ from hybrid_aif.reads import Emission
 from hybrid_aif.replay import Replay, replay, replay_document, stack_traces
 from hybrid_aif.system import System, SystemParams
 
-__version__ = "0.23.0"
+__version__ = "0.23.1"
 
 __all__ = [
     "Box",

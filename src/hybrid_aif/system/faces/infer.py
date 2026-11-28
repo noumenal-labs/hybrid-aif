@@ -150,7 +150,7 @@ def _belief_components(q) -> tuple[Array, Array]:
     return q.loc[None], q.chol[None]
 
 
-def _observation_model(system, a, m: int, q, out, priors, families, s: int):
+def _observation_model(system, a, m: int, q, out, priors, families, s: int, present=True):
     """Modality ``m``'s observation model at the belief ``q`` over its factor, as
     ``(H, c, noise, axes)`` with leading ``(K, M)`` axes: ``K`` the belief's components (one for a
     Gaussian), ``M`` the mode configurations over the parents ``axes`` (one where there are none),
@@ -162,7 +162,8 @@ def _observation_model(system, a, m: int, q, out, priors, families, s: int):
     at their one-hots; its action-node parents are held at the one-hot of their point prior's
     level (``priors[g]``). Its noise is a :class:`~hybrid_aif.inference.linear_gaussian.
     DiagonalNoise`, which :func:`~hybrid_aif.inference.linear_gaussian.condition` takes in state
-    space.
+    space. ``present`` is the modality's flag: an action node's prior need not be a point where
+    the modality is absent.
     """
     mods, facs = system.modality_names, system._facs
     deps = system._engine_A_deps[m]
@@ -172,7 +173,7 @@ def _observation_model(system, a, m: int, q, out, priors, families, s: int):
 
     def level_of(g: int, f: int):
         return _hybrid.prior_point_level(
-            priors[g], system._sensed[g - s], mods[m], facs[f], mixture
+            priors[g], system._sensed[g - s], mods[m], facs[f], mixture, present
         )
 
     if isinstance(a, MLPConditional):
@@ -256,7 +257,7 @@ def _neural_table(a: MLPConditional, y: Array, deps: tuple[int, ...], sizes: tup
     return jax.vmap(one)(grid).reshape(sizes)
 
 
-def expected_nll(system, a, m: int, y: Array, out, priors, families, s: int) -> Array:
+def expected_nll(system, a, m: int, y: Array, out, priors, families, s: int, present=True) -> Array:
     """``- E_q[log p(y | s)]`` of modality ``m`` (declaration ``a``) under the beliefs ``out``.
 
     A linear-Gaussian or neural modality over a continuous factor takes the closed-form Gaussian
@@ -283,7 +284,7 @@ def expected_nll(system, a, m: int, y: Array, out, priors, families, s: int) -> 
         return -jnp.sum(joint * table)
     f = cont[0] if isinstance(a, MLPConditional) else deps[0]
     q = out[f]
-    H, c, R, axes = _observation_model(system, a, m, q, out, priors, families, s)
+    H, c, R, axes = _observation_model(system, a, m, q, out, priors, families, s, present)
     locs, chols = _belief_components(q)
     return _amortized.expected_gaussian_nll(
         locs, chols, H, c, R, y, _joint_weights(system, q, out, axes, f)
@@ -736,6 +737,7 @@ def _infer_states_expected(
                         mods[m],
                         facs[f],
                         families[f] == _hybrid.MIXTURE,
+                        present,
                     )
                     for g in obs_parents
                 ),
@@ -755,7 +757,7 @@ def _infer_states_expected(
             #  linearised at the belief the factor holds now, per component and, with
             #  state mode parents, per mode configuration (``(K, M, ...)``)
             lin_H, lin_c, lin_R, _ = _observation_model(
-                system, a, m, out[f], out, priors, families, s
+                system, a, m, out[f], out, priors, families, s, present
             )
         if obs_parents:
             # Switching observation: grow the factor to K*M, read the mode message from
@@ -858,7 +860,9 @@ def _infer_states_expected(
             present = True if masks is None else masks[m]
             term = jnp.zeros((), tree_float_dtype((a, out)))  # an absent modality's term
             if present is not False:
-                term = expected_nll(system, a, m, observations[m], out, priors, families, s)
+                term = expected_nll(
+                    system, a, m, observations[m], out, priors, families, s, present
+                )
                 term = term if present is True else jnp.where(present, term, 0.0)
                 message_terms.append(term)
             covered_terms[mods[m]] = term

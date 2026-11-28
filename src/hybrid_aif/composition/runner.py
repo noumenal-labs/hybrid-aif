@@ -635,10 +635,12 @@ class _Sample:
     """The step :func:`sample` builds."""
 
     def __call__(self, system, key, obs, carry, params):
+        nodes = set(system._table.control_names)
         if obs is None:
             emitted, state = system.sample_initial(key, params, state=carry)
-            return emitted, state, params
-        nodes = set(system._table.control_names)
+            #  no control node has a value before the first round, so nor has an emission of one
+            unread = {name for name, emit in system.emissions if nodes & set(emit.parents)}
+            return {e: v for e, v in emitted.items() if e not in unread}, state, params
         unset = [k for k, v in obs.items() if k in nodes and isinstance(v, Maybe)]
         if unset:
             raise ValueError(
@@ -658,6 +660,9 @@ def sample() -> Step:
 
     The first call (the reset) draws the initial state, or takes the partial point state the
     carry was seeded with through ``run(carries=...)``, and returns the emissions of that state.
+    An emission that reads a control node is not among them: no control node has a value before
+    the first round, so the emission has none either, and what observes it is handed it as
+    absent in round 0 (a :class:`Maybe`; ``plan()`` reads it as an absent modality).
     Each round calls :meth:`System.sample_step` on the unsliced view with the control nodes that
     other nodes drive taken from ``obs`` (a driven node's value as the driver realised it),
     returning every emission realised by its declared rule from the stepped state and the action

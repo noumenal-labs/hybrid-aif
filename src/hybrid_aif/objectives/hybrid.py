@@ -1035,19 +1035,28 @@ def point_level(
 
 
 def prior_point_level(
-    q: Categorical, node: str, modality: str, factor: str, mixture: bool = False
+    q: Categorical,
+    node: str,
+    modality: str,
+    factor: str,
+    mixture: bool = False,
+    present: bool | Array = True,
 ) -> Array:
     """The level of an action node's prior, which must be a point (one level holding all the
-    mass): the efference copy under the delta kernel. A prior that is not raises, at once for a
-    concrete one and when the computation runs for a traced one."""
+    mass) where the modality is observed (``present``): the efference copy under the delta
+    kernel. A prior that is not raises, at once for a concrete one and when the computation runs
+    for a traced one. An absent modality selects nothing, so its node's prior is not checked."""
     probs = q.probs
     peak = jnp.max(probs, axis=-1)
     level = jnp.argmax(probs, axis=-1).astype(jnp.int32)
-    if isinstance(peak, jax.core.Tracer):
+    if present is False:
+        return level
+    spread = (peak < 1.0 - 1e-6) & jnp.asarray(present, bool)
+    if isinstance(spread, jax.core.Tracer):
         why = "spread over its levels in the prior the call was given"
         error = soft_selection_error(modality, factor, node, why, mixture)
-        return eqx.error_if(level, peak < 1.0 - 1e-6, str(error))
-    if float(peak) < 1.0 - 1e-6:
+        return eqx.error_if(level, spread, str(error))
+    if bool(spread):
         why = f"the prior {np.asarray(probs).tolist()}"
         raise soft_selection_error(modality, factor, node, why, mixture)
     return level

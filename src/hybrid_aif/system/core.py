@@ -2725,10 +2725,20 @@ class System(eqx.Module, metaclass=_SystemMeta):
         ``point()``. ``infer_states`` uses this when ``priors=None``; planning faces take it in
         place of a raw conditional ``D``. On the amortized path it returns the episode-start values:
         each carry's learned initial value, and each code's transition read at it.
+
+        An action node a modality observes gets an entry too, uniform over its levels (no action
+        precedes the first step), so the mapping has the entries :meth:`infer_states` and
+        :meth:`update_empirical_prior` return.
         """
         self._refuse_black_box("initial_priors")
         params = self._params_in(params, "initial_priors")
-        return self._beliefs_out(params, self._initial_priors(params, "initial_priors"))
+        sensed = None
+        if self._sensed_columns:
+            priors = self._sensed_priors(params, None, "initial_priors")
+            sensed = dict(zip(self._sensed, priors, strict=True))
+        return self._beliefs_out(
+            params, self._initial_priors(params, "initial_priors"), sensed=sensed
+        )
 
     def _initial_priors(self, params: SystemParams, face: str = "this face") -> tuple[Belief, ...]:
         """:meth:`initial_priors` over the positional tuple."""

@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from hybrid_aif.composition import plan, run, sample, with_mirror
 from hybrid_aif.controls import FLOAT, LEVEL, ControlLayout, ControlStep
 from hybrid_aif.objectives import total
 from hybrid_aif.planning import (
@@ -338,3 +339,21 @@ def test_every_policy_starts_from_the_same_warm_start_and_the_traces_are_returne
     np.testing.assert_array_equal(np.asarray(held.plan), np.full((9, 2, 1), 0.5, np.float32))
     centre = mixed_plan(ctx, steps=0)
     np.testing.assert_array_equal(np.asarray(centre.plan), np.zeros((9, 2, 1), np.float32))
+
+
+def test_run_plans_the_payoff_model_against_its_mirror():
+    """``run`` with ``plan()`` on a model whose Gaussian reading is selected by an action node,
+    planned over the mixed control space: the reading is absent in round 0 and present after,
+    and the mind's belief over the node is the one-hot of the level it chose."""
+    system, params = payoff(3)
+    both, joint = with_mirror(system, params)
+    key = jax.random.PRNGKey(0)
+    out = run(both, joint, 4, key, {"model": plan(), "world": sample()}, record_carries=True)
+    assert not any(bool(np.any(np.asarray(fault))) for fault in out.faults.values())
+    assert np.asarray(out.present["model.answer"]).tolist() == [False, True, True, True, True]
+    assert np.asarray(out.present["model.gps"]).all()
+    levels = np.asarray(out.emitted["model.option"])
+    assert np.asarray(out.emitted["model.steer"]).shape == (4, 1)
+    for t, level in enumerate(levels):
+        carried = np.asarray(out.carries["model"][t + 1].beliefs["model.option"].probs)
+        np.testing.assert_allclose(carried, np.eye(3)[level], atol=1e-6)

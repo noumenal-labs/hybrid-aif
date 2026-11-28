@@ -29,7 +29,9 @@ from hybrid_aif import (
     System,
     SystemParams,
 )
+from hybrid_aif.composition import plan, run, sample, with_mirror
 from hybrid_aif.controls import ControlStep
+from hybrid_aif.dtypes import table_dtype
 from hybrid_aif.objectives import total
 from hybrid_aif.planning.enumerate import evaluate_policies
 from tests.test_conditional_targets import (
@@ -301,6 +303,58 @@ def test_a_cue_read_only_by_looking_is_looked_for_first_and_scores_as_a_cue_loca
     assert int(best[0, 0]) == LOOK
 
 
+def test_the_initial_priors_give_an_observed_action_node_a_uniform_entry():
+    """``initial_priors`` has the entries ``infer_states`` and ``update_empirical_prior``
+    return, the observed action node's uniform over its levels, and filtering from it is
+    filtering with no entry for the node."""
+    system, params = maze_with_cue_by_node()
+    priors = system.initial_priors(params)
+    logits = np.asarray(priors["act"].logits)
+    assert logits.shape == (3,) and logits.dtype == table_dtype(params)
+    assert np.ptp(logits) == 0.0
+    seen = {"reward": jnp.asarray(0), "cue": jnp.asarray(1)}
+    posterior, _ = system.infer_states(params, seen, priors)
+    pushed = system.update_empirical_prior(params, posterior, {"act": jnp.asarray(LOOK)})
+    assert set(priors) == set(posterior) == set(pushed)
+    bare, _ = system.infer_states(params, seen, {k: v for k, v in priors.items() if k != "act"})
+    for name, belief in posterior.items():
+        assert np.array_equal(np.asarray(belief.probs), np.asarray(bare[name].probs)), name
+    #  the reading under a uniform node is not the reading under LOOK, so the entry is read
+    looked, _ = system.infer_states(
+        params, seen, {**priors, "act": Categorical.from_probs(jax.nn.one_hot(LOOK, 3))}
+    )
+    assert not np.allclose(np.asarray(looked["context"].probs), np.asarray(bare["context"].probs))
+
+
+@pytest.mark.parametrize("tick_order", ["simultaneous", "sequential"])
+def test_run_plans_over_a_modality_that_reads_an_action_node(tick_order):
+    """Under ``run`` the world's reset gives no cue, there being no action for it to be read
+    under, so the mind's first cue is absent and it looks first. Its belief over the observed
+    action node is carried from the reset: uniform before the first round, then the one-hot of
+    the level each round chose."""
+    system, params = maze_with_cue_by_node()
+    both, joint = with_mirror(system, params)
+    out = run(
+        both,
+        joint,
+        4,
+        KEY,
+        {"model": plan(), "world": sample()},
+        tick_order=tick_order,
+        record_carries=True,
+    )
+    assert not any(bool(np.any(np.asarray(fault))) for fault in out.faults.values())
+    assert np.asarray(out.present["model.cue"]).tolist() == [False, True, True, True, True]
+    assert np.asarray(out.present["model.reward"]).all()
+    levels = np.asarray(out.emitted["model.act"])
+    assert levels[0] == LOOK and LOOK not in levels[1:]
+    carried = [np.asarray(carry.beliefs["model.act"].probs) for carry in out.carries["model"]]
+    assert len(carried) == len(levels) + 1 == 5
+    np.testing.assert_allclose(carried[0], np.full(3, 1.0 / 3.0), rtol=1e-6)
+    for t, level in enumerate(levels):
+        np.testing.assert_allclose(carried[t + 1], np.eye(3)[level], atol=1e-6)
+
+
 # -------------------------------------------------- a linear-Gaussian channel that selects
 
 LEVEL_SD = (0.5, 0.05, 0.5)  # the reading's noise sd under each level of the node
@@ -406,6 +460,67 @@ def test_a_prior_over_the_action_node_that_is_not_a_point_is_refused_at_inferenc
     )
     with pytest.raises(Exception, match="selects its head and noise by action node 'a'"):
         run(jnp.asarray([0.2, 0.8, 0.0]))
+
+
+def test_an_absent_reading_selects_nothing_so_its_nodes_prior_need_not_be_a_point():
+    """A selecting modality that is absent leaves its factor at the prior whatever the action
+    node's prior is; where it is present a prior that is not a point is refused."""
+    system, params = scalar_model()
+    beliefs = system.initial_priors(params)
+    assert np.ptp(np.asarray(beliefs["a"].logits)) == 0.0  # uniform: not a point
+    y = {"y": jnp.asarray([0.55])}
+    posterior, _ = system.infer_states(params, y, beliefs, present={"y": False})
+    assert np.array_equal(np.asarray(posterior["x"].loc), np.asarray(beliefs["x"].loc))
+    assert np.array_equal(np.asarray(posterior["x"].cov), np.asarray(beliefs["x"].cov))
+    filtered = jax.jit(
+        lambda flag: system.infer_states(params, y, beliefs, present={"y": flag})[0]["x"]
+    )
+    absent = filtered(jnp.asarray(False))
+    assert np.array_equal(np.asarray(absent.loc), np.asarray(beliefs["x"].loc))
+    assert np.array_equal(np.asarray(absent.cov), np.asarray(beliefs["x"].cov))
+    with pytest.raises(Exception, match="selects its head and noise by action node 'a'"):
+        filtered(jnp.asarray(True))
+    #  a point prior under the traced flag: the reading is taken where it is present
+    copy = {**beliefs, "a": Categorical.from_probs(jax.nn.one_hot(1, 3))}
+    taken = jax.jit(
+        lambda flag: system.infer_states(params, y, copy, present={"y": flag})[0]["x"].loc
+    )
+    mean, _ = _kalman(PRIOR_MEAN, PRIOR_SD**2, 0.55, LEVEL_SD[1])
+    np.testing.assert_allclose(np.asarray(taken(jnp.asarray(True))), [mean], rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(taken(jnp.asarray(False))), [PRIOR_MEAN], rtol=1e-6)
+
+
+@pytest.mark.parametrize("tick_order", ["simultaneous", "sequential"])
+def test_run_plans_over_a_selecting_modality_from_an_absent_first_reading(tick_order):
+    """Under ``run`` the selecting modality is absent in round 0 (no action precedes it), so
+    the round's posterior is the prior, and from round 1 the reading is taken with the noise of
+    the level the round before chose."""
+    system, params = scalar_model()
+    both, joint = with_mirror(system, params)
+    out = run(
+        both,
+        joint,
+        4,
+        KEY,
+        {"model": plan(), "world": sample()},
+        tick_order=tick_order,
+        record_carries=True,
+    )
+    assert not any(bool(np.any(np.asarray(fault))) for fault in out.faults.values())
+    assert np.asarray(out.present["model.y"]).tolist() == [False, True, True, True, True]
+    carries = out.carries["model"]
+    first = carries[1].previous["model.x"]  # the posterior of round 0
+    assert np.array_equal(np.asarray(first.loc), np.asarray(carries[0].beliefs["model.x"].loc))
+    assert np.array_equal(np.asarray(first.cov), np.asarray(carries[0].beliefs["model.x"].cov))
+    levels = np.asarray(out.emitted["model.a"])
+    readings = np.asarray(out.received["model.y"])
+    for t in range(1, 4):
+        prior, posterior = carries[t].beliefs["model.x"], carries[t + 1].previous["model.x"]
+        mean, var = _kalman(
+            float(prior.loc[0]), float(prior.cov[0, 0]), readings[t, 0], LEVEL_SD[levels[t - 1]]
+        )
+        np.testing.assert_allclose(np.asarray(posterior.loc), [mean], rtol=1e-4)
+        np.testing.assert_allclose(np.asarray(posterior.cov), [[var]], rtol=1e-4)
 
 
 def _hand_chain(levels, belief="posterior"):

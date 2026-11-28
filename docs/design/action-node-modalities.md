@@ -68,6 +68,15 @@ same holds at inference on the hybrid path: the action node's prior, given with 
 the tabular path takes it (the decision's one-hot, the efference copy), selects when it is a
 point and is refused otherwise. A noise map on a selecting channel is not built, as on a
 switching channel.
+*2026-11-28 (Alex): the refusal at inference holds only where the modality is observed. A
+selecting modality that is absent (`present=` false for it, statically or as a traced flag)
+selects nothing and leaves its factor at the prior, so the action node's prior need not be a
+point at that step. This is the first round's case: no action precedes it, so `initial_priors`
+gives each observed action node a uniform entry, and under `run` the reset of a sampled world
+(`sample()`) returns no value for an emission that reads a control node, which the modality
+observing it is handed as absent in round 0. No level of the node stands for "no action". The
+reset of a hand-written loop (`env.reset`, `System.sample_initial`) still draws such an
+emission at level 0, which is open.*
 
 **S4 — The epistemic chain and the closed loop.** A selecting channel is a conditioner of the
 epistemic chain under `planning_belief="posterior"`, its head and noise taken at the step's
